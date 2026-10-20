@@ -1,0 +1,59 @@
+name: Release
+on:
+  push:
+    tags:
+      - 'v*'
+permissions:
+  contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+      - run: nix run -f nix/bootstrap.nix -- shell -- cargo fetch --locked
+      - run: nix run -f nix/bootstrap.nix -- shell -- cargo xtask deps
+      - run: nix run -f nix/bootstrap.nix -- shell -- cargo xtask check
+      - run: nix run -f nix/bootstrap.nix -- shell -- cargo xtask build
+      - run: nix run -f nix/bootstrap.nix -- shell -- cargo xtask lab
+      - run: nix run -f nix/bootstrap.nix -- shell -- cargo xtask package
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-inputs
+          path: |
+            dist/*.ipk
+            dist/licenses.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: release-lab-results
+          path: artifacts/local/current/*.json
+          if-no-files-found: ignore
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-inputs
+          path: dist/
+      - run: nix run -f nix/bootstrap.nix -- shell -- cargo fetch --locked
+      - run: nix run -f nix/bootstrap.nix -- shell -- cargo build --locked --offline --package xtask
+      - name: Sign the manifest
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: nix run -f nix/bootstrap.nix -- shell -- target/debug/wayline-dev release
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: nix run -f nix/bootstrap.nix -- shell -- target/debug/wayline-dev publish

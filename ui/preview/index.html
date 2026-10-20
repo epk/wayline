@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Wayline · UI preview</title>
+    <style>
+      body {
+        margin: 0;
+        background: #f4f6f8;
+        color: #253644;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      }
+      .router-header {
+        height: 58px;
+        background: #139b9b;
+        color: white;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 26px;
+      }
+      .router-header strong {
+        font-size: 22px;
+        letter-spacing: 0.01em;
+      }
+      .router-header span {
+        font-size: 13px;
+        opacity: 0.9;
+      }
+      .router-layout {
+        display: grid;
+        grid-template-columns: 210px minmax(0, 1fr);
+        min-height: calc(100vh - 58px);
+      }
+      aside {
+        background: white;
+        border-right: 1px solid #e3e9ed;
+        padding: 25px 14px;
+        color: #6c7e88;
+        font-size: 14px;
+      }
+      aside div {
+        padding: 11px 16px;
+      }
+      aside .active {
+        color: #139b9b;
+        background: #edf8f8;
+        border-radius: 5px;
+      }
+      aside .sub {
+        font-size: 13px;
+        padding-left: 31px;
+      }
+      .router-layout > main {
+        padding: 26px 34px;
+        min-width: 0;
+      }
+      @media (max-width: 850px) {
+        .router-layout {
+          grid-template-columns: 1fr;
+        }
+        aside {
+          display: none;
+        }
+        .router-layout > main {
+          padding: 16px 14px;
+        }
+        .router-header {
+          padding: 0 18px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="router-header"><strong>GL.iNet</strong><span>Beryl 7 · UI preview</span></header>
+    <div class="router-layout">
+      <aside aria-label="Router navigation">
+        <div>Internet</div>
+        <div>Wireless</div>
+        <div>Clients</div>
+        <div>VPN</div>
+        <div class="sub">VPN Dashboard</div>
+        <div class="sub active">Wayline</div>
+        <div>Applications</div>
+        <div>Network</div>
+        <div>System</div>
+      </aside>
+      <div id="app"></div>
+    </div>
+    <script src="../node_modules/vue/dist/vue.runtime.min.js"></script>
+    <script>
+      var module = { exports: {} };
+      function require(name) {
+        if (name === 'vue') return Vue;
+        throw Error('Unexpected dependency: ' + name);
+      }
+    </script>
+    <script src="../dist/gl-sdk4-ui-wayline.common.js"></script>
+    <script src="demo.js"></script>
+    <script>
+      new Vue({
+        render: (h) => h(module.exports, { props: { api: window.previewApi, preview: true } }),
+      }).$mount('#app');
+    </script>
+  </body>
+</html>

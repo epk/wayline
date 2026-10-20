@@ -1,0 +1,6 @@
+[target.aarch64-unknown-linux-musl]
+linker = "ld.lld"
+rustflags = ["-C", "target-cpu=cortex-a53", "-C", "link-self-contained=yes"]
+
+[alias]
+xtask = "run --locked --offline --package xtask --"

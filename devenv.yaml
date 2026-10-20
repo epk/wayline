@@ -1,0 +1,11 @@
+inputs:
+  nixpkgs:
+    url: https://github.com/NixOS/nixpkgs/archive/e513db7b0a65def6f6e17bb55195dfe510871944.tar.gz
+  rust-overlay:
+    url: github:oxalica/rust-overlay/5424e1e6dda30b0626935d2a03a6526db4858d60
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+  ste:
+    url: github:danyuchn/asd-ste100-skill/master
+    flake: false

@@ -1,0 +1,26 @@
+local json = require('cjson')
+local rpc = require('oui.rpc')
+local methods =
+    { 'get_state', 'get_history', 'set_config', 'select_tunnel', 'check_update', 'install_update' }
+local module = {}
+local function invoke(method, args)
+    local session = rpc.session()
+    assert(session and session.aclgroup == 'root', 'An active administrator session is required.')
+    local input = json.encode(args or {})
+    assert(#input <= 32768, 'The request exceeds its size limit.')
+    local quoted = "'" .. input:gsub("'", "'\\''") .. "'"
+    local pipe = assert(io.popen('/usr/sbin/wayline-ctl ' .. method .. ' ' .. quoted, 'r'))
+    local output = pipe:read(524289)
+    pipe:close()
+    assert(output and #output <= 524288, 'The response exceeds its size limit.')
+    local response = json.decode(output)
+    assert(response.ok == true, response.error or 'The operation failed.')
+    return response.result
+end
+for _, name in ipairs(methods) do
+    local method = name
+    module[method] = function(args)
+        return invoke(method, args)
+    end
+end
+return module

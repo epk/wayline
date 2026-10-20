@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "target": "1.1.1.1",
+  "interval": 15,
+  "tunnels": [],
+  "diagnostics": false,
+  "targets": ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
+  "directWan": false,
+  "historyHours": 24,
+  "autoUpdates": false
+}

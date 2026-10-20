@@ -1,0 +1,2 @@
+#!/bin/sh
+[ -n "${IPKG_INSTROOT:-}" ] || /usr/sbin/wayline-ctl install

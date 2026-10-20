@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/sbin/wayline-ctl reconcile

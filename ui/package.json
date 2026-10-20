@@ -1,0 +1,22 @@
+{
+  "name": "gl-sdk4-ui-wayline",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "webpack --mode production",
+    "check": "eslint src/index.vue preview/demo.js webpack.config.cjs && prettier --check src preview webpack.config.cjs package.json",
+    "format": "prettier --write src preview webpack.config.cjs package.json"
+  },
+  "devDependencies": {
+    "vue": "2.7.16",
+    "vue-template-compiler": "2.7.16",
+    "vue-loader": "15.11.1",
+    "vue-style-loader": "4.1.3",
+    "css-loader": "6.11.0",
+    "webpack": "5.104.1",
+    "webpack-cli": "5.1.4",
+    "prettier": "3.6.2",
+    "eslint": "9.39.1",
+    "eslint-plugin-vue": "10.5.1"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "target": "192.0.2.1",
+  "interval_ms": 15000,
+  "timeout_ms": 2000,
+  "tunnels": [
+    {
+      "id": "home",
+      "name": "Home",
+      "interface": "wgclient1",
+      "source": "10.0.1.2",
+      "mark": 4096
+    },
+    {
+      "id": "backup",
+      "name": "Backup",
+      "interface": "wgclient2",
+      "source": "10.0.2.2",
+      "mark": 8192
+    }
+  ]
+}

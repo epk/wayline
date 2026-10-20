@@ -1,0 +1,20 @@
+{
+  "date": "2026-10-20",
+  "binary_sha256": "8bfbc32cf8441907b023dac2844035413123d1bb090cdf3d18e12016bd900539",
+  "binary_bytes": 458408,
+  "architecture": "aarch64-unknown-linux-musl",
+  "kernel": "6.8.0-117-generic",
+  "runtime": "Monoio 0.2.4 legacy",
+  "wireguard_exits": 8,
+  "series": 45,
+  "interval_ms": 15000,
+  "probe_timeout_ms": 2000,
+  "outage_seconds": 80.171772485,
+  "one_core_cpu_percent": 0.3492501771575266,
+  "rss_kib": 528,
+  "threads": 1,
+  "file_descriptors": 99,
+  "input_and_endpoint_guards": true,
+  "closed_box_passed": true,
+  "physical_router_validated": false
+}
