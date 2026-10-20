@@ -99,7 +99,7 @@ Install Nix with flakes enabled.
 Enter the pinned devenv environment:
 
 ```sh
-nix run -f nix/bootstrap.nix -- shell
+nix run -f nix/bootstrap.nix devenv -- shell
 ```
 
 Run these commands inside that environment:

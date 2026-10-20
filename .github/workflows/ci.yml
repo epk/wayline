@@ -14,11 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
-      - run: nix run -f nix/bootstrap.nix -- shell -- cargo fetch --locked
-      - run: nix run -f nix/bootstrap.nix -- shell -- cargo xtask deps
-      - run: nix run -f nix/bootstrap.nix -- shell -- cargo xtask check
-      - run: nix run -f nix/bootstrap.nix -- shell -- cargo xtask build
-      - run: nix run -f nix/bootstrap.nix -- shell -- cargo xtask lab
+      - run: nix run -f nix/bootstrap.nix devenv -- shell -- cargo fetch --locked
+      - run: nix run -f nix/bootstrap.nix devenv -- shell -- cargo xtask deps
+      - run: nix run -f nix/bootstrap.nix devenv -- shell -- cargo xtask check
+      - run: nix run -f nix/bootstrap.nix devenv -- shell -- cargo xtask build
+      - run: nix run -f nix/bootstrap.nix devenv -- shell -- cargo xtask lab
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

@@ -5,4 +5,6 @@ let
   };
   pkgs = import source { };
 in
-pkgs.devenv
+{
+  inherit (pkgs) devenv;
+}
