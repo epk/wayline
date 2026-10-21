@@ -1,4 +1,5 @@
 use crate::{
+    changes,
     native::{self, Level},
     router,
     runtime::{MONITOR_CONFIG, SETTINGS, STATUS_SOCKET, snapshot, version},
@@ -50,6 +51,23 @@ fn topology(
         }
         None => warn(warnings, "WAN path", &value.wan_reason),
     }
+    for uplink in &value.uplinks {
+        let active = value
+            .wan
+            .as_ref()
+            .is_some_and(|wan| wan.name == uplink.name);
+        show(
+            true,
+            "uplink",
+            &format!(
+                "{}{} on {} {}",
+                uplink.name,
+                if active { " (active)" } else { "" },
+                uplink.interface,
+                uplink.source
+            ),
+        );
+    }
     if let Ok(config) = settings
         && router::endpoints_enabled(config)
     {
@@ -59,6 +77,14 @@ fn topology(
                 &format!("VPN endpoint {}", path.name),
                 &path.endpoint_reason,
             );
+        }
+    }
+}
+
+fn recent_changes(settings: &Result<Settings>) {
+    if let Ok(config) = settings {
+        for event in changes::read(config).iter().rev().take(5) {
+            println!("recent change ({}): {}", event.subject, event.text);
         }
     }
 }
@@ -117,6 +143,7 @@ pub fn run() -> bool {
             }),
     );
     topology(&mut warnings, &settings, &inventory);
+    recent_changes(&settings);
     let list = native::List::read();
     let detail = list.as_ref().map_or_else(ToString::to_string, |value| {
         format!("{} tunnel(s) in priority order", value.tunnels.len())

@@ -2,6 +2,7 @@
 
 mod api;
 mod auto;
+mod changes;
 mod doctor;
 mod egress;
 mod history;

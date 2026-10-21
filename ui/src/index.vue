@@ -86,6 +86,47 @@
       This page is from Wayline {{ bundleVersion }}, but the router runs {{ state.version }}.
       <button type="button" class="vph-button" @click="reloadPage">Reload page</button>
     </div>
+    <section v-if="ready" class="vph-panel vph-hero" aria-labelledby="vph-hero-label">
+      <p id="vph-hero-label" class="vph-hero-label">Your traffic leaves from</p>
+      <p v-if="heroEgressState === 'ok'" class="vph-hero-main">
+        <span class="vph-hero-ip">{{ heroEgress.ip }}</span>
+        <span v-if="heroPlace.name" class="vph-hero-country"
+          ><span class="vph-flag" aria-hidden="true">{{ heroPlace.flag }}</span>
+          {{ heroPlace.name }}</span
+        >
+      </p>
+      <p
+        v-else-if="heroEgressState === 'error'"
+        class="vph-hero-main vph-hero-pending"
+        :title="heroEgress.error"
+      >
+        Exit address unavailable
+      </p>
+      <p v-else class="vph-hero-main vph-hero-pending">Checking exit address…</p>
+      <p class="vph-hero-via">
+        <template v-if="exitTunnel"
+          >Through {{ exitTunnel.name
+          }}<template v-if="heroEgress && heroEgress.colo">
+            (exit point {{ heroEgress.colo }})</template
+          ></template
+        >
+        <template v-else>Through {{ wanInterface }}, without VPN</template>
+      </p>
+      <p v-if="overhead" class="vph-hero-overhead" :title="overhead.title">
+        <strong>{{ overhead.headline }}</strong> {{ overhead.detail }}
+      </p>
+      <p v-if="exitTunnel && wanEgress && wanEgress.ip" class="vph-hero-wan">
+        Without VPN: <span class="vph-hero-wan-ip">{{ wanEgress.ip }}</span>
+        <template v-if="wanPlace.name"
+          ><span class="vph-flag" aria-hidden="true">{{ wanPlace.flag }}</span>
+          {{ wanPlace.name }}</template
+        >
+        via {{ wanInterface }}
+      </p>
+      <p v-if="egressCheckedAt" class="vph-hero-updated">
+        Updated {{ ago(egressCheckedAt * 1000) }}
+      </p>
+    </section>
     <p class="vph-statusline" role="status">{{ statusLine }}</p>
     <p v-if="!can.configure && ready" class="vph-muted vph-hint">{{ configureReason }}</p>
     <div role="alert">
@@ -284,304 +325,240 @@
       </footer>
     </form>
 
-    <nav class="vph-tabs" aria-label="Wayline views">
-      <button
-        :class="{ active: tab === 'tunnels' }"
-        :aria-pressed="tab === 'tunnels' ? 'true' : 'false'"
-        @click="tab = 'tunnels'"
+    <p v-if="!can.select && selectReason" class="vph-muted vph-hint">{{ selectReason }}</p>
+    <div v-if="state.auto && state.auto.enabled" class="vph-panel vph-info">
+      <strong>Automatic exit switching is on.</strong>
+      <span v-if="state.auto.last">
+        Last switch
+        <time :title="new Date(state.auto.last.at).toLocaleString()">{{
+          ago(state.auto.last.at)
+        }}</time
+        >: from {{ tunnelName(state.auto.last.from) }} to {{ tunnelName(state.auto.last.to) }}.
+        {{ state.auto.last.reason }}</span
       >
-        Exit tunnels</button
-      ><button
-        :class="{ active: tab === 'diagnostics' }"
-        :aria-pressed="tab === 'diagnostics' ? 'true' : 'false'"
-        @click="tab = 'diagnostics'"
-      >
-        Internet diagnostics
-      </button>
-    </nav>
-    <template v-if="tab === 'tunnels'">
-      <div class="vph-scope">
-        <span
-          >Exit preference for <strong>{{ state.scope || 'Scope unavailable' }}</strong></span
+      <span v-else class="vph-muted"> No switch yet.</span>
+    </div>
+    <div class="vph-table-head">
+      <div v-if="destinations.length > 1" class="vph-ranges" role="group" aria-label="Destination">
+        <button
+          v-for="d in destinations"
+          :key="d"
+          :class="{ active: selectedTarget === d }"
+          :aria-pressed="selectedTarget === d ? 'true' : 'false'"
+          @click="chooseTarget(d)"
         >
-        <span class="vph-muted"
-          >Target {{ state.config.target
-          }}<template v-if="resolvedText(state.config.target)"
-            >. {{ resolvedText(state.config.target) }}</template
-          >. Checked every {{ state.config.interval }} seconds.</span
-        >
-      </div>
-      <p v-if="!can.select && selectReason" class="vph-muted vph-hint">{{ selectReason }}</p>
-      <div v-if="state.auto && state.auto.enabled" class="vph-panel vph-info">
-        <strong>Automatic exit switching is on.</strong>
-        <span v-if="state.auto.last">
-          Last switch
-          <time :title="new Date(state.auto.last.at).toLocaleString()">{{
-            ago(state.auto.last.at)
-          }}</time
-          >: from {{ tunnelName(state.auto.last.from) }} to {{ tunnelName(state.auto.last.to) }}.
-          {{ state.auto.last.reason }}</span
-        >
-        <span v-else class="vph-muted"> No switch yet.</span>
-      </div>
-      <div
-        class="vph-panel vph-table-wrap"
-        tabindex="0"
-        role="region"
-        aria-label="Exit tunnels table"
-      >
-        <table>
-          <thead>
-            <tr>
-              <th scope="col">Tunnel</th>
-              <th scope="col">Latency</th>
-              <th scope="col" class="vph-spark-column">Recent</th>
-              <th scope="col" class="vph-action-head"><span class="vph-sr">Actions</span></th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr
-              v-for="t in state.tunnels"
-              :key="t.id"
-              :class="{ selected: selectedTunnel === t.id, 'vph-active': t.preferred }"
-            >
-              <td class="vph-tunnel">
-                <div class="vph-name-line">
-                  <span
-                    class="vph-state-dot"
-                    :class="'vph-state-' + tunnelTone(t)"
-                    aria-hidden="true"
-                  ></span>
-                  <button
-                    class="vph-name"
-                    :aria-pressed="selectedTunnel === t.id ? 'true' : 'false'"
-                    :aria-label="'Highlight ' + t.name + ' in the latency graph'"
-                    @click="highlight(t.id)"
-                  >
-                    {{ t.name }}</button
-                  ><span v-if="t.preferred" class="vph-badge">Active exit</span>
-                </div>
-                <div class="vph-muted vph-status">{{ t.stateLabel }}{{ tunnelEgress(t) }}</div>
-                <div v-if="notEligible(t)" class="vph-muted vph-status">
-                  Not eligible: {{ t.reason || 'not ready yet' }}
-                </div>
-              </td>
-              <td class="vph-metric" data-label="Latency">
-                <span class="vph-number"
-                  >{{ latency(t.median) }}<small v-if="t.median !== null"> ms</small></span
-                >
-                <span v-if="lossShown(t)" class="vph-loss" :title="lossTitle(t)"
-                  >{{ lossText(t) }} loss</span
-                >
-                <span class="vph-bar" aria-hidden="true"
-                  ><span
-                    class="vph-bar-fill"
-                    :class="{ 'vph-bar-best': t.id === fastestId }"
-                    :style="{ width: barWidth(t) + '%' }"
-                  ></span
-                ></span>
-              </td>
-              <td class="vph-spark-column">
-                <svg
-                  v-if="sparkStats(t.recent)"
-                  class="vph-spark"
-                  viewBox="0 0 128 24"
-                  preserveAspectRatio="none"
-                  role="img"
-                  :aria-label="sparkLabel(t)"
-                >
-                  <title>{{ sparkLabel(t) }}</title>
-                  <rect
-                    v-for="b in sparkBars(t.recent)"
-                    :key="b.i"
-                    :x="b.x"
-                    :y="b.y"
-                    :width="b.w"
-                    :height="b.h"
-                    :class="{ 'vph-spark-lost': b.lost }"
-                  />
-                </svg>
-                <span v-else class="vph-muted">Waiting for samples</span>
-              </td>
-              <td class="vph-action" :class="{ 'vph-confirming': pendingStop === t.id }">
-                <div v-if="pendingStop === t.id" class="vph-confirm">
-                  <span class="vph-confirm-text">Stop {{ t.name }}? Traffic may use WAN.</span>
-                  <div class="vph-actions">
-                    <button
-                      ref="confirm"
-                      type="button"
-                      class="vph-control vph-danger"
-                      :disabled="busy"
-                      :aria-label="'Confirm stop ' + t.name"
-                      @click="setTunnelEnabled(t)"
-                    >
-                      Stop
-                    </button>
-                    <button type="button" class="vph-control" @click="pendingStop = ''">
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-                <div v-else class="vph-actions">
-                  <button
-                    v-if="!t.preferred && t.enabled"
-                    type="button"
-                    class="vph-control"
-                    :disabled="useDisabled(t)"
-                    :title="useReason(t)"
-                    :aria-label="'Use ' + t.name + ' as exit'"
-                    @click="selectExit(t)"
-                  >
-                    {{
-                      busyTunnel === t.id && busyAction === 'select' ? 'Applying…' : 'Use as exit'
-                    }}
-                  </button>
-                  <span
-                    v-if="busyTunnel === t.id && busyAction === 'toggle'"
-                    class="vph-muted vph-busy"
-                    role="status"
-                    >{{ t.enabled ? 'Stopping…' : 'Starting…' }}</span
-                  >
-                  <button
-                    v-else
-                    type="button"
-                    role="switch"
-                    class="vph-switch"
-                    :aria-checked="t.enabled ? 'true' : 'false'"
-                    :disabled="toggleDisabled(t)"
-                    :title="toggleReason(t)"
-                    @click="askToggle(t)"
-                  >
-                    <span class="vph-sr">{{ (t.enabled ? 'Stop ' : 'Start ') + t.name }}</span>
-                    <span class="vph-track" aria-hidden="true"></span>
-                  </button>
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-        <div v-if="!state.tunnels.length" class="vph-empty" role="status">
-          {{ emptyText }}
-        </div>
-      </div>
-      <p v-if="wanEgress" class="vph-muted vph-note">
-        {{ egressText(wanEgress, 'Direct WAN exit IP') }}
-        <span v-if="wanEgress.error" class="vph-egress-error">{{ wanEgress.error }}</span>
-      </p>
-      <p class="vph-muted vph-note">
-        Changing the active exit applies to new connections. Stopping a tunnel can send traffic over
-        WAN under your GL.iNet policy.
-      </p>
-    </template>
-    <template v-else>
-      <section v-if="!state.config.diagnostics" class="vph-panel vph-empty">
-        <h2>Internet diagnostics</h2>
-        <p>See how destinations perform through each tunnel and directly through WAN.</p>
-        <button class="vph-button" :disabled="!can.configure" @click="openSettings">
-          Enable in settings
+          {{ d }}
         </button>
-      </section>
-      <div
-        v-else
-        class="vph-panel vph-table-wrap"
-        tabindex="0"
-        role="region"
-        aria-label="Internet diagnostics table"
-      >
-        <table>
-          <thead>
-            <tr>
-              <th scope="col">Destination</th>
-              <th scope="col" v-if="state.config.directWan">{{ wanHeader }}</th>
-              <th scope="col" v-for="t in state.tunnels" :key="t.id">{{ t.name }}</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr
-              v-for="target in state.config.targets"
-              :key="target"
-              :class="{ selected: selectedTarget === target }"
-            >
-              <td>
+      </div>
+      <p class="vph-muted" :title="state.scope || null">
+        Measured every {{ state.config.interval }} seconds.
+      </p>
+    </div>
+    <div
+      class="vph-panel vph-table-wrap"
+      tabindex="0"
+      role="region"
+      aria-label="Exit tunnels table"
+    >
+      <table class="vph-exits">
+        <thead>
+          <tr>
+            <th scope="col">Tunnel</th>
+            <th scope="col" class="vph-col-through">Through tunnel</th>
+            <th scope="col" class="vph-col-server" v-if="showServer">To server</th>
+            <th scope="col" class="vph-action-head"><span class="vph-sr">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="t in state.tunnels"
+            :key="t.id"
+            :class="{ selected: selectedTunnel === t.id, 'vph-active': t.preferred }"
+          >
+            <td class="vph-tunnel">
+              <div class="vph-name-line">
+                <span
+                  class="vph-state-dot"
+                  :class="'vph-state-' + tunnelTone(t)"
+                  aria-hidden="true"
+                ></span>
                 <button
                   class="vph-name"
-                  :aria-pressed="selectedTarget === target ? 'true' : 'false'"
-                  :aria-label="'Show history for ' + target"
-                  @click="
-                    selectedTarget = target;
-                    loadHistory();
-                  "
+                  :title="t.name"
+                  :aria-pressed="selectedTunnel === t.id ? 'true' : 'false'"
+                  :aria-label="'Highlight ' + t.name + ' in the latency graph'"
+                  @click="highlight(t.id)"
                 >
-                  {{ target }}
+                  {{ t.name }}</button
+                ><span v-if="t.preferred" class="vph-badge">Active exit</span
+                ><span v-if="changeFor(t.id)" class="vph-tag" :title="changeFor(t.id).text"
+                  >Changed</span
+                >
+              </div>
+              <div v-if="exitIdentity(t.id) && !isExit(t)" class="vph-muted vph-status">
+                Exit IP {{ exitIdentity(t.id).ip
+                }}<template v-if="exitIdentity(t.id).place.name"
+                  >,
+                  <span class="vph-flag" aria-hidden="true">{{
+                    exitIdentity(t.id).place.flag
+                  }}</span>
+                  {{ exitIdentity(t.id).place.name }}</template
+                >
+              </div>
+              <div v-else class="vph-muted vph-status">{{ t.stateLabel }}</div>
+              <div v-if="notEligible(t)" class="vph-muted vph-status">
+                Not eligible: {{ t.reason || 'not ready yet' }}
+              </div>
+            </td>
+            <td class="vph-metric" data-label="Through tunnel">
+              <template v-if="primarySelected">
+                <span class="vph-number vph-latency"
+                  >{{ latency(t.median) }}<small v-if="hasMs(t.median)"> ms</small></span
+                >
+                <span
+                  v-if="latencyNotes[t.id]"
+                  class="vph-latency-note"
+                  :class="latencyNotes[t.id].cls"
+                  :title="latencyNotes[t.id].title"
+                  >{{ latencyNotes[t.id].text }}</span
+                >
+              </template>
+              <span v-else-if="diagnosticValue(t.id) !== null" class="vph-number vph-latency"
+                >{{ latency(diagnosticValue(t.id)) }}<small> ms</small></span
+              >
+              <span v-else class="vph-muted">No data yet</span>
+            </td>
+            <td v-if="showServer" class="vph-server" data-label="To server" :title="serverTitle(t)">
+              <template v-if="serverFor(t) && serverFor(t).address">
+                <span class="vph-number vph-server-ms">{{ serverMs(serverFor(t)) }}</span>
+                <span class="vph-status vph-muted vph-server-address"
+                  >Server {{ serverFor(t).address }}</span
+                >
+              </template>
+              <span v-else class="vph-muted">—</span>
+            </td>
+            <td class="vph-action" :class="{ 'vph-confirming': pendingStop === t.id }">
+              <div v-if="pendingStop === t.id" class="vph-confirm">
+                <span class="vph-confirm-text">Stop {{ t.name }}? Traffic may use WAN.</span>
+                <div class="vph-actions">
+                  <button
+                    ref="confirm"
+                    type="button"
+                    class="vph-control vph-danger"
+                    :disabled="busy"
+                    :aria-label="'Confirm stop ' + t.name"
+                    @click="setTunnelEnabled(t)"
+                  >
+                    Stop
+                  </button>
+                  <button type="button" class="vph-control" @click="pendingStop = ''">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+              <div v-else class="vph-actions">
+                <button
+                  v-if="!t.preferred && t.enabled"
+                  type="button"
+                  class="vph-control"
+                  :disabled="useDisabled(t)"
+                  :title="useReason(t)"
+                  :aria-label="'Use ' + t.name + ' as exit'"
+                  @click="selectExit(t)"
+                >
+                  {{ busyTunnel === t.id && busyAction === 'select' ? 'Applying…' : 'Use as exit' }}
                 </button>
-                <div v-if="resolvedText(target)" class="vph-muted vph-status">
-                  {{ resolvedText(target) }}
-                </div>
-              </td>
-              <td v-if="state.config.directWan" class="vph-number">
-                {{ wanCell(target) }}
-              </td>
-              <td v-for="t in state.tunnels" :key="t.id" class="vph-number">
-                {{ diagnostic(target, t.id) }}
-              </td>
-            </tr>
-            <tr v-for="e in endpoints" :key="'endpoint-' + e.tunnel" class="vph-endpoint">
-              <td>
-                Endpoint of {{ e.name }}
-                <div class="vph-muted vph-status">
-                  {{ e.address || e.reason || 'No address yet' }}
-                </div>
-              </td>
-              <td v-if="state.config.directWan" class="vph-number">
-                {{ e.address ? wanCell(e.address) : '—' }}
-              </td>
-              <td v-for="t in state.tunnels" :key="t.id" class="vph-number vph-muted">
-                <span aria-hidden="true">—</span><span class="vph-sr">Not measured</span>
-              </td>
-            </tr>
-          </tbody>
-        </table>
+                <span
+                  v-if="busyTunnel === t.id && busyAction === 'toggle'"
+                  class="vph-muted vph-busy"
+                  role="status"
+                  >{{ t.enabled ? 'Stopping…' : 'Starting…' }}</span
+                >
+                <button
+                  v-else
+                  type="button"
+                  role="switch"
+                  class="vph-switch"
+                  :aria-checked="t.enabled ? 'true' : 'false'"
+                  :disabled="toggleDisabled(t)"
+                  :title="toggleReason(t)"
+                  @click="askToggle(t)"
+                >
+                  <span class="vph-sr">{{ (t.enabled ? 'Stop ' : 'Start ') + t.name }}</span>
+                  <span class="vph-track" aria-hidden="true"></span>
+                </button>
+              </div>
+            </td>
+          </tr>
+          <tr v-for="u in uplinkRows" :key="u.id" class="vph-uplink-row">
+            <td class="vph-tunnel">
+              <div class="vph-name-line">
+                <span class="vph-name vph-wan-name">{{ uplinkName(u) }}</span
+                ><span v-if="u.active" class="vph-badge">Active uplink</span
+                ><span v-if="changeFor(u.id)" class="vph-tag" :title="changeFor(u.id).text"
+                  >Changed</span
+                >
+              </div>
+              <div v-if="!u.active && u.address" class="vph-muted vph-status">
+                Address {{ u.address }}
+              </div>
+            </td>
+            <td class="vph-metric">
+              <span
+                v-if="!u.active && unmeasurable(u)"
+                class="vph-latency-text"
+                title="The router sends this traffic through the active uplink."
+                >Not measurable</span
+              >
+              <span v-else-if="uplinkValue(u) !== null" class="vph-number vph-latency"
+                ><span class="vph-sr">Without VPN: </span>{{ latency(uplinkValue(u))
+                }}<small> ms</small></span
+              >
+              <span v-else class="vph-muted">No data yet</span>
+            </td>
+            <td v-if="showServer"></td>
+            <td class="vph-action"></td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="!state.tunnels.length" class="vph-empty" role="status">
+        {{ emptyText }}
       </div>
-      <p v-if="state.config.directWan && !wanAvailable" class="vph-muted" role="note">
-        {{ wanNote }}
-      </p>
-      <p v-if="state.config.endpointDiagnostics" class="vph-muted">
-        {{
-          endpoints.length
-            ? 'Endpoint rows show the route to the VPN server over WAN. They do not show latency through the tunnel.'
-            : 'No VPN endpoints found yet. Endpoint rows show the route to the server, not latency through the tunnel.'
-        }}
-      </p>
-    </template>
+    </div>
+    <p v-if="uplinkRows.length && !wanAvailable" class="vph-muted vph-note" role="note">
+      {{ wanNote }}
+    </p>
+    <p v-if="!state.config.diagnostics" class="vph-muted vph-note">
+      Turn on Internet diagnostics in Settings to compare destinations and uplinks.
+    </p>
+    <p class="vph-muted vph-note">
+      Changing the exit affects new connections. Stopping a tunnel may send traffic over WAN.
+    </p>
 
-    <section v-if="tab === 'tunnels' || state.config.diagnostics" class="vph-panel vph-history">
+    <section class="vph-panel vph-history">
       <header class="vph-chart-heading">
         <div>
-          <h2 v-if="allMode">Latency to {{ graphTarget }} through each tunnel</h2>
-          <h2 v-else>{{ selectedName }} <span class="vph-muted">latency</span></h2>
-          <p v-if="!allMode && storedHistory" class="vph-stored">Stored history (tunnel stopped)</p>
-          <p v-if="allMode" class="vph-muted">
+          <h2>Latency to {{ selectedTarget }}</h2>
+          <p class="vph-muted">
             {{ range === 1440 ? 'Five-minute' : 'One-minute' }} medians. Gaps mean no measurement.
           </p>
-          <p v-else class="vph-muted">
-            Showing {{ graphTarget }}. {{ range === 1440 ? 'Five-minute' : 'One-minute' }}
-            averages. Gaps mean no measurement.
-          </p>
         </div>
-        <div class="vph-ranges" role="group" aria-label="History range">
-          <button
-            v-for="r in ranges"
-            :key="r.minutes"
-            :class="{ active: range === r.minutes }"
-            :aria-pressed="range === r.minutes"
-            @click="
-              range = r.minutes;
-              offset = 0;
-              loadHistory();
-            "
-          >
-            {{ r.label }}
-          </button>
+        <div class="vph-chart-controls">
+          <div class="vph-ranges" role="group" aria-label="History range">
+            <button
+              v-for="r in ranges"
+              :key="r.minutes"
+              :class="{ active: range === r.minutes }"
+              :aria-pressed="range === r.minutes"
+              @click="
+                range = r.minutes;
+                offset = 0;
+                loadHistory();
+              "
+            >
+              {{ r.label }}
+            </button>
+          </div>
         </div>
       </header>
       <div class="vph-chart" ref="chart" @mouseleave="hover = null">
@@ -590,15 +567,9 @@
           role="img"
           tabindex="0"
           :aria-label="
-            allMode
-              ? 'Latency to ' +
-                graphTarget +
-                ' through each tunnel. Use the arrow keys to read values.'
-              : 'Latency history for ' +
-                selectedName +
-                ' to ' +
-                graphTarget +
-                '. Use the arrow keys to read values.'
+            'Latency to ' +
+            selectedTarget +
+            ' through each tunnel. Use the arrow keys to read values.'
           "
           @mousemove="hoverAt"
           @click="hoverAt"
@@ -628,6 +599,8 @@
             :key="series.id"
             :class="{
               'vph-wan-series': series.id === 'wan',
+              'vph-uplink-series': isUplink(series),
+              'vph-endpoint-series': isServer(series),
               'vph-series-selected': isSelected(series),
               'vph-series-dim': isDimmed(series),
             }"
@@ -644,6 +617,20 @@
               class="vph-dot"
             />
           </g>
+          <g
+            v-for="(m, i) in markerList"
+            :key="i + ':' + m.at"
+            class="vph-marker"
+            role="img"
+            tabindex="0"
+            :aria-label="m.text"
+            @mouseenter="showMarker(m)"
+            @focus="showMarker(m)"
+            @blur="hover = null"
+          >
+            <line :x1="chartX(m.at)" :x2="chartX(m.at)" y1="24" y2="200" class="vph-marker-line" />
+            <circle :cx="chartX(m.at)" cy="24" r="3" class="vph-marker-dot" />
+          </g>
           <text
             v-for="fraction in [0, 0.5, 1]"
             :key="fraction"
@@ -656,45 +643,60 @@
           <line v-if="hover" :x1="hover.x" :x2="hover.x" y1="24" y2="200" class="vph-guide" />
         </svg>
         <div v-if="chartNote" class="vph-chart-note" role="status">{{ chartNote }}</div>
-        <div
-          v-if="hover"
-          role="status"
-          class="vph-tooltip"
-          :style="{ left: Math.min(Math.max(hover.x, 0), chartWidth - 268) + 'px' }"
-        >
+        <div v-if="hover" role="status" class="vph-tooltip" :style="tipStyle">
           <strong>{{ clock(hover.at) }}</strong>
+          <div v-if="hover.marker" class="vph-tip-event">{{ hover.marker }}</div>
           <div v-for="row in hoverRows" :key="row.id" :class="{ 'vph-tip-selected': row.selected }">
             <span
               class="vph-swatch vph-tip-swatch"
-              :class="{ 'vph-swatch-wan': row.id === 'wan' }"
+              :class="{ 'vph-swatch-wan': row.wan }"
               :style="{ '--series': row.color }"
               aria-hidden="true"
             ></span
-            >{{ row.name }}{{ row.selected ? ' (selected)' : '' }}:
-            {{ row.value === null ? 'No measurement' : row.value + ' ms' }}
+            >{{ row.name }}: {{ row.text }}
           </div>
         </div>
       </div>
       <div class="vph-chart-footer">
-        <ul v-if="legendItems.length" class="vph-legend" aria-label="Tunnels in the graph">
-          <li v-for="item in legendItems" :key="item.id">
-            <button
-              v-if="item.tunnel"
-              type="button"
-              class="vph-legend-item"
-              :class="{ active: item.selected }"
-              :aria-pressed="item.selected ? 'true' : 'false'"
-              @click="highlight(item.id)"
-            >
-              <span class="vph-swatch" :style="{ '--series': item.color }" aria-hidden="true"></span
-              >{{ item.name }}<span v-if="item.preferred" class="vph-muted"> Active exit</span
-              ><span v-if="item.stored" class="vph-muted"> Stored</span>
-            </button>
-            <span v-else class="vph-legend-item vph-muted">
-              <span class="vph-swatch vph-swatch-wan" aria-hidden="true"></span>{{ item.name }}
-            </span>
-          </li>
-        </ul>
+        <div v-if="legendItems.length" class="vph-legend-block">
+          <ul class="vph-key" aria-label="Line styles">
+            <li>
+              <svg class="vph-key-line" width="24" height="8" viewBox="0 0 24 8" aria-hidden="true">
+                <line x1="0" y1="4" x2="24" y2="4" />
+              </svg>
+              Through the tunnel
+            </li>
+            <li v-if="serverShown">
+              <svg class="vph-key-line" width="24" height="8" viewBox="0 0 24 8" aria-hidden="true">
+                <line x1="0" y1="4" x2="24" y2="4" class="vph-key-dashed" />
+              </svg>
+              To its VPN server, over WAN
+            </li>
+          </ul>
+          <ul class="vph-legend" aria-label="Tunnels in the graph">
+            <li v-for="item in legendItems" :key="item.id">
+              <button
+                v-if="item.tunnel"
+                type="button"
+                class="vph-legend-item"
+                :class="{ active: item.selected }"
+                :aria-pressed="item.selected ? 'true' : 'false'"
+                @click="highlight(item.owner)"
+              >
+                <span
+                  class="vph-legend-dot"
+                  :style="{ '--series': item.color }"
+                  aria-hidden="true"
+                ></span
+                >{{ item.name }}<span v-if="item.preferred" class="vph-muted"> Active exit</span
+                ><span v-if="item.stored" class="vph-muted"> Stored</span>
+              </button>
+              <span v-else class="vph-legend-item vph-muted">
+                <span class="vph-swatch vph-swatch-wan" aria-hidden="true"></span>{{ item.name }}
+              </span>
+            </li>
+          </ul>
+        </div>
         <span class="vph-muted vph-range-label">{{
           range === 1440
             ? 'Last 24 hours'
@@ -715,6 +717,16 @@
             loadHistory();
           "
       /></label>
+    </section>
+
+    <section v-if="recentEvents.length" class="vph-panel vph-changes">
+      <h2>Recent changes</h2>
+      <ul>
+        <li v-for="(e, i) in recentEvents" :key="i">
+          <time class="vph-muted" :title="new Date(e.at).toLocaleString()">{{ ago(e.at) }}</time>
+          <span>{{ e.text }}</span>
+        </li>
+      </ul>
     </section>
     <footer class="vph-footnote">
       {{ preview ? 'Design preview' : 'Wayline' }}, version {{ state.version || '0.1.0' }}
@@ -753,6 +765,36 @@ const palette = [
   '#a6761d',
 ];
 const historyInterval = 30000;
+const endpointPrefix = 'endpoint:';
+const uplinkPrefix = 'uplink:';
+const changeWindow = 60 * 60000;
+const targetKey = 'wayline.target';
+const storage = {
+  get(key) {
+    try {
+      return window.localStorage.getItem(key) || '';
+    } catch {
+      return '';
+    }
+  },
+  set(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+    } catch {
+      return;
+    }
+  },
+};
+const validCountry = (code) => typeof code === 'string' && /^[A-Z]{2}$/.test(code) && code !== 'XX';
+const flagOf = (code) =>
+  String.fromCodePoint(...[...code].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
+const countryName = (code) => {
+  try {
+    return new Intl.DisplayNames(['en'], { type: 'region' }).of(code) || code;
+  } catch {
+    return code;
+  }
+};
 export default {
   name: 'WaylineDashboard',
   props: { api: Object, preview: Boolean },
@@ -761,6 +803,8 @@ export default {
       state: {
         config: defaults(),
         tunnels: [],
+        uplinks: [],
+        events: [],
         capabilities: { configure: false, select: false, control: false },
         compat: { level: 'full', firmware: '', message: '' },
         scope: '',
@@ -777,9 +821,8 @@ export default {
       busyAction: '',
       noticeTimer: null,
       draft: defaults(),
-      tab: 'tunnels',
       selectedTunnel: '',
-      selectedTarget: '1.1.1.1',
+      selectedTarget: storage.get(targetKey) || '1.1.1.1',
       settingsOpen: false,
       loading: false,
       readError: '',
@@ -789,6 +832,7 @@ export default {
       error: '',
       notice: '',
       history: [],
+      historyMarkers: [],
       historyAt: 0,
       range: 60,
       offset: 0,
@@ -808,6 +852,12 @@ export default {
     };
   },
   computed: {
+    tipStyle() {
+      const x = this.hover ? this.hover.x : 0;
+      return x > this.chartWidth / 2
+        ? { left: x - 12 + 'px', transform: 'translateX(-100%)' }
+        : { left: x + 12 + 'px' };
+    },
     compat() {
       const c = this.state.compat || {};
       const level = ['monitoring', 'unsupported'].includes(c.level) ? c.level : 'full';
@@ -870,18 +920,75 @@ export default {
       if (this.readError) return 'Showing the last known state. Trying again.';
       return 'Tunnel state is up to date.';
     },
-    selectedName() {
-      const t = this.state.tunnels.find((t) => t.id === this.selectedTunnel);
-      return t ? t.name : 'Tunnel';
+    activeMedian() {
+      const active = this.state.tunnels.find((t) => t.preferred);
+      return active && isNumber(active.median) ? active.median : null;
     },
-    latencyMax() {
-      const values = this.state.tunnels.map((t) => t.median).filter((n) => typeof n === 'number');
-      return values.length ? Math.max(...values) : 0;
+    comparable() {
+      return this.state.tunnels.filter((t) => t.connected && isNumber(t.median)).length >= 2;
     },
-    fastestId() {
-      const measured = this.state.tunnels.filter((t) => typeof t.median === 'number');
-      if (!measured.length) return '';
-      return measured.reduce((a, b) => (b.median < a.median ? b : a)).id;
+    primarySelected() {
+      return this.selectedTarget === this.state.config.target;
+    },
+    overhead() {
+      const target = this.state.config.target;
+      const direct = (this.state.diagnostics[target] || {}).wan;
+      const tunnel = this.exitTunnel && this.exitTunnel.median;
+      if (!isNumber(direct) || !isNumber(tunnel)) return null;
+      const diff = tunnel - direct;
+      const title =
+        tunnel.toFixed(2) + ' ms through the tunnel, ' + direct.toFixed(2) + ' ms without VPN.';
+      if (Math.abs(diff) < 1) {
+        return {
+          headline: 'No added latency',
+          detail: 'compared with going direct to ' + target + '.',
+          title,
+        };
+      }
+      return diff > 0
+        ? {
+            headline: 'The VPN adds ' + diff.toFixed(2) + ' ms',
+            detail: 'compared with going direct to ' + target + '.',
+            title,
+          }
+        : {
+            headline: 'The VPN is ' + (-diff).toFixed(2) + ' ms faster',
+            detail: 'than going direct to ' + target + '.',
+            title,
+          };
+    },
+    exitTunnel() {
+      const t = this.state.tunnels.find((item) => item.preferred);
+      return t && t.enabled && t.connected ? t : null;
+    },
+    heroEgress() {
+      return this.exitTunnel ? this.egressFor(this.exitTunnel.id) : this.wanEgress;
+    },
+    heroEgressState() {
+      const e = this.heroEgress;
+      if (e && e.error) return 'error';
+      return e && e.ip ? 'ok' : 'checking';
+    },
+    heroPlace() {
+      return this.place(this.heroEgress && this.heroEgress.location);
+    },
+    wanPlace() {
+      return this.place(this.wanEgress && this.wanEgress.location);
+    },
+    wanInterface() {
+      const active = (this.state.uplinks || []).find((u) => u.active);
+      const name = (active && active.interface) || (this.wanEgress && this.wanEgress.interface);
+      return name || 'WAN';
+    },
+    egressCheckedAt() {
+      return (this.state.egress && this.state.egress.checkedAt) || 0;
+    },
+    latencyNotes() {
+      const notes = {};
+      this.state.tunnels.forEach((t) => {
+        notes[t.id] = this.latencyNote(t);
+      });
+      return notes;
     },
     endpoints() {
       return this.state.config.endpointDiagnostics && Array.isArray(this.state.endpoints)
@@ -894,15 +1001,20 @@ export default {
     wanAvailable() {
       return !!(this.state.wan && this.state.wan.available);
     },
-    wanHeader() {
-      const wan = this.state.wan || {};
-      return this.wanAvailable && wan.interface
-        ? 'Direct WAN (' + wan.interface + ')'
-        : 'Direct WAN';
-    },
     wanNote() {
       const reason = (this.state.wan || {}).reason;
       return 'Direct WAN is unavailable. ' + (reason || 'The router did not give a reason.');
+    },
+    uplinkRows() {
+      if (!this.state.config.diagnostics || !this.state.config.directWan) return [];
+      return (this.state.uplinks || []).slice().sort((a, b) => Number(b.active) - Number(a.active));
+    },
+    showServer() {
+      return !!(
+        this.state.config.diagnostics &&
+        this.state.config.directWan &&
+        this.state.config.endpointDiagnostics
+      );
     },
     bundleVersion() {
       return WAYLINE_VERSION;
@@ -913,13 +1025,6 @@ export default {
     wanEgress() {
       return this.egressFor('wan');
     },
-    selectedTunnelState() {
-      return this.state.tunnels.find((t) => t.id === this.selectedTunnel);
-    },
-    storedHistory() {
-      const t = this.selectedTunnelState;
-      return !!t && !t.connected && !!t.historyAvailable;
-    },
     emptyText() {
       if (!this.ready && !this.readError) return 'Reading tunnel state…';
       if (this.readError) return 'Tunnel state could not be read.';
@@ -927,7 +1032,7 @@ export default {
     },
     chartNote() {
       if (this.historyError) return this.historyError;
-      if (!this.selectedTunnel) return 'Choose a tunnel to see its history.';
+      if (!this.selectedTunnel) return 'No tunnels to show.';
       if (
         !this.history.length ||
         this.history.every((s) => s.points.every((p) => !isNumber(p.median)))
@@ -935,8 +1040,10 @@ export default {
         return this.historyLoaded ? 'No measurements in this range.' : 'Loading history…';
       return '';
     },
-    graphTarget() {
-      return this.tab === 'diagnostics' ? this.selectedTarget : this.state.config.target;
+    destinations() {
+      const config = this.state.config;
+      if (!config.diagnostics) return [config.target];
+      return [config.target].concat(config.targets.filter((t) => t !== config.target));
     },
     windowStart() {
       return this.anchor - (this.offset + this.range) * 60000;
@@ -951,52 +1058,99 @@ export default {
       );
       return Math.ceil((n * 1.15) / 25) * 25;
     },
-    allMode() {
-      return this.tab === 'tunnels';
+    endpointHistory() {
+      return !!this.state.config.endpointDiagnostics;
     },
     drawOrder() {
-      const others = this.history.filter((s) => !this.isSelected(s));
-      return others.concat(this.history.filter((s) => this.isSelected(s)));
+      const rank = (s) => {
+        if (this.isServer(s)) return 0;
+        if (s.id === 'wan' || this.isUplink(s)) return 1;
+        return this.isSelected(s) ? 3 : 2;
+      };
+      return this.history.slice().sort((a, b) => rank(a) - rank(b));
+    },
+    wanGraph() {
+      return !!(this.state.config.diagnostics && this.state.config.directWan && this.wanAvailable);
+    },
+    serverShown() {
+      return this.history.some((s) => this.isServer(s));
+    },
+    markerList() {
+      const end = this.windowStart + this.range * 60000;
+      return this.historyMarkers.filter((m) => m.at >= this.windowStart && m.at <= end);
+    },
+    recentEvents() {
+      return (this.state.events || []).slice(0, 5);
     },
     legendItems() {
-      return this.history.map((s) => {
-        const t = this.state.tunnels.find((tunnel) => tunnel.id === s.id);
-        return {
-          id: s.id,
-          name: s.name,
-          tunnel: s.id !== 'wan',
-          selected: this.isSelected(s),
-          color: this.seriesColor(s),
-          preferred: !!t && !!t.preferred,
-          stored: !!t && !t.connected,
-        };
-      });
+      return this.history
+        .filter((s) => !this.isServer(s))
+        .map((s) => {
+          const t = this.state.tunnels.find((tunnel) => tunnel.id === s.id);
+          const tunnel = s.id !== 'wan' && !this.isUplink(s);
+          return {
+            id: s.id,
+            name: this.seriesName(s),
+            owner: s.id,
+            tunnel,
+            selected: this.isSelected(s),
+            color: this.seriesColor(s),
+            preferred: tunnel && !!t && !!t.preferred,
+            stored: tunnel && !!t && !t.connected,
+          };
+        });
     },
     hoverRows() {
       if (!this.hover) return [];
-      const rows = this.history.map((s) => {
+      const valueAt = (s) => {
         let nearest = null;
         for (const p of s.points)
           if (!nearest || Math.abs(p.at - this.hover.at) < Math.abs(nearest.at - this.hover.at))
             nearest = p;
-        return {
-          id: s.id,
-          name: s.name,
-          color: this.seriesColor(s),
-          selected: this.isSelected(s),
-          value: nearest && isNumber(nearest.median) ? nearest.median : null,
-        };
-      });
-      return rows.sort((a, b) => {
+        return nearest && isNumber(nearest.median) ? nearest.median : null;
+      };
+      const tunnels = this.history
+        .filter((s) => !this.isServer(s) && !this.isUplink(s) && s.id !== 'wan')
+        .map((s) => {
+          const server = this.history.find((v) => this.isServer(v) && this.ownerOf(v) === s.id);
+          const through = valueAt(s);
+          const toServer = server ? valueAt(server) : null;
+          let text =
+            through === null
+              ? 'No measurement through the tunnel'
+              : this.ms(through) + ' through the tunnel';
+          if (toServer !== null) text += ', ' + this.ms(toServer) + ' to its server';
+          return {
+            id: s.id,
+            name: this.seriesName(s),
+            color: this.seriesColor(s),
+            selected: this.isSelected(s),
+            wan: false,
+            value: through,
+            text,
+          };
+        });
+      const others = this.history
+        .filter((s) => s.id === 'wan' || this.isUplink(s))
+        .map((s) => {
+          const value = valueAt(s);
+          return {
+            id: s.id,
+            name: this.seriesName(s),
+            color: this.seriesColor(s),
+            selected: false,
+            wan: true,
+            value,
+            text: value === null ? 'No measurement' : this.ms(value),
+          };
+        });
+      return tunnels.concat(others).sort((a, b) => {
         if (a.value === null || b.value === null) return (a.value === null) - (b.value === null);
         return a.value - b.value || a.name.localeCompare(b.name);
       });
     },
   },
   watch: {
-    tab() {
-      this.loadHistory();
-    },
     error(value) {
       if (value) this.$nextTick(() => this.reveal());
     },
@@ -1079,12 +1233,16 @@ export default {
         next.config = Object.assign(defaults(), next.config);
         next.auto = next.auto || { enabled: false, last: null };
         next.endpoints = Array.isArray(next.endpoints) ? next.endpoints : [];
+        next.uplinks = Array.isArray(next.uplinks) ? next.uplinks : [];
+        next.events = Array.isArray(next.events) ? next.events : [];
         next.resolved = next.resolved || {};
         next.wan = Object.assign({ available: true, interface: null, reason: '' }, next.wan);
         this.state = next;
         this.ready = true;
-        if (!next.config.targets.includes(this.selectedTarget))
-          this.selectedTarget = next.config.targets[0] || next.config.target;
+        if (!this.destinations.includes(this.selectedTarget)) {
+          this.selectedTarget = next.config.target;
+          this.historyAt = 0;
+        }
         if (!next.tunnels.some((t) => t.id === this.selectedTunnel))
           this.selectedTunnel =
             (next.tunnels.find((t) => t.preferred) || next.tunnels[0] || {}).id || '';
@@ -1141,6 +1299,17 @@ export default {
       if (s < 86400) return Math.round(s / 3600) + ' h ago';
       return Math.round(s / 86400) + ' d ago';
     },
+    changeFor(subject) {
+      const cutoff = Date.now() - changeWindow;
+      return this.state.events.find((e) => e.subject === subject && e.at >= cutoff) || null;
+    },
+    uplinkName(u) {
+      if (!u.active) return u.interface || u.id;
+      return u.interface ? 'Direct WAN (' + u.interface + ')' : 'Direct WAN';
+    },
+    unmeasurable(u) {
+      return u.state === 'route_mismatch' || u.state === 'route_unavailable';
+    },
     tunnelTone(t) {
       if (!t.enabled) return 'stopped';
       return t.connected ? 'connected' : 'offline';
@@ -1148,10 +1317,35 @@ export default {
     notEligible(t) {
       return !t.preferred && t.enabled && !t.eligible && this.can.select;
     },
-    tunnelEgress(t) {
-      const e = this.egressFor(t.id);
-      if (!e || !e.ip || e.error) return '';
-      return ', exit IP ' + e.ip + (e.location ? ' in ' + e.location : '');
+    exitIdentity(id) {
+      const e = this.egressFor(id);
+      if (!e || !e.ip || e.error) return null;
+      return { ip: e.ip, place: this.place(e.location) };
+    },
+    isExit(t) {
+      return !!this.exitTunnel && this.exitTunnel.id === t.id;
+    },
+    place(code) {
+      if (!validCountry(code)) return { flag: '', name: '' };
+      return { flag: flagOf(code), name: countryName(code) };
+    },
+    diagnosticValue(id) {
+      const d = (this.state.diagnostics || {})[this.selectedTarget] || {};
+      return isNumber(d[id]) ? d[id] : null;
+    },
+    uplinkValue(u) {
+      return this.diagnosticValue(u.active ? 'wan' : u.id);
+    },
+    serverFor(t) {
+      return this.endpoints.find((e) => e.tunnel === t.id) || null;
+    },
+    serverTitle(t) {
+      const e = this.serverFor(t);
+      return e && !e.address && e.reason ? e.reason : null;
+    },
+    serverMs(e) {
+      const d = (this.state.diagnostics || {})[e.address] || {};
+      return isNumber(d.wan) ? this.ms(d.wan) : '—';
     },
     lossShown(t) {
       return !!t.samples && t.lost > 0;
@@ -1164,9 +1358,37 @@ export default {
     lossTitle(t) {
       return t.lost + ' of ' + t.samples + ' samples lost';
     },
-    barWidth(t) {
-      if (typeof t.median !== 'number' || !this.latencyMax) return 0;
-      return Math.max(2, (t.median / this.latencyMax) * 100);
+    latencyNote(t) {
+      if (this.lossShown(t)) {
+        return { text: this.lossText(t) + ' loss', cls: 'vph-note-loss', title: this.lossTitle(t) };
+      }
+      const active = this.activeMedian;
+      if (this.comparable && !t.preferred && active !== null && isNumber(t.median)) {
+        const diff = active - t.median;
+        if (Math.abs(diff) <= 3) return { text: 'About the same as the active exit', cls: '' };
+        if (diff > 0) {
+          return {
+            text: diff.toFixed(2) + ' ms faster than the active exit',
+            cls: 'vph-note-faster',
+          };
+        }
+        return { text: (-diff).toFixed(2) + ' ms slower than the active exit', cls: '' };
+      }
+      const range = this.recentRange(t.recent);
+      if (!range) return null;
+      if (range.max - range.min < 3) {
+        return { text: 'Steady for the last ' + range.minutes + ' min', cls: '' };
+      }
+      return {
+        text:
+          range.min.toFixed(2) +
+          '–' +
+          range.max.toFixed(2) +
+          ' ms in the last ' +
+          range.minutes +
+          ' min',
+        cls: '',
+      };
     },
     useDisabled(t) {
       return this.busy || !t.eligible || !this.can.select;
@@ -1241,16 +1463,6 @@ export default {
     egressFor(id) {
       const paths = (this.state.egress && this.state.egress.paths) || [];
       return paths.find((p) => p.id === id) || null;
-    },
-    egressText(p, label) {
-      if (!p.ip) return label + ' unavailable.';
-      let text = label + ' ' + p.ip;
-      if (p.location) text += ' in ' + p.location;
-      if (p.colo) text += ' (' + p.colo + ')';
-      return text;
-    },
-    wanCell(target) {
-      return this.wanAvailable ? this.diagnostic(target, 'wan') : 'Unavailable';
     },
     async selectExit(t) {
       if (this.busy || t.preferred || !t.eligible || !this.can.select) return;
@@ -1334,35 +1546,42 @@ export default {
         this.busy = false;
       }
     },
+    chooseTarget(target) {
+      this.selectedTarget = target;
+      storage.set(targetKey, target);
+      this.loadHistory();
+    },
     async loadHistory() {
       if (this.offset === 0) this.anchor = Math.floor(Date.now() / 60000) * 60000;
       const request = ++this.historyRequest;
       this.historyAt = Date.now();
-      const selected = this.state.tunnels.find((tunnel) => tunnel.id === this.selectedTunnel);
-      if (!this.allMode && selected && !selected.connected && !selected.historyAvailable) {
-        this.history = [];
-        this.historyError = 'No history is stored for this tunnel. Start it to collect history.';
-        this.historyLoaded = true;
-        this.hover = null;
-        return;
-      }
-      if (!this.selectedTunnel || (this.tab === 'diagnostics' && !this.state.config.diagnostics))
-        return;
+      if (!this.selectedTunnel) return;
       try {
+        const endpoints = this.endpointHistory;
         const r = await this.call('get_history', {
           tunnel: this.selectedTunnel,
-          target: this.graphTarget,
-          all: this.allMode,
+          target: this.selectedTarget,
+          all: true,
+          uplinks: true,
           start: this.windowStart,
           end: this.windowStart + this.range * 60000,
           step: this.range === 1440 ? 5 : 1,
-          include_wan: !this.allMode && this.state.config.directWan,
+          include_wan: this.wanGraph,
+          ...(endpoints ? { endpoints: true } : {}),
         });
         if (request === this.historyRequest) {
-          this.history = Array.isArray(r.series) ? r.series : [];
-          this.history.forEach((series) => {
-            series.points = Array.isArray(series.points) ? series.points : [];
+          const series = Array.isArray(r.series) ? r.series : [];
+          series.forEach((item) => {
+            item.points = Array.isArray(item.points) ? item.points : [];
           });
+          this.history = series.filter(
+            (item) =>
+              !this.isServer(item) ||
+              (endpoints &&
+                series.some((owner) => !this.isServer(owner) && owner.id === this.ownerOf(item)) &&
+                item.points.some((p) => isNumber(p.median))),
+          );
+          this.historyMarkers = Array.isArray(r.events) ? r.events : [];
           this.historyError = '';
           this.historyLoaded = true;
           this.hover = null;
@@ -1373,12 +1592,19 @@ export default {
       } catch (e) {
         if (request === this.historyRequest) {
           this.history = [];
+          this.historyMarkers = [];
           this.historyError = e.message || 'History unavailable.';
         }
       }
     },
+    hasMs(n) {
+      return isNumber(n);
+    },
+    ms(n) {
+      return n.toFixed(2) + ' ms';
+    },
     latency(n) {
-      return n === null ? '—' : Math.round(n);
+      return isNumber(n) ? n.toFixed(2) : '—';
     },
     clock(t) {
       return new Date(t).toLocaleTimeString([], {
@@ -1386,10 +1612,6 @@ export default {
         minute: '2-digit',
         hour12: false,
       });
-    },
-    diagnostic(target, id) {
-      const d = (this.state.diagnostics || {})[target] || {};
-      return d[id] === undefined || d[id] === null ? 'Unavailable' : Math.round(d[id]) + ' ms';
     },
     chartX(at) {
       const x = 45 + ((at - this.windowStart) / (this.range * 60000)) * (this.chartWidth - 63);
@@ -1452,48 +1674,18 @@ export default {
       flush();
       return d;
     },
-    sparkStats(values) {
+    recentRange(values) {
       const valid = values.filter(isNumber);
-      if (valid.length < 2) return null;
-      const sorted = valid.slice().sort((a, b) => a - b);
-      const half = Math.floor(sorted.length / 2);
-      const median = sorted.length % 2 ? sorted[half] : (sorted[half - 1] + sorted[half]) / 2;
-      return {
-        min: sorted[0],
-        max: sorted[sorted.length - 1],
-        median,
-        lost: values.length - valid.length,
-      };
-    },
-    sparkLabel(t) {
-      const s = this.sparkStats(t.recent);
-      const head = 'Recent latency for ' + t.name + ': ';
-      if (!s) return head + 'waiting for samples.';
-      const lost = s.lost === 1 ? '1 lost sample' : s.lost + ' lost samples';
-      return (
-        head +
-        'min ' +
-        Math.round(s.min) +
-        ' ms, median ' +
-        Math.round(s.median) +
-        ' ms, max ' +
-        Math.round(s.max) +
-        ' ms, ' +
-        lost +
-        '.'
+      if (valid.length < 4) return null;
+      const minutes = Math.max(
+        1,
+        Math.round((values.length * (this.state.config.interval || 15)) / 60),
       );
-    },
-    sparkBars(values) {
-      const s = this.sparkStats(values);
-      if (!s) return [];
-      const span = s.max - s.min || 1;
-      const recent = values.slice(-64);
-      return recent.map((n, i) => {
-        const x = 128 - (recent.length - i) * 2;
-        if (!isNumber(n)) return { i, x, y: 0, w: 1.4, h: 24, lost: true };
-        const h = 5 + (19 * (n - s.min)) / span;
-        return { i, x, y: 24 - h, w: 1.4, h, lost: false };
-      });
+      return {
+        min: Math.min(...valid),
+        max: Math.max(...valid),
+        minutes,
+      };
     },
     keyHover(e) {
       if (e.key === 'Escape') {
@@ -1517,30 +1709,48 @@ export default {
     hoverX(raw) {
       const x = Math.max(45, Math.min(this.chartWidth - 18, raw));
       const at = this.windowStart + ((x - 45) / (this.chartWidth - 63)) * this.range * 60000;
-      this.hover = { x, at };
+      const marker = this.markerList.find((m) => Math.abs(this.chartX(m.at) - x) < 5);
+      this.hover = { x, at, marker: marker ? marker.text : '' };
+    },
+    showMarker(m) {
+      this.hover = { x: this.chartX(m.at), at: m.at, marker: m.text };
     },
     highlight(id) {
-      if (this.selectedTunnel === id) return;
       this.selectedTunnel = id;
-      if (!this.allMode) this.loadHistory();
+    },
+    isServer(series) {
+      return series.id.startsWith(endpointPrefix);
+    },
+    isUplink(series) {
+      return series.id.startsWith(uplinkPrefix);
+    },
+    seriesName(series) {
+      if (series.id === 'wan') return 'Direct WAN (no VPN)';
+      if (this.isUplink(series)) return series.id.slice(uplinkPrefix.length) + ' uplink';
+      return series.name;
+    },
+    ownerOf(series) {
+      return this.isServer(series) ? series.id.slice(endpointPrefix.length) : series.id;
     },
     isSelected(series) {
-      return series.id === this.selectedTunnel;
+      return series.id !== 'wan' && this.ownerOf(series) === this.selectedTunnel;
     },
     isDimmed(series) {
       return (
         series.id !== 'wan' &&
+        !this.isUplink(series) &&
         !this.isSelected(series) &&
         this.history.some((s) => this.isSelected(s))
       );
     },
     hasBand(series) {
-      return this.isSelected(series) || series.id === 'wan';
+      return !this.isServer(series) && this.isSelected(series);
     },
     seriesColor(series) {
-      if (series.id === 'wan') return 'var(--vph-muted)';
-      if (this.isSelected(series)) return 'var(--vph-brand)';
-      const index = this.state.tunnels.findIndex((t) => t.id === series.id);
+      const owner = this.ownerOf(series);
+      if (owner === 'wan' || this.isUplink(series)) return 'var(--vph-muted)';
+      const index = this.state.tunnels.findIndex((t) => t.id === owner);
+      if (index >= 0 && this.state.tunnels[index].preferred) return 'var(--vph-brand)';
       return palette[(index < 0 ? 0 : index) % palette.length];
     },
   },
@@ -1625,7 +1835,6 @@ export default {
 }
 .vph-heading,
 .vph-chart-heading,
-.vph-scope,
 .vph-chart-footer {
   display: flex;
   align-items: center;
@@ -1689,26 +1898,6 @@ export default {
   border-radius: 7px;
   margin: 16px 0;
 }
-.vph-tabs {
-  display: flex;
-  gap: 26px;
-  border-bottom: 1px solid var(--vph-border);
-  margin: 22px 0;
-}
-.vph-tabs button {
-  background: none;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  padding: 10px 0;
-  color: var(--vph-muted);
-}
-.vph-tabs button.active {
-  border-color: var(--vph-brand);
-  color: var(--vph-brand-text);
-}
-.vph-scope {
-  margin: 18px 0 12px;
-}
 .vph-table-wrap {
   overflow-x: auto;
   min-height: 120px;
@@ -1724,13 +1913,11 @@ export default {
   color: var(--vph-warn-text);
   font-size: 13px;
 }
-.vph-stored {
-  color: var(--vph-brand-text);
-  font-size: 12px;
-  margin: 2px 0 0;
+.vph-col-through {
+  width: 170px;
 }
-.vph-endpoint td {
-  background: color-mix(in srgb, var(--vph-muted) 5%, var(--vph-card));
+.vph-col-server {
+  width: 150px;
 }
 .vph table {
   width: 100%;
@@ -1755,6 +1942,16 @@ export default {
 .vph tr:last-child td {
   border-bottom: 0;
 }
+.vph-exits td {
+  height: 64px;
+}
+.vph-exits .vph-tunnel {
+  width: 100%;
+  max-width: 0;
+}
+.vph-uplink-row td {
+  color: var(--vph-muted);
+}
 .vph tbody tr:hover {
   background: color-mix(in srgb, var(--vph-muted) 4%, var(--vph-card));
 }
@@ -1775,9 +1972,21 @@ export default {
 }
 .vph-name-line {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 4px 8px;
   min-width: 0;
+}
+.vph-name-line .vph-name {
+  min-width: 0;
+}
+.vph-server-ms,
+.vph-server-address {
+  display: block;
+}
+.vph-wan-name {
+  font-weight: 400;
+  color: var(--vph-muted);
 }
 .vph-state-dot {
   flex: none;
@@ -1803,43 +2012,53 @@ export default {
   background: color-mix(in srgb, var(--vph-brand) 12%, var(--vph-card));
   padding: 1px 8px;
 }
+.vph-tag {
+  flex: none;
+  display: inline-block;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+  color: var(--vph-warn-text);
+  background: color-mix(in srgb, #e0a800 18%, var(--vph-card));
+  padding: 1px 8px;
+}
 .vph-status {
   font-size: 12px;
   margin-top: 4px;
 }
-.vph-metric {
-  min-width: 128px;
-}
 .vph-metric .vph-number {
   display: block;
 }
-.vph-loss {
+.vph .vph-latency {
+  font-size: 22px;
+  font-weight: 500;
+  line-height: 28px;
+}
+.vph .vph-latency small {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--vph-muted);
+}
+.vph-latency-text {
+  font-size: 13px;
+  color: var(--vph-muted);
+}
+.vph-latency-note {
   display: block;
   margin-top: 2px;
   font-size: 12px;
+  line-height: 18px;
   font-variant-numeric: tabular-nums;
+  color: var(--vph-muted);
+}
+.vph-note-loss {
   color: var(--vph-danger-text);
 }
-.vph-bar {
-  display: block;
-  width: 96px;
-  height: 4px;
-  margin-top: 6px;
-  border-radius: 2px;
-  background: color-mix(in srgb, var(--vph-muted) 14%, var(--vph-card));
-  overflow: hidden;
-}
-.vph-bar-fill {
-  display: block;
-  height: 100%;
-  border-radius: 2px;
-  background: color-mix(in srgb, var(--vph-muted) 45%, var(--vph-card));
-}
-.vph-bar-best {
-  background: var(--vph-brand);
+.vph-note-faster {
+  color: var(--vph-brand-text);
 }
 .vph-action {
-  min-width: 232px;
   text-align: right;
 }
 .vph-actions {
@@ -1921,19 +2140,6 @@ export default {
   font-size: 12px;
   margin: 12px 0 16px;
 }
-.vph-spark {
-  width: 128px;
-  height: 24px;
-  display: block;
-}
-.vph-spark rect {
-  fill: var(--vph-muted);
-  opacity: 0.55;
-}
-.vph-spark .vph-spark-lost {
-  fill: var(--vph-danger);
-  opacity: 0.35;
-}
 .vph-dot {
   fill: var(--series, var(--vph-brand));
 }
@@ -1950,6 +2156,112 @@ export default {
 .vph-egress-error {
   color: var(--vph-danger-text);
 }
+.vph-hero .vph-hero-overhead {
+  margin-top: 8px;
+  font-size: 14px;
+  color: var(--vph-text);
+}
+.vph-hero-overhead strong {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.vph-hero {
+  padding: 20px 22px;
+  background: color-mix(in srgb, var(--vph-brand) 6%, var(--vph-card));
+}
+.vph-hero p {
+  margin: 0;
+}
+.vph-hero .vph-hero-label {
+  font-size: 13px;
+  color: var(--vph-muted);
+}
+.vph-hero .vph-hero-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 14px;
+  margin-top: 6px;
+}
+.vph-hero-ip {
+  font-size: 32px;
+  font-weight: 500;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.vph-hero-country {
+  font-size: 18px;
+}
+.vph-hero .vph-hero-pending {
+  font-size: 18px;
+  color: var(--vph-muted);
+}
+.vph-hero .vph-hero-via {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--vph-muted);
+}
+.vph-hero .vph-hero-wan {
+  margin-top: 14px;
+  font-size: 15px;
+}
+.vph-hero .vph-hero-updated {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--vph-muted);
+}
+.vph-flag {
+  font-family: 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif;
+}
+.vph-table-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  margin-top: 18px;
+}
+.vph-table-head p {
+  margin: 0;
+  font-size: 13px;
+}
+.vph-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 0;
+  padding: 0 8px;
+  list-style: none;
+  font-size: 12px;
+  color: var(--vph-muted);
+}
+.vph-key li {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.vph-key-line {
+  display: block;
+  width: 24px;
+  height: 8px;
+  overflow: visible;
+}
+.vph-key-line line {
+  stroke: var(--vph-muted);
+  stroke-width: 1.8;
+}
+.vph-key-line .vph-key-dashed {
+  stroke-dasharray: 4 3;
+}
+.vph-legend-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--series, var(--vph-brand));
+}
 .vph-history {
   padding: 22px;
 }
@@ -1958,6 +2270,12 @@ export default {
 }
 .vph-chart-heading p {
   font-size: 12px;
+}
+.vph-chart-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
 }
 .vph-ranges {
   display: flex;
@@ -2021,11 +2339,37 @@ export default {
 }
 .vph-wan-series .vph-line {
   stroke: var(--vph-muted);
-  stroke-dasharray: 5 4;
+  stroke-width: 1.5;
 }
 .vph-wan-series .vph-band {
   fill: var(--vph-muted);
   opacity: 0.05;
+}
+.vph-uplink-series .vph-line {
+  stroke-width: 1.2;
+  opacity: 0.8;
+}
+.vph-endpoint-series .vph-line {
+  stroke-width: 1.2;
+  stroke-dasharray: 4 3;
+}
+.vph-endpoint-series.vph-series-selected .vph-line {
+  stroke-width: 1.8;
+}
+.vph-marker-line {
+  stroke: var(--vph-muted);
+  stroke-width: 1;
+  stroke-dasharray: 2 3;
+}
+.vph-marker-dot {
+  fill: var(--vph-muted);
+}
+.vph-marker {
+  outline: none;
+}
+.vph-marker:focus-visible .vph-marker-dot {
+  stroke: var(--vph-brand);
+  stroke-width: 2;
 }
 .vph-guide {
   stroke: var(--vph-muted);
@@ -2035,14 +2379,22 @@ export default {
 .vph-tooltip {
   position: absolute;
   top: 25px;
-  width: 268px;
-  white-space: nowrap;
+  width: max-content;
+  max-width: min(380px, calc(100% - 24px));
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
   padding: 10px 12px;
   background: var(--vph-card);
   border: 1px solid var(--vph-border);
   border-radius: 5px;
   font-size: 12px;
   pointer-events: none;
+}
+.vph-tip-event {
+  color: var(--vph-brand-text);
+  white-space: normal;
+  margin: 2px 0 4px;
 }
 .vph-tip-selected {
   color: var(--vph-text);
@@ -2104,7 +2456,14 @@ button.vph-legend-item {
 .vph-swatch-wan {
   height: 0;
   background: none;
-  border-top: 2px dashed var(--vph-muted);
+  border-top: 1.5px solid var(--vph-muted);
+}
+.vph-legend-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
 }
 .vph-tip-swatch {
   width: 10px;
@@ -2127,6 +2486,31 @@ button.vph-legend-item {
   width: 100%;
   margin: 8px 0 0;
   accent-color: var(--vph-brand);
+}
+.vph-changes {
+  padding: 16px 18px;
+}
+.vph-changes h2 {
+  margin-bottom: 8px;
+}
+.vph-changes ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.vph-changes li {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  font-size: 13px;
+  padding: 7px 0;
+  border-top: 1px solid var(--vph-border);
+}
+.vph-changes time {
+  flex: none;
+  width: 84px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 .vph-settings {
   padding: 24px;
@@ -2322,7 +2706,6 @@ button.vph-legend-item {
     font-size: 23px;
   }
   .vph-button,
-  .vph-tabs button,
   .vph-ranges button {
     min-height: 44px;
   }
@@ -2331,6 +2714,15 @@ button.vph-legend-item {
   }
   .vph-info {
     padding: 12px;
+  }
+  .vph-hero {
+    padding: 16px;
+  }
+  .vph-hero-ip {
+    font-size: 24px;
+  }
+  .vph-hero-country {
+    font-size: 16px;
   }
   .vph-fields {
     grid-template-columns: 1fr;
@@ -2355,28 +2747,19 @@ button.vph-legend-item {
   .vph select {
     font-size: 16px !important;
   }
-  .vph-scope {
-    gap: 6px;
-  }
   .vph-preview {
     font-size: 12px;
   }
-  .vph-tabs {
-    gap: 22px;
-  }
 }
 @media (max-width: 639px) {
-  .vph thead {
+  .vph-exits thead {
     position: absolute;
     width: 1px;
     height: 1px;
     overflow: hidden;
     clip: rect(0 0 0 0);
   }
-  .vph-spark-column {
-    display: none;
-  }
-  .vph tbody tr {
+  .vph-exits tbody tr {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -2384,38 +2767,31 @@ button.vph-legend-item {
     padding: 12px 16px;
     border-bottom: 1px solid var(--vph-border);
   }
-  .vph tbody tr:last-child {
+  .vph-exits tbody tr:last-child {
     border-bottom: 0;
   }
-  .vph td {
+  .vph-exits td {
     height: auto;
     padding: 0;
     border-bottom: 0;
   }
-  .vph .vph-tunnel {
+  .vph-exits .vph-tunnel {
     flex: 1 0 100%;
+    width: auto;
+    max-width: none;
     min-width: 0;
   }
-  .vph td[data-label]::before {
+  .vph-exits td[data-label]::before {
     content: attr(data-label);
     margin-right: 6px;
     font-size: 12px;
     color: var(--vph-muted);
   }
-  .vph-metric {
-    min-width: 0;
-  }
-  .vph-metric .vph-bar {
-    width: 72px;
-  }
-  .vph-loss {
-    margin-left: 0;
-  }
-  .vph .vph-action {
+  .vph-exits .vph-action {
     min-width: 0;
     margin-left: auto;
   }
-  .vph .vph-action.vph-confirming {
+  .vph-exits .vph-action.vph-confirming {
     flex: 1 0 100%;
   }
 }

@@ -1,5 +1,5 @@
 use crate::{
-    auto, egress, history, native,
+    auto, changes, egress, history, native,
     resolve::Resolved,
     router,
     runtime::{DAEMON, MONITOR_CONFIG, RUNTIME, STATUS_SOCKET, locked, now, snapshot},
@@ -11,7 +11,16 @@ use serde_json::{Value, json};
 use std::{fs, os::unix::fs::symlink, path::Path};
 use wayline_support::{atomic, text};
 
+fn flush() {
+    if let Ok(config) = Settings::read()
+        && config.enabled
+    {
+        let _ = history::collect(&config, &snapshot());
+    }
+}
+
 fn delete() -> Result<Value> {
+    flush();
     native::bus("service", "delete", &json!({"name":"wayline"}))
 }
 
@@ -74,6 +83,9 @@ fn reconcile_inner() -> Result<()> {
         .is_ok_and(|value| value["wayline"]["instances"]["monitor"]["running"] == true);
     if changed || !running {
         if changed {
+            if running {
+                flush();
+            }
             atomic(path, &encoded)?;
         }
         native::bus::<Value>(
@@ -134,6 +146,11 @@ fn routine() -> Result<()> {
         }
     }
     reconcile()?;
+    let recorded = if config.enabled {
+        router::inventory().and_then(|inventory| changes::record(&config, &inventory))
+    } else {
+        Ok(())
+    };
     if config.enabled && native::supported() {
         egress::Cache::refresh(&router::inventory()?)?;
     }
@@ -144,11 +161,12 @@ fn routine() -> Result<()> {
         .unwrap_or(0);
     let now = now();
     if config.enabled && (now.saturating_sub(last) >= 300 || now < last) {
-        let remembered = history::Known::remember(&config, &router::inventory()?);
-        let result = history::collect(&config, &snapshot()).and(remembered);
+        let result = history::collect(&config, &snapshot())
+            .and_then(|()| router::inventory())
+            .and_then(|inventory| history::migrate(&config, &inventory));
         atomic(Path::new(&collected), now.to_string().as_bytes())?;
         result?;
     }
     let _ = auto::step(&config);
-    Ok(())
+    recorded
 }

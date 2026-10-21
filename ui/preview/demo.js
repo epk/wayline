@@ -12,6 +12,8 @@
     ? query.get('compat')
     : 'full';
   const wanDown = query.get('wan') === 'unavailable';
+  const directExit = query.get('exit') === 'direct';
+  const wanMs = wanDown ? null : 14.37;
   const compatMessages = {
     full: '',
     monitoring: 'This firmware is newer than the tested range. Monitoring works.',
@@ -28,7 +30,7 @@
   const features = { full: 4, newer: 4, monitoring: 2, unsupported: 0 };
   let revision = 1;
   const state = {
-    version: '0.1.0-alpha.4',
+    version: '0.1.0-alpha.5',
     revision: '1',
     scope: 'All clients',
     compat: {
@@ -52,49 +54,47 @@
       autoExit: true,
       endpointDiagnostics: true,
     },
-    egress: Object.assign(
-      { checkedAt: Math.floor(Date.now() / 1000) - 90 },
-      {
-        paths: [
-          {
-            id: 'home',
-            name: names.home,
-            interface: 'wg-home',
-            ip: '203.0.113.5',
-            location: 'CA',
-            colo: 'YYZ',
-            error: null,
-          },
-          {
-            id: 'backup',
-            name: names.backup,
-            interface: 'wg-backup',
-            ip: '198.51.100.7',
-            location: 'DE',
-            colo: 'FRA',
-            error: null,
-          },
-          {
-            id: 'tokyo',
-            name: names.tokyo,
-            interface: 'wg-tokyo',
-            ip: null,
-            location: null,
-            colo: null,
-            error: 'The IP check timed out after 6 seconds.',
-          },
-          {
-            id: 'wan',
-            name: names.wan,
-            interface: wanDown ? null : 'wwan',
-            ip: wanDown ? null : '203.0.113.80',
-            location: wanDown ? null : 'US',
-            colo: wanDown ? null : 'LAX',
-            error: wanDown ? 'Direct WAN is unavailable.' : null,
-          },
-        ],
-      },
-    ),
+    egress: {
+      checkedAt: Math.floor(Date.now() / 1000) - 90,
+      paths: [
+        {
+          id: 'home',
+          name: names.home,
+          interface: 'wg-home',
+          ip: '203.0.113.5',
+          location: 'CA',
+          colo: 'YYZ',
+          error: null,
+        },
+        {
+          id: 'backup',
+          name: names.backup,
+          interface: 'wg-backup',
+          ip: '198.51.100.7',
+          location: 'DE',
+          colo: 'FRA',
+          error: null,
+        },
+        {
+          id: 'tokyo',
+          name: names.tokyo,
+          interface: 'wg-tokyo',
+          ip: null,
+          location: null,
+          colo: null,
+          error: 'The IP check timed out after 6 seconds.',
+        },
+        {
+          id: 'wan',
+          name: names.wan,
+          interface: wanDown ? null : 'eth1',
+          ip: wanDown ? null : '203.0.113.80',
+          location: wanDown ? null : 'US',
+          colo: wanDown ? null : 'LAX',
+          error: wanDown ? 'Direct WAN is unavailable.' : null,
+        },
+      ],
+    },
     auto: {
       enabled: true,
       last: {
@@ -110,10 +110,54 @@
           interface: null,
           reason: 'The WAN probe cannot bypass the VPN on this firmware.',
         }
-      : { available: true, interface: 'wwan', reason: '' },
+      : { available: true, interface: 'eth1', reason: '' },
+    uplinks: [
+      {
+        id: 'wan',
+        interface: wanDown ? null : 'eth1',
+        device: wanDown ? null : 'eth1',
+        address: null,
+        active: true,
+        state: wanDown ? 'route_unavailable' : 'reachable',
+        median: wanMs,
+      },
+      {
+        id: 'uplink:wwan',
+        interface: 'wwan',
+        device: 'wwan0',
+        address: '100.64.12.9',
+        active: false,
+        state: 'reachable',
+        median: 21.84,
+      },
+      {
+        id: 'uplink:secondwan',
+        interface: 'secondwan',
+        device: 'eth2',
+        address: '192.0.2.77',
+        active: false,
+        state: 'route_mismatch',
+        median: null,
+      },
+    ],
+    events: [
+      {
+        at: Date.now() - 20 * 60000,
+        subject: 'home',
+        kind: 'server',
+        text: 'VPN server address changed to 203.0.113.10',
+      },
+      {
+        at: Date.now() - 3 * 3600000,
+        subject: 'wan',
+        kind: 'uplink',
+        text: 'Active uplink changed from wwan to eth1',
+      },
+    ],
     endpoints: [
       { tunnel: 'home', name: names.home, address: '203.0.113.10', reason: '' },
       { tunnel: 'backup', name: names.backup, address: '198.51.100.24', reason: '' },
+      { tunnel: 'tokyo', name: names.tokyo, address: '192.0.2.44', reason: '' },
       {
         tunnel: 'zurich',
         name: names.zurich,
@@ -126,13 +170,13 @@
       {
         id: 'home',
         name: names.home,
-        preferred: true,
+        preferred: !directExit,
         enabled: true,
         connected: true,
         controllable: true,
         stateLabel: 'Connected',
         age: '4s',
-        median: 32,
+        median: 32.41,
         lost: 0,
         samples: 64,
         eligible: true,
@@ -147,13 +191,11 @@
         controllable: true,
         stateLabel: 'Connected',
         age: '7s',
-        median: 48,
+        median: 24.18,
         lost: 0,
         samples: 64,
         eligible: true,
-        recent: Array.from({ length: 64 }, (_, i) =>
-          i === 42 ? null : 48 + Math.sin(i * 1.2) * 6 + (i > 28 && i < 34 ? 35 : 0),
-        ),
+        recent: Array.from({ length: 64 }, (_, i) => 24 + Math.sin(i * 1.2) * 3),
       },
       {
         id: 'tokyo',
@@ -164,7 +206,7 @@
         controllable: true,
         stateLabel: 'Connected',
         age: '10s',
-        median: 131,
+        median: 131.07,
         lost: 4,
         samples: 64,
         eligible: false,
@@ -191,20 +233,57 @@
       },
     ],
     diagnostics: {
-      '1.1.1.1': { home: 32, backup: 48, tokyo: 131, zurich: null, wan: 14 },
-      '9.9.9.9': { home: 36, backup: 52, tokyo: 128, zurich: null, wan: 15 },
-      'example.com': { home: 39, backup: 55, tokyo: 124, zurich: null, wan: 18 },
-      'missing.invalid': { home: null, backup: null, tokyo: null, zurich: null, wan: null },
+      '1.1.1.1': {
+        home: 32.41,
+        backup: 24.18,
+        tokyo: 131.07,
+        zurich: null,
+        wan: wanMs,
+        'uplink:wwan': 21.84,
+        'uplink:secondwan': null,
+      },
+      '9.9.9.9': {
+        home: 36.02,
+        backup: 28.55,
+        tokyo: 128.3,
+        zurich: null,
+        wan: wanDown ? null : 15.1,
+        'uplink:wwan': 23.9,
+        'uplink:secondwan': null,
+      },
+      'example.com': {
+        home: 39.76,
+        backup: 31.2,
+        tokyo: 124.48,
+        zurich: null,
+        wan: wanDown ? null : 18.05,
+        'uplink:wwan': 26.4,
+        'uplink:secondwan': null,
+      },
+      'missing.invalid': {
+        home: null,
+        backup: null,
+        tokyo: null,
+        zurich: null,
+        wan: null,
+        'uplink:wwan': null,
+        'uplink:secondwan': null,
+      },
       '203.0.113.10': { wan: 21 },
       '198.51.100.24': { wan: 29 },
+      '192.0.2.44': { wan: 118 },
     },
   };
   state.tunnels.forEach((tunnel) => (tunnel.monitorId = tunnel.id));
   const copy = (o) => JSON.parse(JSON.stringify(o));
   const delay = (o) => new Promise((resolve) => setTimeout(() => resolve(copy(o)), 180));
+  const measurableUplinks = state.uplinks
+    .filter((u) => !u.active && u.state === 'reachable')
+    .map((u) => u.id);
   function series(id, target, start, end, step) {
     const targetBias = target === 'example.com' ? 7 : target === '9.9.9.9' ? 4 : 0;
-    const base = { home: 32, backup: 48, tokyo: 130, zurich: 62, wan: 14 }[id] || 32;
+    const base =
+      { home: 32, backup: 24, tokyo: 130, zurich: 62, wan: 14, 'uplink:wwan': 22 }[id] || 32;
     const points = [];
     for (let at = start; at <= end; at += step * 60000) {
       const n = Math.round((at - anchor) / 60000) + 1440;
@@ -227,6 +306,29 @@
     }
     return { id, name: names[id], points };
   }
+  function serverSeries(id, target, start, end, step) {
+    const ratio = { home: 0.72, backup: 0.68, tokyo: 0.76 }[id];
+    const through = series(id, target, start, end, step);
+    return {
+      id: `endpoint:${id}`,
+      name: `${names[id]} server`,
+      points: through.points.map((p) => {
+        const n = Math.round((p.at - anchor) / 60000) + 1440;
+        const median =
+          ratio && p.median !== null
+            ? Math.max(1, Math.round(p.median * ratio + Math.sin(n * 2.1) * 1.5))
+            : null;
+        return {
+          at: p.at,
+          median,
+          min: median === null ? null : median - 2,
+          max: median === null ? null : median + 3,
+          lost: 0,
+          sent: 4,
+        };
+      }),
+    };
+  }
   window.previewApi = {
     get_state: () =>
       query.get('fail') === '1'
@@ -239,6 +341,8 @@
                   endpoints: [],
                   diagnostics: {},
                   resolved: {},
+                  uplinks: [],
+                  events: [],
                   auto: { enabled: false, last: null },
                 }
               : copy(state),
@@ -282,15 +386,20 @@
       }
       return delay({ applied: true, enabled });
     },
-    get_history: ({ tunnel, target, start, end, step, include_wan, all }) => {
+    get_history: ({ tunnel, target, start, end, step, include_wan, all, endpoints, uplinks }) => {
       const ids = all
         ? state.tunnels.filter((t) => t.connected || t.historyAvailable).map((t) => t.id)
         : [tunnel];
+      const withServers = all && endpoints && state.config.endpointDiagnostics;
+      const events = state.events.filter((e) => e.at >= start && e.at <= end);
       return Promise.resolve({
         series: [
           ...ids.map((id) => series(id, target, start, end, step)),
           ...(include_wan && !wanDown ? [series('wan', target, start, end, step)] : []),
+          ...(uplinks ? measurableUplinks.map((id) => series(id, target, start, end, step)) : []),
+          ...(withServers ? ids.map((id) => serverSeries(id, target, start, end, step)) : []),
         ],
+        events,
       });
     },
     check_update: () =>

@@ -1,5 +1,5 @@
 use crate::{
-    auto, egress, history, native,
+    auto, changes, egress, history, native,
     resolve::Resolved,
     router,
     runtime::{RUNTIME, SETTINGS, locked, milliseconds, snapshot, version},
@@ -10,7 +10,11 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, net::Ipv4Addr, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::Ipv4Addr,
+    path::Path,
+};
 use wayline_protocol::{Series, State as Measurement};
 use wayline_support::atomic;
 
@@ -25,6 +29,8 @@ pub struct State {
     diagnostics: BTreeMap<String, BTreeMap<String, Option<f64>>>,
     endpoints: Vec<EndpointView>,
     wan: WanView,
+    uplinks: Vec<UplinkView>,
+    events: Vec<changes::Event>,
     resolved: BTreeMap<String, Option<Ipv4Addr>>,
     auto: AutoView,
     egress: egress::Cache,
@@ -49,6 +55,17 @@ struct WanView {
     available: bool,
     interface: Option<String>,
     reason: String,
+}
+
+#[derive(Serialize)]
+struct UplinkView {
+    id: String,
+    interface: String,
+    device: String,
+    address: Ipv4Addr,
+    active: bool,
+    state: Option<Measurement>,
+    median: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -138,6 +155,7 @@ fn diagnostics(
                 .paths
                 .iter()
                 .chain(inventory.wan.iter())
+                .chain(inventory.standby_uplinks())
                 .map(|path| {
                     let latency = measurement(snapshot, path, target)
                         .and_then(|item| item.median_us)
@@ -153,7 +171,7 @@ fn diagnostics(
             result
                 .entry(endpoint.target.to_string())
                 .or_insert_with(|| {
-                    let id = router::endpoint_series(wan, &endpoint.key);
+                    let id = router::endpoint_series(&endpoint.key);
                     let latency = snapshot
                         .iter()
                         .find(|series| series.id == id)
@@ -186,9 +204,9 @@ fn tunnels(
     inventory: &router::Inventory,
     snapshot: &[Series],
     native: &Result<native::List>,
+    known: &BTreeSet<String>,
     compatible: bool,
 ) -> Vec<Tunnel> {
-    let known = history::Known::read(config);
     let preferred = native
         .as_ref()
         .ok()
@@ -215,7 +233,8 @@ fn tunnels(
             name: tunnel.name.clone(),
             enabled: tunnel.enabled,
             connected: path.is_some(),
-            history_available: path.is_some() || known.contains(&tunnel.key),
+            history_available: path.is_some()
+                || known.contains(&router::tunnel_prefix(&tunnel.key)),
             controllable: compatible
                 && native.as_ref().is_ok_and(|list| {
                     router::native_tunnel(list, inventory, &tunnel.id)
@@ -267,6 +286,34 @@ fn endpoint_views(config: &Settings, inventory: &router::Inventory) -> Vec<Endpo
         .collect()
 }
 
+fn uplink_views(
+    config: &Settings,
+    inventory: &router::Inventory,
+    snapshot: &[Series],
+) -> Vec<UplinkView> {
+    inventory
+        .uplinks
+        .iter()
+        .map(|uplink| {
+            let active = inventory
+                .wan
+                .as_ref()
+                .is_some_and(|wan| wan.name == uplink.name);
+            let path = inventory.wan.as_ref().filter(|_| active).unwrap_or(uplink);
+            let item = measurement(snapshot, path, &config.target);
+            UplinkView {
+                id: uplink.id.clone(),
+                interface: uplink.name.clone(),
+                device: uplink.interface.clone(),
+                address: uplink.source,
+                active,
+                state: item.map(|item| item.state),
+                median: item.and_then(|item| item.median_us).map(milliseconds),
+            }
+        })
+        .collect()
+}
+
 fn wan_view(inventory: &router::Inventory) -> WanView {
     WanView {
         available: inventory.wan.is_some(),
@@ -287,6 +334,8 @@ fn unsupported(compat: native::Compat) -> State {
             interface: None,
             reason: compat.message.clone(),
         },
+        uplinks: Vec::new(),
+        events: Vec::new(),
         resolved: BTreeMap::new(),
         auto: AutoView {
             enabled: false,
@@ -328,13 +377,20 @@ pub fn state() -> Result<State> {
         );
     }
     let compatible = compat.level == native::Level::Full;
-    let tunnels = tunnels(&config, &inventory, &snapshot, &native, compatible);
+    let known = history::known_prefixes();
+    let tunnels = tunnels(&config, &inventory, &snapshot, &native, &known, compatible);
     let auto_enabled = config.auto_exit;
     let resolved = resolved(&config, &inventory);
     let endpoints = router::endpoints(&config, &inventory);
     let diagnostics = diagnostics(&config, &inventory, &endpoints, &snapshot);
     let endpoint_list = endpoint_views(&config, &inventory);
     let wan = wan_view(&inventory);
+    let uplinks = uplink_views(&config, &inventory, &snapshot);
+    let events = changes::read(&config)
+        .into_iter()
+        .rev()
+        .take(changes::RECENT)
+        .collect();
     ensure!(
         router::revision()? == revision,
         "State changed during discovery. Refresh again."
@@ -347,6 +403,8 @@ pub fn state() -> Result<State> {
         resolved,
         endpoints: endpoint_list,
         wan,
+        uplinks,
+        events,
         auto: AutoView {
             enabled: auto_enabled,
             last: auto::Record::read().last,

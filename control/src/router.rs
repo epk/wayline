@@ -108,7 +108,9 @@ pub struct PathInfo {
     pub interface: String,
     pub source: Ipv4Addr,
     pub mark: u32,
-    pub identity: String,
+    pub profile: String,
+    pub series_prefix: String,
+    pub legacy: Option<String>,
     pub endpoint: Option<Target>,
     pub endpoint_reason: String,
 }
@@ -125,6 +127,7 @@ pub struct Inventory {
     pub paths: Vec<PathInfo>,
     pub wan: Option<PathInfo>,
     pub wan_reason: String,
+    pub uplinks: Vec<PathInfo>,
     pub rules: Vec<(String, Rule)>,
 }
 
@@ -174,8 +177,16 @@ impl PathInfo {
     }
 
     pub fn prefix(&self) -> &str {
-        &self.identity[..48]
+        &self.series_prefix
     }
+}
+
+fn digest_prefix(seed: &str) -> String {
+    digest(seed.as_bytes())[..48].to_owned()
+}
+
+pub fn tunnel_prefix(key: &str) -> String {
+    digest_prefix(&format!("tunnel|{key}"))
 }
 
 pub fn series_id(prefix: &str, target: &Target) -> String {
@@ -191,15 +202,17 @@ pub struct Endpoint {
     pub target: Target,
 }
 
-pub fn endpoint_series(wan: &PathInfo, key: &str) -> String {
-    format!(
-        "{}_{}",
-        wan.prefix(),
-        &digest(format!("endpoint|{key}").as_bytes())[..14]
-    )
+pub fn endpoint_series(key: &str) -> String {
+    format!("{}_server", digest_prefix(&format!("endpoint|{key}")))
 }
 
 impl Inventory {
+    pub fn standby_uplinks(&self) -> impl Iterator<Item = &PathInfo> {
+        self.uplinks
+            .iter()
+            .filter(|uplink| self.wan.as_ref().is_none_or(|wan| wan.name != uplink.name))
+    }
+
     fn rule(&self, id: &str) -> Result<&Rule> {
         self.rules
             .iter()
@@ -285,7 +298,7 @@ fn path(
     } else {
         (None, OPENVPN.into())
     };
-    let identity = digest(format!("{key}|{name}|{device}|{source}|{mark}|{profile}").as_bytes());
+    let legacy = digest_prefix(&format!("{key}|{name}|{device}|{source}|{mark}|{profile}"));
     Some(PathInfo {
         id: section_id.into(),
         key: key.into(),
@@ -293,36 +306,60 @@ fn path(
         interface: device,
         source,
         mark,
-        identity,
+        profile,
+        series_prefix: tunnel_prefix(key),
+        legacy: Some(legacy),
         endpoint,
         endpoint_reason,
     })
 }
 
-fn uplink() -> Result<Option<PathInfo>> {
+fn discover_uplinks() -> Result<Vec<PathInfo>> {
     let dump: Dump = native::bus("network.interface", "dump", &json!({}))?;
-    let candidate = dump
+    let mut candidates: Vec<_> = dump
         .interface
         .into_iter()
         .filter_map(|item| {
             let (device, source) = item.uplink()?;
             Some((item.metric, item.name, device, source))
         })
-        .min_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
-    Ok(candidate.map(|(_, name, device, source)| {
-        let identity = digest(format!("wan|{name}|{device}|{source}|0|").as_bytes());
-        PathInfo {
-            id: "wan".into(),
-            key: "wan".into(),
-            name,
+        .collect();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(candidates
+        .into_iter()
+        .map(|(_, name, device, source)| PathInfo {
+            id: format!("uplink:{name}"),
+            key: format!("uplink:{name}"),
             interface: device,
             source,
             mark: 0,
-            identity,
+            profile: String::new(),
+            series_prefix: digest_prefix(&format!("uplink|{name}")),
+            legacy: None,
             endpoint: None,
             endpoint_reason: String::new(),
-        }
-    }))
+            name,
+        })
+        .collect())
+}
+
+fn direct(uplink: &PathInfo) -> PathInfo {
+    PathInfo {
+        id: "wan".into(),
+        key: "wan".into(),
+        name: uplink.name.clone(),
+        interface: uplink.interface.clone(),
+        source: uplink.source,
+        mark: 0,
+        profile: String::new(),
+        series_prefix: digest_prefix("direct-wan"),
+        legacy: Some(digest_prefix(&format!(
+            "wan|{}|{}|{}|0|",
+            uplink.name, uplink.interface, uplink.source
+        ))),
+        endpoint: None,
+        endpoint_reason: String::new(),
+    }
 }
 
 pub fn inventory() -> Result<Inventory> {
@@ -391,13 +428,18 @@ pub fn inventory() -> Result<Inventory> {
         tunnels.len() <= MAX_TUNNELS,
         "More than eight VPN tunnels are unsupported."
     );
-    let (wan, wan_reason) = match uplink() {
-        Ok(Some(path)) => (Some(path), String::new()),
-        Ok(None) => (
-            None,
-            "No uplink interface has an IPv4 default route.".into(),
-        ),
+    let (uplinks, wan, wan_reason) = match discover_uplinks() {
+        Ok(list) => {
+            let wan = list.first().map(direct);
+            let reason = if wan.is_some() {
+                String::new()
+            } else {
+                "No uplink interface has an IPv4 default route.".into()
+            };
+            (list, wan, reason)
+        }
         Err(error) => (
+            Vec::new(),
             None,
             format!("The uplink interface list could not be read: {error}."),
         ),
@@ -407,6 +449,7 @@ pub fn inventory() -> Result<Inventory> {
         paths,
         wan,
         wan_reason,
+        uplinks,
         rules,
     })
 }
@@ -521,20 +564,27 @@ pub fn monitor(settings: &Settings, inventory: &Inventory, resolved: &Resolved) 
     for item in monitored(settings, inventory) {
         wanted.extend(targets.iter().map(|target| (item, target.clone(), None)));
     }
-    if settings.diagnostics
-        && settings.direct_wan
-        && let Some(wan) = &inventory.wan
-    {
-        wanted.extend(
-            settings
-                .targets
-                .iter()
-                .map(|target| (wan, target.clone(), None)),
-        );
-        wanted.extend(endpoints(settings, inventory).into_iter().map(|endpoint| {
-            let id = endpoint_series(wan, &endpoint.key);
-            (wan, endpoint.target, Some(id))
-        }));
+    if settings.diagnostics && settings.direct_wan {
+        if let Some(wan) = &inventory.wan {
+            wanted.extend(
+                settings
+                    .targets
+                    .iter()
+                    .map(|target| (wan, target.clone(), None)),
+            );
+            wanted.extend(endpoints(settings, inventory).into_iter().map(|endpoint| {
+                let id = endpoint_series(&endpoint.key);
+                (wan, endpoint.target, Some(id))
+            }));
+        }
+        for uplink in inventory.standby_uplinks() {
+            wanted.extend(
+                settings
+                    .targets
+                    .iter()
+                    .map(|target| (uplink, target.clone(), None)),
+            );
+        }
     }
     let mut seen = BTreeSet::new();
     let tunnels: Vec<_> = wanted
@@ -641,7 +691,7 @@ mod tests {
         resolve::Resolved,
         settings::{Settings, Target},
     };
-    use anyhow::{Context, Result};
+    use anyhow::Result;
     use std::net::Ipv4Addr;
 
     fn path(id: &str, interface: &str, endpoint: Option<&str>) -> PathInfo {
@@ -652,7 +702,9 @@ mod tests {
             interface: interface.into(),
             source: Ipv4Addr::new(10, 0, 0, 2),
             mark: 4096,
-            identity: "ab".repeat(32),
+            profile: String::new(),
+            series_prefix: "ab".repeat(24),
+            legacy: None,
             endpoint: endpoint.and_then(|value| value.parse().ok()),
             endpoint_reason: String::new(),
         }
@@ -664,6 +716,7 @@ mod tests {
             paths: vec![path("a", "wg1", Some("vpn.example.com"))],
             wan: Some(path("wan", "eth1", None)),
             wan_reason: String::new(),
+            uplinks: vec![path("uplink:wwan", "wwan0", None)],
             rules: Vec::new(),
         }
     }
@@ -716,10 +769,14 @@ mod tests {
             on_wan,
             [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(203, 0, 113, 9)]
         );
-        let inventory = inventory();
-        let wan = inventory.wan.as_ref().context("WAN path")?;
-        let expected = endpoint_series(wan, "vpn:a");
+        let expected = endpoint_series("vpn:a");
         assert!(config.tunnels.iter().any(|tunnel| tunnel.id == expected));
+        assert!(
+            config
+                .tunnels
+                .iter()
+                .any(|tunnel| tunnel.interface == "wwan0")
+        );
         Ok(())
     }
 }

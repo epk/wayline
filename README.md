@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/epk/wayline/main/install.sh | sh
 
 The script installs the newest release, prereleases included. Before it installs anything, it checks the signing key fingerprint, the manifest signature, and the package SHA-256 against the signed manifest, and it stops at the first failure.
 
-To pin a version, download `install.sh` and run `WAYLINE_VERSION=0.1.0-alpha.4 sh install.sh`.
+To pin a version, download `install.sh` and run `WAYLINE_VERSION=0.1.0-alpha.5 sh install.sh`.
 
 Create your tunnels in the factory **VPN** page first. Then open **VPN → Wayline → Settings**, select the tunnels to monitor, and turn monitoring on.
 
