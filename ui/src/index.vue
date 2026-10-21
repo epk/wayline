@@ -2570,7 +2570,7 @@ export default {
   font-size: 13px;
 }
 .vph-series-scroll {
-  max-height: 220px;
+  max-height: 300px;
   overflow: auto;
   margin-top: 14px;
   border-top: 1px solid var(--vph-border);
@@ -2582,8 +2582,9 @@ export default {
   border-spacing: 0;
   font-size: 12px;
 }
-.vph-series th,
-.vph-series td {
+.vph .vph-series th,
+.vph .vph-series td {
+  height: auto;
   padding: 5px 8px;
   border-bottom: 1px solid var(--vph-border);
   text-align: right;
@@ -2599,7 +2600,7 @@ export default {
   background: var(--vph-card);
   color: var(--vph-muted);
 }
-.vph-series .vph-series-name {
+.vph .vph-series .vph-series-name {
   text-align: left;
   color: var(--vph-text);
 }
