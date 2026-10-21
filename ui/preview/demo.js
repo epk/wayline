@@ -32,10 +32,10 @@
   const features = { full: 4, newer: 2, monitoring: 2, unsupported: 0 };
   let revision = 1;
   const state = {
-    version: '0.1.0-alpha.8',
+    version: '0.1.0-alpha.9',
     update: updateFailed
       ? {
-          current: '0.1.0-alpha.8',
+          current: '0.1.0-alpha.9',
           latest: release,
           available: true,
           phase: 'failed',
@@ -46,7 +46,7 @@
           updatedAt: Math.floor(Date.now() / 1000) - 120,
         }
       : {
-          current: '0.1.0-alpha.8',
+          current: '0.1.0-alpha.9',
           latest: null,
           available: false,
           phase: 'idle',
