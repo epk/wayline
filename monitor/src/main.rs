@@ -9,7 +9,7 @@ mod readiness;
 mod route;
 
 use futures_util::future::select_all;
-use probe::Probe;
+use probe::{Links, MAX_PENDING, Probe};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -24,7 +24,10 @@ use std::{future::Future, pin::Pin};
 use wayline_protocol::{Config, MAX_SERIES, MAX_STATUS, Series, Status};
 
 const MAX_CLIENTS: usize = 4;
-const MAX_INFLIGHT: usize = 16;
+const MAX_INFLIGHT: usize = MAX_SERIES * MAX_PENDING + 24;
+const MAX_REQUEST: usize = 64;
+const REQUEST_WINDOW: Duration = Duration::from_millis(200);
+const REPLY_WINDOW: Duration = Duration::from_secs(2);
 
 struct Endpoint {
     listener: UnixListener,
@@ -96,11 +99,15 @@ impl Drop for Endpoint {
     }
 }
 
+enum Phase {
+    Request(Vec<u8>),
+    Reply { data: Vec<u8>, offset: usize },
+}
+
 struct Client {
     stream: UnixStream,
     ready: monoio::net::UnixStream,
-    data: Vec<u8>,
-    offset: usize,
+    phase: Phase,
     deadline: Instant,
 }
 
@@ -113,6 +120,7 @@ fn snapshot(
     probes: &[Probe],
     started: Instant,
     nonce: &[u8; 16],
+    since: Option<u64>,
 ) -> io::Result<Vec<u8>> {
     let now = Instant::now();
     let tunnels = config
@@ -135,10 +143,10 @@ fn snapshot(
             received: p.received,
             success_age_ms: p.last_success.map(|at| millis(now.duration_since(at))),
             history: p.history(),
-            buckets: Vec::new(),
+            buckets: p.buckets(since),
         })
         .collect();
-    let mut data = serde_json::to_vec(&Status {
+    let mut status = Status {
         schema: 3,
         run_id: nonce
             .iter()
@@ -151,27 +159,98 @@ fn snapshot(
         uptime_ms: millis(now.duration_since(started)),
         interval_ms: config.interval_ms,
         tunnels,
-    })?;
-    data.push(b'\n');
-    if data.len() > MAX_STATUS {
-        return Err(io::Error::other("status exceeds size limit"));
-    }
-    Ok(data)
+    };
+    fit(&mut status)
 }
 
-fn update_clients(clients: &mut Vec<Client>, now: Instant) {
-    clients.retain_mut(|client| {
-        if now >= client.deadline {
-            return false;
+fn fit(status: &mut Status) -> io::Result<Vec<u8>> {
+    loop {
+        let mut data = serde_json::to_vec(&*status)?;
+        data.push(b'\n');
+        if data.len() <= MAX_STATUS {
+            return Ok(data);
         }
-        match client.stream.write(&client.data[client.offset..]) {
-            Ok(0) => false,
+        let mut times: Vec<u64> = status
+            .tunnels
+            .iter()
+            .flat_map(|series| series.buckets.iter().map(|bucket| bucket.at))
+            .collect();
+        if times.is_empty() {
+            return Err(io::Error::other("status exceeds size limit"));
+        }
+        times.sort_unstable();
+        let excess = data.len() - MAX_STATUS;
+        let count = times.len().saturating_mul(excess) / data.len() + 1;
+        let Some(&cut) = times.get(count.min(times.len()) - 1) else {
+            return Err(io::Error::other("status exceeds size limit"));
+        };
+        for series in &mut status.tunnels {
+            series.buckets.retain(|bucket| bucket.at > cut);
+        }
+    }
+}
+
+fn parse_since(line: &[u8]) -> Option<u64> {
+    let first = line.split(|byte| *byte == b'\n').next()?;
+    std::str::from_utf8(first.strip_prefix(b"since=")?)
+        .ok()?
+        .parse()
+        .ok()
+}
+
+fn advance(
+    client: &mut Client,
+    now: Instant,
+    build: &dyn Fn(Option<u64>) -> io::Result<Vec<u8>>,
+) -> bool {
+    if let Phase::Request(line) = &mut client.phase {
+        let mut chunk = [0_u8; MAX_REQUEST];
+        let done = match client.stream.read(&mut chunk) {
+            Ok(0) => true,
             Ok(size) => {
-                client.offset += size;
-                client.offset < client.data.len()
+                line.extend_from_slice(&chunk[..size]);
+                line.contains(&b'\n') || line.len() >= MAX_REQUEST || now >= client.deadline
             }
-            Err(error) => error.kind() == io::ErrorKind::WouldBlock,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => now >= client.deadline,
+            Err(_) => return false,
+        };
+        if !done {
+            return true;
         }
+        let Ok(data) = build(parse_since(line)) else {
+            return false;
+        };
+        client.phase = Phase::Reply { data, offset: 0 };
+        client.deadline = now + REPLY_WINDOW;
+    }
+    if now >= client.deadline {
+        return false;
+    }
+    let Phase::Reply { data, offset } = &mut client.phase else {
+        return false;
+    };
+    match client.stream.write(&data[*offset..]) {
+        Ok(0) => false,
+        Ok(size) => {
+            *offset += size;
+            *offset < data.len()
+        }
+        Err(error) => error.kind() == io::ErrorKind::WouldBlock,
+    }
+}
+
+fn service_clients(
+    clients: &mut Vec<Client>,
+    config: &Config,
+    probes: &[Probe],
+    started: Instant,
+    nonce: &[u8; 16],
+    now: Instant,
+) {
+    clients.retain_mut(|client| {
+        advance(client, now, &|since| {
+            snapshot(config, probes, started, nonce, since)
+        })
     });
 }
 
@@ -197,7 +276,7 @@ async fn wait_ready(
     wait: Duration,
     round: usize,
 ) -> io::Result<(bool, bool, [bool; MAX_SERIES])> {
-    let mut pending: Vec<ReadinessFuture<'_>> = Vec::with_capacity(3 + MAX_INFLIGHT + MAX_CLIENTS);
+    let mut pending: Vec<ReadinessFuture<'_>> = Vec::with_capacity(3 + MAX_SERIES + MAX_CLIENTS);
     pending.push(Box::pin(async {
         endpoint.ready.readable(false).await?;
         Ok(Ready::Listener)
@@ -207,7 +286,7 @@ async fn wait_ready(
         Ok(Ready::Route)
     }));
     for (index, probe) in probes.iter().enumerate() {
-        if probe.pending.is_some()
+        if !probe.pending.is_empty()
             && let Some(socket) = &probe.socket
         {
             pending.push(Box::pin(async move {
@@ -217,8 +296,13 @@ async fn wait_ready(
         }
     }
     for client in clients {
-        pending.push(Box::pin(async {
-            client.ready.writable(false).await?;
+        let reading = matches!(client.phase, Phase::Request(_));
+        pending.push(Box::pin(async move {
+            if reading {
+                client.ready.readable(false).await?;
+            } else {
+                client.ready.writable(false).await?;
+            }
             Ok(Ready::Client)
         }));
     }
@@ -241,14 +325,7 @@ async fn wait_ready(
     ))
 }
 
-fn accept_clients(
-    endpoint: &Endpoint,
-    clients: &mut Vec<Client>,
-    config: &Config,
-    probes: &[Probe],
-    started: Instant,
-    nonce: &[u8; 16],
-) -> io::Result<()> {
+fn accept_clients(endpoint: &Endpoint, clients: &mut Vec<Client>, now: Instant) -> io::Result<()> {
     for _ in 0..MAX_CLIENTS {
         match endpoint.listener.accept() {
             Ok((stream, _)) => {
@@ -260,9 +337,8 @@ fn accept_clients(
                 clients.push(Client {
                     ready: monoio::net::UnixStream::from_std(stream.try_clone()?)?,
                     stream,
-                    data: snapshot(config, probes, started, nonce)?,
-                    offset: 0,
-                    deadline: Instant::now() + Duration::from_secs(2),
+                    phase: Phase::Request(Vec::with_capacity(MAX_REQUEST)),
+                    deadline: now + REQUEST_WINDOW,
                 });
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -278,6 +354,7 @@ fn drain_routes(
     config: &Config,
     timeout: Duration,
     nonce: &[u8; 16],
+    links: &mut Links,
 ) -> io::Result<()> {
     for _ in 0..16 {
         let Some(reply) = routes.receive()? else {
@@ -295,6 +372,7 @@ fn drain_routes(
                 tunnel.target.unwrap_or(config.target),
                 timeout,
                 nonce,
+                links,
             );
         }
     }
@@ -314,7 +392,12 @@ async fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>)
     let timeout = Duration::from_millis(config.timeout_ms);
     let step = interval / u32::try_from(config.tunnels.len()).unwrap_or(1);
     let mut probes: Vec<_> = (0..config.tunnels.len())
-        .map(|i| Probe::new(started + step * u32::try_from(i).unwrap_or_default()))
+        .map(|i| {
+            Probe::new(
+                started + step * u32::try_from(i).unwrap_or_default(),
+                interval,
+            )
+        })
         .collect();
     let mut clients: Vec<Client> = Vec::with_capacity(MAX_CLIENTS);
     let mut nonce = [0_u8; 16];
@@ -328,42 +411,50 @@ async fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>)
             return Ok(());
         }
         for probe in &mut probes {
-            probe.expire(now);
+            probe.expire(now, timeout);
         }
-        let mut inflight = probes.iter().filter(|p| p.busy()).count();
+        let mut attempts: usize = probes.iter().map(Probe::attempts).sum();
+        let mut links = Links::default();
         let first_probe = next_probe;
         for offset in 0..probes.len() {
-            if inflight >= MAX_INFLIGHT {
-                break;
-            }
             let index = (first_probe + offset) % probes.len();
             let probe = &mut probes[index];
-            let tunnel = &config.tunnels[index];
-            if !probe.busy() && now >= probe.next_due {
-                next_probe = (index + 1) % config.tunnels.len();
-                sequence = sequence.wrapping_add(1);
-                probe.query_route(
-                    tunnel,
-                    tunnel.target.unwrap_or(config.target),
-                    now,
-                    interval,
-                    &routes,
-                    sequence,
-                );
-                if probe.busy() {
-                    inflight += 1;
-                }
+            if now < probe.next_due || probe.route_pending.is_some() {
+                continue;
             }
+            if probe.pending.len() >= MAX_PENDING {
+                probe.skip_slot(now);
+                continue;
+            }
+            if attempts >= MAX_INFLIGHT {
+                break;
+            }
+            let tunnel = &config.tunnels[index];
+            next_probe = (index + 1) % config.tunnels.len();
+            sequence = sequence.wrapping_add(1);
+            probe.query_route(
+                tunnel,
+                tunnel.target.unwrap_or(config.target),
+                now,
+                &routes,
+                sequence,
+                &mut links,
+            );
+            attempts += usize::from(probe.route_pending.is_some());
         }
 
-        update_clients(&mut clients, now);
-        let mut deadline = stop_at.unwrap_or(now + Duration::from_secs(300));
+        service_clients(&mut clients, config, &probes, started, &nonce, now);
+        let mut deadline = now + Duration::from_secs(1);
+        if let Some(at) = stop_at {
+            deadline = deadline.min(at);
+        }
         for probe in &probes {
-            if let Some(pending) = &probe.pending {
+            for pending in &probe.pending {
                 deadline = deadline.min(pending.deadline);
-            } else if let Some(pending) = &probe.route_pending {
-                deadline = deadline.min(pending.deadline);
-            } else if inflight < MAX_INFLIGHT {
+            }
+            if let Some(route) = &probe.route_pending {
+                deadline = deadline.min(route.deadline);
+            } else if attempts < MAX_INFLIGHT {
                 deadline = deadline.min(probe.next_due);
             }
         }
@@ -374,8 +465,9 @@ async fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>)
         let (accept_ready, route_ready, ready) =
             wait_ready(&endpoint, &routes, &probes, &clients, wait, ready_round).await?;
         ready_round = ready_round.wrapping_add(1);
+        links.clear();
         if route_ready {
-            drain_routes(&routes, &mut probes, config, timeout, &nonce)?;
+            drain_routes(&routes, &mut probes, config, timeout, &nonce, &mut links)?;
         }
         for (i, probe) in probes.iter_mut().enumerate() {
             if ready[i] {
@@ -386,7 +478,7 @@ async fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>)
             }
         }
         if accept_ready {
-            accept_clients(&endpoint, &mut clients, config, &probes, started, &nonce)?;
+            accept_clients(&endpoint, &mut clients, Instant::now())?;
         }
     }
 }
@@ -403,7 +495,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let command = args.next().unwrap_or_default();
     if command == "--help" || command == "-h" || command.is_empty() {
         println!(
-            "waylined monitor --config FILE --socket ABSOLUTE_PATH [--run-for SECONDS]\nwaylined status --socket ABSOLUTE_PATH\nIPv4 ICMP monitor. The monitor does not change routes. Socket clients receive one JSON snapshot."
+            "waylined monitor --config FILE --socket ABSOLUTE_PATH [--run-for SECONDS]\nwaylined status --socket ABSOLUTE_PATH [--since UNIX_SECONDS]\nIPv4 ICMP monitor. The monitor does not change routes. Socket clients receive one JSON snapshot."
         );
         return Ok(());
     }
@@ -414,6 +506,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut config_path = None;
     let mut socket_path = None;
     let mut run_for = None;
+    let mut since = None;
     while let Some(arg) = args.next() {
         let value = args.next().ok_or("option needs a value")?;
         match arg.as_str() {
@@ -426,10 +519,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 run_for = Some(Duration::from_secs(seconds));
             }
+            "--since" if since.is_none() => since = Some(value.parse::<u64>()?),
             _ => return Err("unknown or repeated option".into()),
         }
     }
     let socket_path = socket_path.ok_or("--socket is required")?;
+    if since.is_some() && command != "status" {
+        return Err("--since is only valid for status".into());
+    }
     match command.as_str() {
         "monitor" => {
             let config = config::read(&config_path.ok_or("--config is required")?)?;
@@ -440,8 +537,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .block_on(serve(&config, socket_path, run_for))?;
         }
         "status" if config_path.is_none() && run_for.is_none() => {
-            let stream = UnixStream::connect(socket_path)?;
+            let mut stream = UnixStream::connect(socket_path)?;
             stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+            let request = since.map_or_else(String::new, |cursor| format!("since={cursor}"));
+            stream.write_all(format!("{request}\n").as_bytes())?;
             let mut data = Vec::with_capacity(MAX_STATUS);
             stream
                 .take((MAX_STATUS + 1) as u64)
