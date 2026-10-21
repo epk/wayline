@@ -23,7 +23,7 @@ pub fn now() -> u64 {
 
 pub fn version() -> String {
     fs::read_to_string("/usr/share/wayline/version")
-        .unwrap_or_else(|_| "0.1.0-alpha.6".into())
+        .unwrap_or_else(|_| "0.1.0-alpha.7".into())
         .trim()
         .into()
 }

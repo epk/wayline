@@ -30,7 +30,7 @@
   const features = { full: 4, newer: 2, monitoring: 2, unsupported: 0 };
   let revision = 1;
   const state = {
-    version: '0.1.0-alpha.6',
+    version: '0.1.0-alpha.7',
     revision: '1',
     scope: 'All clients',
     compat: {
