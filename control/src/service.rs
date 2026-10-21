@@ -1,7 +1,7 @@
 use crate::{
     auto, changes, egress, history, native,
     resolve::Resolved,
-    router,
+    router::{self, Inventory},
     runtime::{DAEMON, MONITOR_CONFIG, RUNTIME, STATUS_SOCKET, locked, now},
     settings::Settings,
     update,
@@ -33,12 +33,13 @@ pub fn stop() -> Result<()> {
     delete().map(drop)
 }
 
-pub fn running() -> Result<()> {
+fn monitor_running() -> Result<bool> {
     let list = native::bus::<Value>("service", "list", &json!({"name":"wayline"}))?;
-    anyhow::ensure!(
-        list["wayline"]["instances"]["monitor"]["running"] == true,
-        "The monitor is not running."
-    );
+    Ok(list["wayline"]["instances"]["monitor"]["running"] == true)
+}
+
+pub fn running() -> Result<()> {
+    anyhow::ensure!(monitor_running()?, "The monitor is not running.");
     Ok(())
 }
 
@@ -54,6 +55,14 @@ pub fn reconcile() -> Result<()> {
     locked("reconcile", reconcile_inner)
 }
 
+fn reconcile_inner() -> Result<()> {
+    let config = Settings::read()?;
+    let inventory = (config.enabled && native::supported())
+        .then(router::inventory)
+        .transpose()?;
+    apply(&config, inventory.as_ref())
+}
+
 pub fn restart() -> Result<()> {
     locked("reconcile", || {
         delete()?;
@@ -61,26 +70,18 @@ pub fn restart() -> Result<()> {
     })
 }
 
-fn reconcile_inner() -> Result<()> {
-    let config = Settings::read()?;
-    let desired = if config.enabled && native::supported() {
-        Some(router::monitor(
-            &config,
-            &router::inventory()?,
-            &Resolved::read(),
-        ))
-    } else {
-        None
-    };
-    let Some(desired) = desired.filter(|desired| !desired.tunnels.is_empty()) else {
+fn apply(config: &Settings, inventory: Option<&Inventory>) -> Result<()> {
+    let desired = inventory
+        .map(|inventory| router::monitor(config, inventory, &Resolved::read()))
+        .filter(|desired| !desired.tunnels.is_empty());
+    let Some(desired) = desired else {
         halt();
         return Ok(());
     };
     let path = Path::new(MONITOR_CONFIG);
     let encoded = serde_json::to_vec(&desired)?;
     let changed = fs::read(path).ok().as_deref() != Some(&encoded);
-    let running = native::bus::<Value>("service", "list", &json!({"name":"wayline"}))
-        .is_ok_and(|value| value["wayline"]["instances"]["monitor"]["running"] == true);
+    let running = monitor_running().unwrap_or(false);
     if changed || !running {
         if changed {
             if running {
@@ -138,21 +139,21 @@ pub fn tick() -> Result<()> {
 
 fn routine() -> Result<()> {
     let config = Settings::read()?;
-    if config.enabled && native::supported() {
-        let hosts = router::hosts(&config, &router::inventory()?);
+    let inventory = config.enabled.then(router::inventory).transpose()?;
+    let monitored = inventory.as_ref().filter(|_| native::supported());
+    if let Some(inventory) = monitored {
+        let hosts = router::hosts(&config, inventory);
         let mut resolved = Resolved::read();
         if resolved.stale(&hosts) {
             resolved.refresh(&hosts)?;
         }
     }
-    reconcile()?;
-    let recorded = if config.enabled {
-        router::inventory().and_then(|inventory| changes::record(&config, &inventory))
-    } else {
-        Ok(())
-    };
-    if config.enabled && native::supported() {
-        egress::Cache::refresh(&config, &router::inventory()?)?;
+    locked("reconcile", || apply(&config, monitored))?;
+    let recorded = inventory
+        .as_ref()
+        .map_or(Ok(()), |inventory| changes::record(&config, inventory));
+    if let Some(inventory) = monitored {
+        egress::Cache::refresh(&config, inventory)?;
     }
     let collected = format!("{RUNTIME}/last-collect");
     let last = fs::read_to_string(&collected)
@@ -160,10 +161,10 @@ fn routine() -> Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let now = now();
-    if config.enabled && (now.saturating_sub(last) >= 300 || now < last) {
-        let result = history::collect(&config)
-            .and_then(|()| router::inventory())
-            .and_then(|inventory| history::migrate(&config, &inventory));
+    if let Some(inventory) = &inventory
+        && (now.saturating_sub(last) >= 300 || now < last)
+    {
+        let result = history::collect(&config).and_then(|()| history::migrate(&config, inventory));
         atomic(Path::new(&collected), now.to_string().as_bytes())?;
         result?;
     }
