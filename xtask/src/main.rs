@@ -6,7 +6,11 @@ mod package;
 mod quality;
 
 use anyhow::{Context, Result, ensure};
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::{Child, Command},
+};
 
 fn run(program: &str, args: &[&str]) -> Result<()> {
     ensure!(
@@ -18,6 +22,11 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
         "{program} failed."
     );
     Ok(())
+}
+
+fn stop_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn build() -> Result<()> {

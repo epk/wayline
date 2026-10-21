@@ -1,4 +1,4 @@
-use crate::run;
+use crate::{run, stop_child};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -8,9 +8,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use wayline_support::{output, text};
+use wayline_support::{atomic, digest, input, output, text};
 
 const PROFILE: &str = "wayline-lab";
 
@@ -304,12 +304,24 @@ fn policy(index: u32) -> Result<()> {
 
 fn key(name: &str) -> Result<String> {
     let private = output("wg", &["genkey"], 128, 2)?;
-    let public = wayline_support::input("wg", &["pubkey"], &private, 128, 2)?;
-    wayline_support::atomic(
-        &PathBuf::from(format!("/run/wayline-lab/keys/{name}")),
-        &private,
-    )?;
+    let public = input("wg", &["pubkey"], &private, 128, 2)?;
+    atomic(&Path::new("/run/wayline-lab/keys").join(name), &private)?;
     Ok(String::from_utf8(public)?.trim().into())
+}
+
+fn monitor() -> Result<PathBuf> {
+    Ok(fs::canonicalize(
+        "target/aarch64-unknown-linux-musl/release/waylined",
+    )?)
+}
+
+fn routes() -> Result<String> {
+    text(
+        "ip",
+        &["-n", "router", "-j", "route", "show", "table", "all"],
+        65_536,
+        2,
+    )
 }
 
 fn configuration(interval: u64, timeout: u64, multiple: bool) -> Value {
@@ -329,10 +341,9 @@ fn configuration(interval: u64, timeout: u64, multiple: bool) -> Value {
 
 fn start_monitor(config: &Value) -> Result<Child> {
     fs::write("/run/wayline-lab/config.json", serde_json::to_vec(config)?)?;
-    let binary = fs::canonicalize("target/aarch64-unknown-linux-musl/release/waylined")?;
     Ok(Command::new("ip")
         .args(["netns", "exec", "router"])
-        .arg(binary)
+        .arg(monitor()?)
         .args([
             "monitor",
             "--config",
@@ -372,8 +383,7 @@ fn scenarios() -> Result<()> {
     crate::native::check()?;
     let mut child = start_monitor(&configuration(1000, 500, false))?;
     let result = failures(&mut child);
-    let _ = child.kill();
-    let _ = child.wait();
+    stop_child(&mut child);
     result
 }
 
@@ -415,7 +425,7 @@ fn failures(child: &mut Child) -> Result<()> {
     *child = start_monitor(&config)?;
     let before = after(18)?;
     let resources_start = resources(child.id())?;
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     for index in 1..=8 {
         delay(index, &["loss", "100%"])?;
     }
@@ -449,9 +459,7 @@ fn failures(child: &mut Child) -> Result<()> {
     fs::create_dir_all(output)?;
     results.insert(
         "binary_sha256".into(),
-        json!(wayline_support::digest(&fs::read(
-            "target/aarch64-unknown-linux-musl/release/waylined"
-        )?)),
+        json!(digest(&fs::read(monitor()?)?)),
     );
     results.insert(
         "kernel".into(),
@@ -466,13 +474,8 @@ fn failures(child: &mut Child) -> Result<()> {
 }
 
 fn rejection_checks() -> Result<()> {
-    let routes = text(
-        "ip",
-        &["-n", "router", "-j", "route", "show", "table", "all"],
-        65_536,
-        2,
-    )?;
-    let binary = fs::canonicalize("target/aarch64-unknown-linux-musl/release/waylined")?;
+    let before = routes()?;
+    let binary = monitor()?;
     let binary = binary.to_str().context("Invalid monitor path.")?;
     let valid = configuration(1000, 500, false);
     let mut invalid = vec![json!({}), valid.clone(), valid.clone(), valid];
@@ -545,13 +548,7 @@ fn rejection_checks() -> Result<()> {
         "The endpoint guard changed an ordinary file."
     );
     ensure!(
-        routes
-            == text(
-                "ip",
-                &["-n", "router", "-j", "route", "show", "table", "all"],
-                65_536,
-                2
-            )?,
+        before == routes()?,
         "Monitor requests changed routing state."
     );
     Ok(())
@@ -649,7 +646,7 @@ fn cpu_percent(start: &Value, end: &Value, seconds: f64) -> Result<f64> {
 }
 
 fn status(since: u64) -> Result<Value> {
-    let binary = fs::canonicalize("target/aarch64-unknown-linux-musl/release/waylined")?;
+    let binary = monitor()?;
     let binary = binary.to_str().context("Invalid monitor path.")?;
     let since = since.to_string();
     let data = text(
@@ -685,11 +682,6 @@ fn clean_bucket(item: &Value) -> bool {
     })
 }
 
-fn stop_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 fn one_second_checks(results: &mut serde_json::Map<String, Value>) -> Result<()> {
     for index in 1..=8 {
         let rate = format!("{}ms", index * 10);
@@ -712,7 +704,7 @@ fn healthy_one_second(
     results: &mut serde_json::Map<String, Value>,
 ) -> Result<()> {
     let start = resources(child.id())?;
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     thread::sleep(Duration::from_secs(35));
     let snapshot = status(0)?;
     let seconds = started.elapsed().as_secs_f64();

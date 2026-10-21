@@ -6,10 +6,11 @@ use anyhow::{Context, Result, ensure};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs,
     io::Read,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Command, Stdio},
 };
 use wayline_support::{atomic, digest, read, text};
 
@@ -138,7 +139,7 @@ impl Status {
     }
 
     fn path() -> PathBuf {
-        PathBuf::from(format!("{RUNTIME}/update.json"))
+        Path::new(RUNTIME).join("update.json")
     }
 
     fn write(&self) -> Result<()> {
@@ -175,18 +176,16 @@ impl Status {
     }
 
     fn stopped(error: &anyhow::Error) -> Self {
-        let current = Self::read();
+        let previous = Self::read().unwrap_or_default();
         let at = now();
         Self {
             current: version(),
-            latest: current.as_ref().and_then(|status| status.latest.clone()),
-            available: current.as_ref().is_some_and(|status| status.available),
+            latest: previous.latest,
+            available: previous.available,
             phase: Phase::Failed,
             message: format!("Update stopped. {error}"),
             failed: true,
-            needs_attention: current
-                .as_ref()
-                .is_some_and(|status| status.needs_attention || status.phase == Phase::Installing),
+            needs_attention: previous.needs_attention || previous.phase == Phase::Installing,
             checked_at: at,
             updated_at: at,
         }
@@ -251,8 +250,9 @@ fn download(url: &str, path: &Path, limit: u64) -> Result<()> {
         status.trim() == "200",
         "The release server rejected the request."
     );
+    let size = fs::metadata(path)?.len();
     ensure!(
-        fs::metadata(path)?.len() > 0 && fs::metadata(path)?.len() <= limit,
+        size > 0 && size <= limit,
         "The release download exceeds its limit."
     );
     Ok(())
@@ -334,7 +334,8 @@ fn metadata(folder: &Path, latest: &Version) -> Result<(Manifest, Artifact, Stri
 fn member(reader: impl Read, name: &str, limit: u64) -> Result<Vec<u8>> {
     for entry in tar::Archive::new(flate2::read::GzDecoder::new(reader)).entries()? {
         let entry = entry?;
-        if entry.path()?.strip_prefix(".").unwrap_or(&entry.path()?) == Path::new(name) {
+        let path = entry.path()?;
+        if path.strip_prefix(".").unwrap_or(&path) == Path::new(name) {
             let mut bytes = Vec::new();
             entry.take(limit + 1).read_to_end(&mut bytes)?;
             ensure!(
@@ -347,10 +348,10 @@ fn member(reader: impl Read, name: &str, limit: u64) -> Result<Vec<u8>> {
     anyhow::bail!("Package control data is absent.")
 }
 
-fn package_identity(path: &Path, expected: &str) -> Result<()> {
-    let control = member(fs::File::open(path)?, "control.tar.gz", 65_536)?;
+fn package_identity(package: &[u8], expected: &str) -> Result<()> {
+    let control = member(package, "control.tar.gz", 65_536)?;
     let data = String::from_utf8(member(control.as_slice(), "control", 16_384)?)?;
-    let mut fields = std::collections::BTreeMap::new();
+    let mut fields = BTreeMap::new();
     for line in data.lines() {
         if let Some((key, value)) = line.split_once(": ") {
             ensure!(
@@ -412,7 +413,7 @@ fn execute(install: bool, report: &dyn Fn(Phase, &str) -> Result<()>) -> Result<
         u64::try_from(bytes.len())? == artifact.bytes && digest(&bytes) == artifact.sha256,
         "The release size or digest does not match."
     );
-    package_identity(&package, &manifest.version)?;
+    package_identity(&bytes, &manifest.version)?;
     let path = package.to_str().context("Invalid package path.")?;
     text("opkg", &["--noaction", "install", path], 16_384, 30)?;
     report(Phase::Installing, "Installing the signed update.")?;
@@ -430,11 +431,10 @@ fn execute(install: bool, report: &dyn Fn(Phase, &str) -> Result<()>) -> Result<
     ))
 }
 
-fn attempt(install: bool) -> Result<Status> {
-    let previous = Status::read();
-    let report =
-        |phase: Phase, message: &str| Status::working(previous.as_ref(), phase, message).write();
-    let status = if settled(previous.as_ref()) {
+fn attempt(install: bool, previous: Option<&Status>) -> Result<Status> {
+    let status = if settled(previous) {
+        let report =
+            |phase: Phase, message: &str| Status::working(previous, phase, message).write();
         execute(install, &report).unwrap_or_else(|error| Status::stopped(&error))
     } else {
         Status::stopped(&anyhow::anyhow!("A previous installation needs checking."))
@@ -457,7 +457,7 @@ fn space(path: &Path, minimum: u64) -> Result<()> {
 }
 
 fn request_path() -> PathBuf {
-    PathBuf::from(format!("{RUNTIME}/update-request"))
+    Path::new(RUNTIME).join("update-request")
 }
 
 fn idle() -> bool {
@@ -469,7 +469,7 @@ pub fn start(method: &str) -> Result<bool> {
         return Ok(false);
     }
     atomic(&request_path(), method.as_bytes())?;
-    std::process::Command::new(std::env::current_exe()?)
+    Command::new(std::env::current_exe()?)
         .arg("update-job")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -483,7 +483,7 @@ pub fn job() -> Result<()> {
         let request = request_path();
         let install = fs::read_to_string(&request).unwrap_or_default() == "install_update";
         let _ = fs::remove_file(&request);
-        attempt(install).map(drop)
+        attempt(install, Status::read().as_ref()).map(drop)
     })
 }
 
@@ -494,7 +494,7 @@ pub fn run_now(install: bool) -> Result<Status> {
             settled(previous.as_ref()),
             "A previous installation needs checking."
         );
-        attempt(install)
+        attempt(install, previous.as_ref())
     })
 }
 
@@ -510,13 +510,15 @@ pub fn scheduled(config: &Settings) -> Result<()> {
             settled(previous.as_ref()),
             "A previous installation needs checking."
         );
+        let checked_at = previous.as_ref().map_or(0, |status| status.checked_at);
         if requested.is_empty()
-            && (!config.auto_updates
-                || now().saturating_sub(previous.map_or(0, |status| status.checked_at)) < 86_400)
+            && (!config.auto_updates || now().saturating_sub(checked_at) < 86_400)
         {
             return Ok(());
         }
-        attempt(requested == "install_update" || (requested.is_empty() && config.auto_updates))?;
+        let install =
+            requested == "install_update" || (requested.is_empty() && config.auto_updates);
+        attempt(install, previous.as_ref())?;
         if request.exists() {
             fs::remove_file(request)?;
         }

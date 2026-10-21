@@ -8,15 +8,20 @@ use std::{
     thread,
     time::Duration,
 };
+use wayline_support::{FIRMWARE_CONTRACT as CONTRACT, digest};
 
 const ROOT: &str = "artifacts/local/firmware-root";
-use wayline_support::FIRMWARE_CONTRACT as CONTRACT;
 const NATIVE_PATH: &str = "PATH=/usr/sbin:/usr/bin:/sbin:/bin";
+
+fn contract(root: &Path) -> Result<String> {
+    Ok(digest(&fs::read(
+        root.join("usr/lib/oui-httpd/rpc/vpn-client"),
+    )?))
+}
 
 pub fn prepare(source: &Path) -> Result<()> {
     ensure!(
-        wayline_support::digest(&fs::read(source.join("usr/lib/oui-httpd/rpc/vpn-client"))?)
-            == CONTRACT,
+        contract(source)? == CONTRACT,
         "The extracted firmware contract differs."
     );
     ensure!(
@@ -63,9 +68,7 @@ pub fn check() -> Result<()> {
     }
     crate::run("ip", &["link", "set", "lo", "up"])?;
     ensure!(
-        wayline_support::digest(&fs::read(
-            Path::new(ROOT).join("usr/lib/oui-httpd/rpc/vpn-client")
-        )?) == CONTRACT,
+        contract(Path::new(ROOT))? == CONTRACT,
         "The firmware contract differs."
     );
     fs::create_dir_all(format!("{ROOT}/tmp"))?;
@@ -176,14 +179,9 @@ pub fn check() -> Result<()> {
             fs::read_to_string(Path::new(ROOT).join("tmp/log/nginx/error.log")).unwrap_or_default()
         );
     }
-    let _ = http.kill();
-    let _ = http.wait();
-    let _ = session.kill();
-    let _ = session.wait();
-    let _ = rpc.kill();
-    let _ = rpc.wait();
-    let _ = bus.kill();
-    let _ = bus.wait();
+    for child in [&mut http, &mut session, &mut rpc, &mut bus] {
+        crate::stop_child(child);
+    }
     result
 }
 
@@ -223,8 +221,7 @@ fn fixtures() -> Result<()> {
     }
     call("/sbin/uci", &["commit", "route_policy"])?;
     let policy = Path::new(ROOT).join("etc/config/route_policy");
-    let original = fs::read_to_string(&policy)?;
-    let mut rules = original;
+    let mut rules = fs::read_to_string(&policy)?;
     for (id, number) in [("wayline_lab", 2001), ("wayline_other", 2002)] {
         let _ =
             fs::remove_file(Path::new(ROOT).join(format!("etc/vpn_profiles.d/profile{number}")));
@@ -380,6 +377,15 @@ fn compatibility_checks() -> Result<()> {
     Ok(())
 }
 
+fn tunnel_row(state: &Value) -> Result<&Value> {
+    state["tunnels"]
+        .as_array()
+        .context("Missing tunnel rows.")?
+        .iter()
+        .find(|row| row["monitorId"] == "vpn:2001")
+        .context("The tunnel row disappeared.")
+}
+
 fn session(method: &str, params: &Value) -> Result<Value> {
     Ok(serde_json::from_str(&call(
         "/bin/ubus",
@@ -434,7 +440,7 @@ fn bridge_checks() -> Result<()> {
         let nonce = challenge["data"]["nonce"]
             .as_str()
             .context("The lab login challenge failed.")?;
-        let hash = wayline_support::digest(format!("root:{}:{nonce}", crypt.trim()).as_bytes());
+        let hash = digest(format!("root:{}:{nonce}", crypt.trim()).as_bytes());
         let login = session("login", &json!({"username":"root","hash":hash}))?;
         Ok(login["data"]["sid"]
             .as_str()
@@ -449,12 +455,7 @@ fn bridge_checks() -> Result<()> {
         "An authenticated bridge read failed."
     );
     let state = &response["result"];
-    let row = state["tunnels"]
-        .as_array()
-        .context("Missing tunnel rows.")?
-        .iter()
-        .find(|row| row["monitorId"] == "vpn:2001")
-        .context("The tunnel row disappeared.")?;
+    let row = tunnel_row(state)?;
     let args =
         json!({"section_id":row["id"],"enabled":false,"expected_revision":state["revision"]});
     ensure!(
@@ -538,13 +539,7 @@ fn tunnel_controls() -> Result<()> {
     )?;
     for enabled in [true, true, false, false] {
         let current = request("get_state", &json!({}))?;
-        let id = current["tunnels"]
-            .as_array()
-            .context("Missing tunnel rows.")?
-            .iter()
-            .find(|row| row["monitorId"] == "vpn:2001")
-            .context("The tunnel row disappeared.")?["id"]
-            .clone();
+        let id = tunnel_row(&current)?["id"].clone();
         let result = request(
             "set_tunnel_enabled",
             &json!({"section_id":id,"enabled":enabled,"expected_revision":current["revision"]}),
@@ -554,12 +549,7 @@ fn tunnel_controls() -> Result<()> {
             "The native tunnel state did not match the request."
         );
         let observed = request("get_state", &json!({}))?;
-        let row = observed["tunnels"]
-            .as_array()
-            .context("Missing tunnel rows.")?
-            .iter()
-            .find(|row| row["monitorId"] == "vpn:2001")
-            .context("The tunnel row disappeared.")?;
+        let row = tunnel_row(&observed)?;
         ensure!(
             row["enabled"] == enabled && row["connected"] == false && row["eligible"] == false,
             "An offline tunnel reported a connected path."

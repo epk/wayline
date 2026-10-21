@@ -9,13 +9,13 @@ use sha2::{Digest, Sha256};
 use std::{
     fmt::Write as _,
     fs,
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, tempfile};
 
 pub const FIRMWARE_CONTRACT: &str =
     "9c8a9102c046ff12ba95e4c9a03b4e5392c461584c5d4d8ab9c5591ab6ec9237";
@@ -98,31 +98,32 @@ fn run(
 ) -> Result<(bool, Vec<u8>)> {
     let stdin = match input {
         Some(bytes) => {
-            let mut source = NamedTempFile::new()?;
+            let mut source = tempfile()?;
             source.write_all(bytes)?;
-            Stdio::from(source.reopen()?)
+            source.rewind()?;
+            Stdio::from(source)
         }
         None => Stdio::null(),
     };
-    let mut data = NamedTempFile::new()?;
+    let mut data = tempfile()?;
     let mut child = Command::new(program)
         .args(args)
         .env("LC_ALL", "C")
         .stdin(stdin)
-        .stdout(Stdio::from(data.reopen()?))
+        .stdout(Stdio::from(data.try_clone()?))
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("Cannot start {program}."))?;
-    let status = wait(&mut child, Duration::from_secs(seconds))?;
-    let Some(status) = status else {
+    let Some(status) = wait(&mut child, Duration::from_secs(seconds))? else {
         child.kill()?;
         child.wait()?;
         anyhow::bail!("{program} exceeded its time limit.");
     };
     ensure!(
-        data.as_file().metadata()?.len() <= u64::try_from(limit)?,
+        data.metadata()?.len() <= u64::try_from(limit)?,
         "Helper output exceeds its size limit."
     );
+    data.rewind()?;
     let mut bytes = Vec::new();
     data.read_to_end(&mut bytes)?;
     Ok((status.success(), bytes))

@@ -2,14 +2,20 @@ use crate::run;
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, write::GzEncoder};
 use serde_json::{Value, json};
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-};
-use tar::{Builder, Header};
+use std::{fs, io::Write, path::Path};
+use tar::{Builder, EntryType, Header};
 use walkdir::WalkDir;
 use wayline_support::digest;
+
+fn header(mode: u32, size: u64) -> Header {
+    let mut header = Header::new_gnu();
+    header.set_size(size);
+    header.set_mode(mode);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header
+}
 
 fn append(
     builder: &mut Builder<GzEncoder<Vec<u8>>>,
@@ -17,13 +23,7 @@ fn append(
     data: &[u8],
     mode: u32,
 ) -> Result<()> {
-    let mut header = Header::new_gnu();
-    header.set_size(u64::try_from(data.len())?);
-    header.set_uid(0);
-    header.set_gid(0);
-    header.set_mtime(0);
-    header.set_mode(mode);
-    header.set_cksum();
+    let mut header = header(mode, u64::try_from(data.len())?);
     builder.append_data(&mut header, path, data)?;
     Ok(())
 }
@@ -44,38 +44,24 @@ fn archive(root: &Path) -> Result<Vec<u8>> {
                 item.file_name().to_str(),
                 Some("waylined" | "wayline-ctl" | "postinst" | "prerm" | "95-wayline")
             );
-            append(
-                &mut builder,
-                relative,
-                &fs::read(item.path())?,
-                if executable { 0o755 } else { 0o644 },
-            )?;
+            let mode = if executable { 0o755 } else { 0o644 };
+            let mut data = header(mode, item.metadata()?.len());
+            builder.append_data(&mut data, relative, fs::File::open(item.path())?)?;
         }
         if item.file_type().is_symlink() {
-            let mut header = Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Symlink);
-            header.set_size(0);
-            header.set_mode(0o777);
-            header.set_uid(0);
-            header.set_gid(0);
-            header.set_mtime(0);
-            header.set_cksum();
-            builder.append_link(&mut header, relative, fs::read_link(item.path())?)?;
+            let mut link = header(0o777, 0);
+            link.set_entry_type(EntryType::Symlink);
+            builder.append_link(&mut link, relative, fs::read_link(item.path())?)?;
         }
         if item.file_type().is_dir() {
-            let mut header = Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Directory);
-            header.set_size(0);
-            header.set_mode(if relative == Path::new("etc/wayline") {
+            let mode = if relative == Path::new("etc/wayline") {
                 0o700
             } else {
                 0o755
-            });
-            header.set_uid(0);
-            header.set_gid(0);
-            header.set_mtime(0);
-            header.set_cksum();
-            builder.append_data(&mut header, relative, std::io::empty())?;
+            };
+            let mut directory = header(mode, 0);
+            directory.set_entry_type(EntryType::Directory);
+            builder.append_data(&mut directory, relative, std::io::empty())?;
         }
     }
     Ok(builder.into_inner()?.finish()?)
@@ -264,34 +250,29 @@ fn licenses(version: &str) -> Result<()> {
             package["name"].as_str().unwrap_or_default(),
             package["version"].as_str().unwrap_or_default()
         );
-        let destination = output.join(name);
-        fs::create_dir_all(&destination)?;
-        for item in fs::read_dir(source)? {
-            let item = item?;
-            let name = item.file_name().to_string_lossy().into_owned();
-            if item.file_type()?.is_file()
-                && ["LICENSE", "COPYING", "NOTICE"]
-                    .iter()
-                    .any(|prefix| name.to_uppercase().starts_with(prefix))
-            {
-                fs::copy(item.path(), destination.join(name))?;
-            }
-        }
+        copy_licenses(
+            source,
+            &output.join(name),
+            &["LICENSE", "COPYING", "NOTICE"],
+        )?;
     }
     for name in ["vue-style-loader", "css-loader", "uplot"] {
-        let source = PathBuf::from(format!("ui/node_modules/{name}"));
-        let destination = output.join(name);
-        fs::create_dir_all(&destination)?;
-        for item in fs::read_dir(source)? {
-            let item = item?;
-            if item
-                .file_name()
-                .to_string_lossy()
-                .to_uppercase()
-                .starts_with("LICENSE")
-            {
-                fs::copy(item.path(), destination.join(item.file_name()))?;
-            }
+        copy_licenses(
+            &Path::new("ui/node_modules").join(name),
+            &output.join(name),
+            &["LICENSE"],
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_licenses(source: &Path, destination: &Path, prefixes: &[&str]) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for item in fs::read_dir(source)? {
+        let item = item?;
+        let name = item.file_name().to_string_lossy().to_uppercase();
+        if item.file_type()?.is_file() && prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            fs::copy(item.path(), destination.join(item.file_name()))?;
         }
     }
     Ok(())
