@@ -214,7 +214,6 @@
         samples: 64,
         eligible: true,
         selectable: true,
-        recent: Array.from({ length: 64 }, (_, i) => 32 + Math.sin(i * 1.8) * 4),
       },
       {
         id: 'backup',
@@ -230,7 +229,6 @@
         samples: 64,
         eligible: true,
         selectable: true,
-        recent: Array.from({ length: 64 }, (_, i) => 24 + Math.sin(i * 1.2) * 3),
       },
       {
         id: 'tokyo',
@@ -247,9 +245,6 @@
         eligible: false,
         selectable: true,
         reason: 'Recent packet loss',
-        recent: Array.from({ length: 64 }, (_, i) =>
-          i > 37 && i < 42 ? null : 130 + Math.sin(i) * 17,
-        ),
       },
       {
         id: 'zurich',
@@ -267,7 +262,6 @@
         selectable: false,
         selectReason: 'The tunnel is stopped.',
         historyAvailable: true,
-        recent: [],
       },
     ],
     diagnostics: {
@@ -440,7 +434,6 @@
           stateLabel: enabled ? 'Enabled, offline' : 'Stopped',
           age: 'unknown',
           median: null,
-          recent: [],
           samples: 0,
           lost: 0,
         });
