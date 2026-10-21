@@ -421,14 +421,11 @@ fn failures(child: &mut Child) -> Result<()> {
     }
     let outage = after(80)?;
     let resources_end = resources(child.id())?;
-    let ticks = text("getconf", &["CLK_TCK"], 32, 2)?
-        .trim()
-        .parse::<f64>()?;
-    let cpu = (resources_end["cpu_ticks"].as_f64().unwrap_or(0.0)
-        - resources_start["cpu_ticks"].as_f64().unwrap_or(0.0))
-        / ticks
-        / started.elapsed().as_secs_f64()
-        * 100.0;
+    let cpu = cpu_percent(
+        &resources_start,
+        &resources_end,
+        started.elapsed().as_secs_f64(),
+    )?;
     results.insert("resources".into(), json!({"start":resources_start,"end":resources_end,"one_core_cpu_percent":cpu,"seconds":started.elapsed().as_secs_f64()}));
     ensure!(
         outage["tunnels"]
@@ -445,6 +442,9 @@ fn failures(child: &mut Child) -> Result<()> {
         child.try_wait()?.is_none(),
         "The monitor exited during the failure checks."
     );
+    child.kill()?;
+    child.wait()?;
+    one_second_checks(&mut results)?;
     let output = Path::new("artifacts/local/current");
     fs::create_dir_all(output)?;
     results.insert(
@@ -633,6 +633,137 @@ fn route_failures(results: &mut serde_json::Map<String, Value>) -> Result<()> {
         "router",
         &["route", "replace", "default", "dev", "wg5", "table", "1005"],
     )?;
+    Ok(())
+}
+
+fn cpu_percent(start: &Value, end: &Value, seconds: f64) -> Result<f64> {
+    let ticks = text("getconf", &["CLK_TCK"], 32, 2)?
+        .trim()
+        .parse::<f64>()?;
+    Ok(
+        (end["cpu_ticks"].as_f64().unwrap_or(0.0) - start["cpu_ticks"].as_f64().unwrap_or(0.0))
+            / ticks
+            / seconds
+            * 100.0,
+    )
+}
+
+fn status(since: u64) -> Result<Value> {
+    let binary = fs::canonicalize("target/aarch64-unknown-linux-musl/release/waylined")?;
+    let binary = binary.to_str().context("Invalid monitor path.")?;
+    let since = since.to_string();
+    let data = text(
+        binary,
+        &[
+            "status",
+            "--socket",
+            "/run/wayline/status.sock",
+            "--since",
+            &since,
+        ],
+        786_432,
+        3,
+    )?;
+    Ok(serde_json::from_str(&data)?)
+}
+
+fn aligned(item: &Value) -> bool {
+    item["buckets"].as_array().is_some_and(|buckets| {
+        buckets
+            .iter()
+            .all(|bucket| bucket["at"].as_u64().is_some_and(|at| at % 15 == 0))
+    })
+}
+
+fn clean_bucket(item: &Value) -> bool {
+    item["buckets"].as_array().is_some_and(|buckets| {
+        buckets.iter().any(|bucket| {
+            bucket["sent"].as_u64().unwrap_or(0) >= 12
+                && bucket["lost"].as_u64() == Some(0)
+                && !bucket["median_us"].is_null()
+        })
+    })
+}
+
+fn stop_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn one_second_checks(results: &mut serde_json::Map<String, Value>) -> Result<()> {
+    for index in 1..=8 {
+        let rate = format!("{}ms", index * 10);
+        delay(index, &["delay", rate.as_str()])?;
+    }
+    let mut child = start_monitor(&configuration(1000, 500, false))?;
+    let result = healthy_one_second(&mut child, results);
+    stop_child(&mut child);
+    result?;
+    delay(3, &["loss", "100%"])?;
+    let mut child = start_monitor(&configuration(1000, 500, false))?;
+    let result = lossy_one_second(&mut child, results);
+    stop_child(&mut child);
+    delay(3, &["delay", "30ms"])?;
+    result
+}
+
+fn healthy_one_second(
+    child: &mut Child,
+    results: &mut serde_json::Map<String, Value>,
+) -> Result<()> {
+    let start = resources(child.id())?;
+    let started = std::time::Instant::now();
+    thread::sleep(Duration::from_secs(35));
+    let snapshot = status(0)?;
+    let seconds = started.elapsed().as_secs_f64();
+    let end = resources(child.id())?;
+    ensure!(
+        child.try_wait()?.is_none(),
+        "The one-second monitor exited."
+    );
+    ensure!(
+        snapshot["tunnels"]
+            .as_array()
+            .is_some_and(|items| items.len() == 8
+                && items.iter().all(|item| clean_bucket(item) && aligned(item))),
+        "A healthy one-second series lacks a clean closed bucket."
+    );
+    let cpu = cpu_percent(&start, &end, seconds)?;
+    results.insert(
+        "one_second_resources".into(),
+        json!({"start":start,"end":end,"one_core_cpu_percent":cpu,"rss_kib":end["rss_kib"],"seconds":seconds}),
+    );
+    results.insert("one_second_healthy".into(), snapshot);
+    Ok(())
+}
+
+fn lossy_one_second(child: &mut Child, results: &mut serde_json::Map<String, Value>) -> Result<()> {
+    thread::sleep(Duration::from_secs(35));
+    let snapshot = status(0)?;
+    ensure!(
+        child.try_wait()?.is_none(),
+        "The one-second monitor exited."
+    );
+    let lossy = snapshot["tunnels"]
+        .get(2)
+        .context("Missing lossy series.")?;
+    ensure!(
+        lossy["id"] == "exit3_1",
+        "The lossy series is not the expected path."
+    );
+    let buckets = lossy["buckets"].as_array().context("Missing buckets.")?;
+    ensure!(
+        buckets
+            .iter()
+            .any(|bucket| bucket["sent"].as_u64().unwrap_or(0) >= 12)
+            && buckets.iter().all(|bucket| {
+                bucket["sent"].as_u64().unwrap_or(0) > 0
+                    && bucket["lost"] == bucket["sent"]
+                    && bucket["median_us"].is_null()
+            }),
+        "The lossy path did not keep one probe per second with every probe lost."
+    );
+    results.insert("one_second_loss".into(), snapshot);
     Ok(())
 }
 
