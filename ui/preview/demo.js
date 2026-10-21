@@ -338,7 +338,7 @@
         median: value,
         min: value === null ? null : value - 3,
         max: value === null ? null : value + 5 + (n % 91 === 0 ? 35 : 0),
-        lost: outage ? 4 : 0,
+        lost: outage ? 4 : id === 'wan' && n % 53 < 2 ? 1 : 0,
         sent: 4,
       });
     }

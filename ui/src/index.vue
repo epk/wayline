@@ -1853,14 +1853,28 @@ export default {
           }
           lines.push(line);
           line.lossIndex = loss.length;
-          loss.push(lossColumn(s.points));
+          line.loss = lossColumn(s.points);
+          loss.push(line.loss);
           lossSeries.push({
             label: line.name,
             stroke: color,
             width: server ? 1 : 1.5,
             spanGaps: false,
             ...(server ? { dash: [6, 4] } : {}),
-            points: { show: false },
+            points: {
+              show: true,
+              size: 6,
+              space: 0,
+              stroke: color,
+              fill: color,
+              filter: (u, seriesIndex) => {
+                const found = [];
+                u.data[seriesIndex].forEach((v, i) => {
+                  if (v > 0) found.push(i);
+                });
+                return found;
+              },
+            },
           });
           rows.push(
             Object.freeze({
@@ -1932,7 +1946,7 @@ export default {
           cursor: { sync: { key: 'wayline' }, drag: { x: false, y: false, setScale: false } },
           scales: {
             x: { time: true, range: () => this.plotRange() },
-            y: { range: (u, low, high) => [0, high > 5 ? Math.min(100, high * 1.15) : 5] },
+            y: { range: (u, low, high) => [0, Math.min(100, Math.max(2, high * 1.3))] },
           },
           axes: [
             this.axisOptions({
@@ -1941,7 +1955,8 @@ export default {
             }),
             this.axisOptions({
               label: '%',
-              values: (u, values) => values.map((v) => String(Math.round(v))),
+              values: (u, values) =>
+                values.map((v) => (Number.isInteger(v) ? String(v) : v.toFixed(1))),
             }),
           ],
           series: built.lossSeries,
@@ -2042,7 +2057,9 @@ export default {
         name.textContent = nearest.line.name;
         const value = document.createElement('span');
         value.className = 'vph-tip-value';
-        value.textContent = this.ms(nearest.value);
+        const lost = nearest.line.loss[idx];
+        value.textContent =
+          this.ms(nearest.value) + (lost > 0 ? ' · ' + this.lossPercent(lost) + ' loss' : '');
         head.append(swatch, name, value);
       } else {
         const none = document.createElement('span');
