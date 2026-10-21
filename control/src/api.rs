@@ -2,7 +2,7 @@ use crate::{
     auto, changes, egress, history, native,
     resolve::Resolved,
     router,
-    runtime::{RUNTIME, SETTINGS, locked, milliseconds, snapshot, version},
+    runtime::{SETTINGS, locked, milliseconds, snapshot, version},
     service::reconcile,
     settings::{self, Settings, Target},
     update,
@@ -41,7 +41,7 @@ pub struct State {
     capabilities: Capabilities,
     compat: native::Compat,
     monitoring_issue: Option<String>,
-    update: Option<update::Status>,
+    update: update::Status,
 }
 
 #[derive(Serialize)]
@@ -392,7 +392,7 @@ fn unsupported(compat: native::Compat) -> State {
         },
         compat,
         monitoring_issue: None,
-        update: update::Status::read(),
+        update: update::view(),
     }
 }
 
@@ -472,7 +472,7 @@ pub fn state() -> Result<State> {
         },
         compat,
         monitoring_issue,
-        update: update::Status::read(),
+        update: update::view(),
     })
 }
 
@@ -616,10 +616,7 @@ pub fn apply(id: &str, expected_revision: &str, require_health: bool) -> Result<
     Ok(json!({"applied":true}))
 }
 
-pub fn queue_update(method: &str) -> Result<Value> {
-    atomic(
-        Path::new(&format!("{RUNTIME}/update-request")),
-        method.as_bytes(),
-    )?;
-    Ok(json!({"message":"The request is queued. Its status appears within one minute."}))
+pub fn start_update(method: &str) -> Result<Value> {
+    let started = update::start(method)?;
+    Ok(json!({"started":started,"update":update::view()}))
 }

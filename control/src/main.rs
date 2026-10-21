@@ -54,7 +54,7 @@ fn run() -> Result<Value> {
         "set_config" => api::set_config(parse(&raw)?),
         "select_tunnel" => api::select(&parse(&raw)?),
         "set_tunnel_enabled" => api::set_tunnel_enabled(&parse(&raw)?),
-        "check_update" | "install_update" => api::queue_update(&method),
+        "check_update" | "install_update" => api::start_update(&method),
         "tick" => applied(service::tick()),
         "restart" => applied(service::restart()),
         "boot" | "start" | "reload" | "reconcile" => applied(service::reconcile()),
@@ -88,6 +88,7 @@ fn human(command: &str, option: Option<&str>) -> Option<Result<bool>> {
             Some(Ok(true))
         }
         ("doctor", None) => Some(Ok(doctor::run())),
+        ("update-job", None) => Some(privileged().and_then(|()| update::job()).map(|()| true)),
         ("update", None | Some("--check")) => Some(
             privileged()
                 .and_then(|()| update::run_now(option.is_none()))

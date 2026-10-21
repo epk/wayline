@@ -9,10 +9,12 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
+    process::Stdio,
 };
 use wayline_support::{atomic, digest, read, text};
 
 const RELEASES: &str = "https://api.github.com/repos/epk/wayline/releases?per_page=30";
+const STALE_AFTER: u64 = 240;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,26 +46,90 @@ struct Release {
     draft: bool,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    #[default]
+    Idle,
+    Checking,
+    Downloading,
+    Verifying,
+    Installing,
+    Done,
+    Failed,
+}
+
+impl Phase {
+    const fn working(self) -> bool {
+        matches!(
+            self,
+            Self::Checking | Self::Downloading | Self::Verifying | Self::Installing
+        )
+    }
+}
+
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Status {
+    current: String,
+    latest: Option<String>,
+    available: bool,
+    phase: Phase,
     message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    available: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    version: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    installing: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     failed: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     needs_attention: bool,
-    #[serde(default)]
     checked_at: u64,
+    updated_at: u64,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Stored {
+    current: Option<String>,
+    #[serde(alias = "version")]
+    latest: Option<String>,
+    available: Option<bool>,
+    phase: Option<Phase>,
+    installing: bool,
+    message: String,
+    failed: bool,
+    #[serde(alias = "needs_attention")]
+    needs_attention: bool,
+    #[serde(alias = "checked_at")]
+    checked_at: u64,
+    updated_at: u64,
+}
+
+impl From<Stored> for Status {
+    fn from(stored: Stored) -> Self {
+        let phase = stored.phase.unwrap_or(if stored.installing {
+            Phase::Installing
+        } else if stored.failed {
+            Phase::Failed
+        } else {
+            Phase::Done
+        });
+        Self {
+            current: stored.current.unwrap_or_else(version),
+            latest: stored.latest,
+            available: stored.available.unwrap_or(false),
+            phase,
+            message: stored.message,
+            failed: stored.failed,
+            needs_attention: stored.needs_attention,
+            checked_at: stored.checked_at,
+            updated_at: stored.updated_at,
+        }
+    }
 }
 
 impl Status {
     pub fn read() -> Option<Self> {
-        serde_json::from_slice(&fs::read(Self::path()).ok()?).ok()
+        Self::parse(&fs::read(Self::path()).ok()?)
+    }
+
+    fn parse(raw: &[u8]) -> Option<Self> {
+        serde_json::from_slice::<Stored>(raw).ok().map(Self::from)
     }
 
     pub fn message(&self) -> &str {
@@ -78,15 +144,73 @@ impl Status {
         atomic(&Self::path(), &serde_json::to_vec(self)?)
     }
 
-    fn checked(message: &str, available: bool, version: String) -> Self {
+    fn working(previous: Option<&Self>, phase: Phase, message: &str) -> Self {
         Self {
+            current: version(),
+            latest: previous.and_then(|status| status.latest.clone()),
+            available: previous.is_some_and(|status| status.available),
+            phase,
             message: message.into(),
-            available: Some(available),
-            version: Some(version),
-            checked_at: now(),
-            ..Self::default()
+            failed: false,
+            needs_attention: previous.is_some_and(|status| status.needs_attention),
+            checked_at: previous.map_or(0, |status| status.checked_at),
+            updated_at: now(),
         }
     }
+
+    fn finished(message: String, latest: String, available: bool) -> Self {
+        let at = now();
+        Self {
+            current: version(),
+            latest: Some(latest),
+            available,
+            phase: Phase::Done,
+            message,
+            failed: false,
+            needs_attention: false,
+            checked_at: at,
+            updated_at: at,
+        }
+    }
+
+    fn stopped(error: &anyhow::Error) -> Self {
+        let current = Self::read();
+        let at = now();
+        Self {
+            current: version(),
+            latest: current.as_ref().and_then(|status| status.latest.clone()),
+            available: current.as_ref().is_some_and(|status| status.available),
+            phase: Phase::Failed,
+            message: format!("Update stopped. {error}"),
+            failed: true,
+            needs_attention: current
+                .as_ref()
+                .is_some_and(|status| status.needs_attention || status.phase == Phase::Installing),
+            checked_at: at,
+            updated_at: at,
+        }
+    }
+}
+
+fn effective(mut status: Status, at: u64) -> Status {
+    if status.phase.working() && at.saturating_sub(status.updated_at) > STALE_AFTER {
+        status.needs_attention |= status.phase == Phase::Installing;
+        status.phase = Phase::Failed;
+        status.failed = true;
+        status.message =
+            "The update did not finish. Run wayline-ctl update on the router for details.".into();
+    }
+    status
+}
+
+pub fn view() -> Status {
+    effective(
+        Status::read().unwrap_or_else(|| Status {
+            current: version(),
+            ..Status::default()
+        }),
+        now(),
+    )
 }
 
 fn download(url: &str, path: &Path, limit: u64) -> Result<()> {
@@ -245,18 +369,23 @@ fn package_identity(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn execute(install: bool) -> Result<Status> {
+fn execute(install: bool, report: &dyn Fn(Phase, &str) -> Result<()>) -> Result<Status> {
+    report(Phase::Checking, "Checking for a newer release…")?;
     let folder = tempfile::tempdir_in(RUNTIME)?;
     let Some(latest) = newer(folder.path())? else {
-        return Ok(Status::checked("Wayline is current.", false, version()));
+        return Ok(Status::finished(
+            "Wayline is up to date.".into(),
+            version(),
+            false,
+        ));
     };
+    if install {
+        report(Phase::Downloading, "Downloading the signed update.")?;
+    }
     let (manifest, artifact, prefix) = metadata(folder.path(), &latest)?;
     if !install {
-        return Ok(Status::checked(
-            "A signed update is available.",
-            true,
-            manifest.version,
-        ));
+        let message = format!("Version {} is available.", manifest.version);
+        return Ok(Status::finished(message, manifest.version, true));
     }
     space(folder.path(), artifact.bytes.saturating_mul(2) + 1_048_576)?;
     space(Path::new("/etc/wayline"), 4_194_304)?;
@@ -266,6 +395,7 @@ fn execute(install: bool) -> Result<Status> {
         &package,
         artifact.bytes,
     )?;
+    report(Phase::Verifying, "Verifying the signed package.")?;
     let bytes = read(&package, 4_194_304)?;
     ensure!(
         u64::try_from(bytes.len())? == artifact.bytes && digest(&bytes) == artifact.sha256,
@@ -274,33 +404,31 @@ fn execute(install: bool) -> Result<Status> {
     package_identity(&package, &manifest.version)?;
     let path = package.to_str().context("Invalid package path.")?;
     text("opkg", &["--noaction", "install", path], 16_384, 30)?;
-    Status {
-        message: "Installing the signed update.".into(),
-        installing: true,
-        checked_at: now(),
-        ..Status::default()
-    }
-    .write()?;
+    report(Phase::Installing, "Installing the signed update.")?;
     text("opkg", &["install", path], 32_768, 120)?;
     ensure!(
         version() == manifest.version,
         "The installed version needs checking. Do not retry automatically."
     );
-    Ok(Status::checked("Wayline updated.", false, manifest.version))
+    let message = format!("Updated to {}.", manifest.version);
+    Ok(Status::finished(message, manifest.version, false))
 }
 
-fn attempt(install: bool) -> Status {
-    execute(install).unwrap_or_else(|error| Status {
-        message: format!("Update stopped. {error}"),
-        failed: true,
-        needs_attention: Status::read().is_some_and(|status| status.installing),
-        checked_at: now(),
-        ..Status::default()
-    })
+fn attempt(install: bool) -> Result<Status> {
+    let previous = Status::read();
+    let report =
+        |phase: Phase, message: &str| Status::working(previous.as_ref(), phase, message).write();
+    let status = if settled(previous.as_ref()) {
+        execute(install, &report).unwrap_or_else(|error| Status::stopped(&error))
+    } else {
+        Status::stopped(&anyhow::anyhow!("A previous installation needs checking."))
+    };
+    status.write()?;
+    Ok(status)
 }
 
 fn settled(previous: Option<&Status>) -> bool {
-    previous.is_none_or(|status| !status.installing && !status.needs_attention)
+    previous.is_none_or(|status| status.phase != Phase::Installing && !status.needs_attention)
 }
 
 fn space(path: &Path, minimum: u64) -> Result<()> {
@@ -312,6 +440,37 @@ fn space(path: &Path, minimum: u64) -> Result<()> {
     Ok(())
 }
 
+fn request_path() -> PathBuf {
+    PathBuf::from(format!("{RUNTIME}/update-request"))
+}
+
+fn idle() -> bool {
+    locked("update", || Ok(())).is_ok()
+}
+
+pub fn start(method: &str) -> Result<bool> {
+    if !idle() {
+        return Ok(false);
+    }
+    atomic(&request_path(), method.as_bytes())?;
+    std::process::Command::new(std::env::current_exe()?)
+        .arg("update-job")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(true)
+}
+
+pub fn job() -> Result<()> {
+    locked("update", || {
+        let request = request_path();
+        let install = fs::read_to_string(&request).unwrap_or_default() == "install_update";
+        let _ = fs::remove_file(&request);
+        attempt(install).map(drop)
+    })
+}
+
 pub fn run_now(install: bool) -> Result<Status> {
     locked("update", || {
         let previous = Status::read();
@@ -319,15 +478,16 @@ pub fn run_now(install: bool) -> Result<Status> {
             settled(previous.as_ref()),
             "A previous installation needs checking."
         );
-        let status = attempt(install);
-        status.write()?;
-        Ok(status)
+        attempt(install)
     })
 }
 
 pub fn scheduled(config: &Settings) -> Result<()> {
+    if !idle() {
+        return Ok(());
+    }
     locked("update", || {
-        let request = PathBuf::from(format!("{RUNTIME}/update-request"));
+        let request = request_path();
         let requested = fs::read_to_string(&request).unwrap_or_default();
         let previous = Status::read();
         ensure!(
@@ -340,9 +500,7 @@ pub fn scheduled(config: &Settings) -> Result<()> {
         {
             return Ok(());
         }
-        let status =
-            attempt(requested == "install_update" || (requested.is_empty() && config.auto_updates));
-        status.write()?;
+        attempt(requested == "install_update" || (requested.is_empty() && config.auto_updates))?;
         if request.exists() {
             fs::remove_file(request)?;
         }
@@ -352,14 +510,26 @@ pub fn scheduled(config: &Settings) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Release, newest};
-    use anyhow::{Result, ensure};
+    use super::{Phase, Release, Status, effective, newest};
+    use anyhow::{Context, Result, ensure};
     use semver::Version;
 
     fn release(tag_name: &str, draft: bool) -> Release {
         Release {
             tag_name: tag_name.into(),
             draft,
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Status> {
+        Status::parse(raw.as_bytes()).context("The status is unreadable.")
+    }
+
+    fn at(phase: Phase, updated_at: u64) -> Status {
+        Status {
+            phase,
+            updated_at,
+            ..Status::default()
         }
     }
 
@@ -406,6 +576,79 @@ mod tests {
     #[test]
     fn empty_list_has_no_release() -> Result<()> {
         ensure!(newest(&[]).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_available_status() -> Result<()> {
+        let status = parse(
+            r#"{"message":"A signed update is available.","available":true,"version":"0.2.0","checked_at":5}"#,
+        )?;
+        ensure!(status.latest.as_deref() == Some("0.2.0"));
+        ensure!(status.available && status.phase == Phase::Done);
+        ensure!(status.checked_at == 5 && !status.needs_attention && !status.failed);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_installing_status() -> Result<()> {
+        let status = parse(
+            r#"{"message":"Installing the signed update.","installing":true,"checked_at":7}"#,
+        )?;
+        ensure!(status.phase == Phase::Installing);
+        ensure!(!status.needs_attention && !status.available);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_needs_attention_status() -> Result<()> {
+        let status = parse(
+            r#"{"message":"Update stopped. Refused.","failed":true,"needs_attention":true}"#,
+        )?;
+        ensure!(status.phase == Phase::Failed && status.failed && status.needs_attention);
+        ensure!(!super::settled(Some(&status)));
+        Ok(())
+    }
+
+    #[test]
+    fn writes_camel_case_phases() -> Result<()> {
+        let value = serde_json::to_value(at(Phase::Downloading, 9))?;
+        ensure!(value["phase"] == "downloading");
+        ensure!(value["updatedAt"] == 9 && value["checkedAt"] == 0);
+        ensure!(value["latest"].is_null() && value["needsAttention"] == false);
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_work_is_kept() -> Result<()> {
+        let status = effective(at(Phase::Downloading, 100), 200);
+        ensure!(status.phase == Phase::Downloading && !status.failed);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_work_fails() -> Result<()> {
+        ensure!(effective(at(Phase::Checking, 100), 340).phase == Phase::Checking);
+        let status = effective(at(Phase::Checking, 100), 341);
+        ensure!(status.phase == Phase::Failed && status.failed);
+        ensure!(
+            status.message
+                == "The update did not finish. Run wayline-ctl update on the router for details."
+        );
+        ensure!(!status.needs_attention);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_install_needs_attention() -> Result<()> {
+        let status = effective(at(Phase::Installing, 0), 1000);
+        ensure!(status.phase == Phase::Failed && status.needs_attention);
+        Ok(())
+    }
+
+    #[test]
+    fn finished_status_is_not_stale() -> Result<()> {
+        ensure!(effective(at(Phase::Done, 0), 10_000).phase == Phase::Done);
         Ok(())
     }
 }
