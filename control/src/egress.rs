@@ -1,16 +1,19 @@
 use crate::{
-    router::{Inventory, PathInfo},
+    router::{Inventory, PathInfo, monitored},
     runtime::{RUNTIME, now},
+    settings::Settings,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
+    path::Path,
     sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant},
 };
+use wayline_support::atomic;
 
 const LIMIT: Duration = Duration::from_secs(6);
 const MAX_AGE: u64 = 300;
@@ -34,7 +37,7 @@ impl Cache {
             .unwrap_or_default()
     }
 
-    pub fn view(config: &crate::settings::Settings, inventory: &Inventory) -> Self {
+    pub fn view(config: &Settings, inventory: &Inventory) -> Self {
         let mut cache = Self::read();
         let paths = scheduled_paths(config, inventory);
         cache.paths.retain(|cached| {
@@ -46,19 +49,13 @@ impl Cache {
     }
 
     fn matches(&self, paths: &[&PathInfo]) -> bool {
-        let wanted: Vec<_> = paths
-            .iter()
-            .map(|path| (path.id.as_str(), path.interface.as_str()))
-            .collect();
-        let cached: Vec<_> = self
-            .paths
-            .iter()
-            .map(|path| (path.id.as_str(), path.interface.as_str()))
-            .collect();
-        wanted == cached
+        paths.len() == self.paths.len()
+            && paths.iter().zip(&self.paths).all(|(wanted, cached)| {
+                wanted.id == cached.id && wanted.interface == cached.interface
+            })
     }
 
-    pub fn refresh(config: &crate::settings::Settings, inventory: &Inventory) -> Result<()> {
+    pub fn refresh(config: &Settings, inventory: &Inventory) -> Result<()> {
         let cache = Self::read();
         let paths = scheduled_paths(config, inventory);
         if now().saturating_sub(cache.checked_at) < MAX_AGE && cache.matches(&paths) {
@@ -68,26 +65,20 @@ impl Cache {
             checked_at: now(),
             paths: probe_paths(&paths),
         };
-        wayline_support::atomic(
-            std::path::Path::new(&Self::path()),
-            &serde_json::to_vec(&fresh)?,
-        )
+        atomic(Path::new(&Self::path()), &serde_json::to_vec(&fresh)?)
     }
 }
 
-pub fn scheduled_paths<'a>(
-    config: &'a crate::settings::Settings,
-    inventory: &'a Inventory,
-) -> Vec<&'a PathInfo> {
+pub fn scheduled_paths<'a>(config: &'a Settings, inventory: &'a Inventory) -> Vec<&'a PathInfo> {
     if !config.enabled {
         return Vec::new();
     }
-    crate::router::monitored(config, inventory)
+    monitored(config, inventory)
         .chain(inventory.wan.iter().filter(|_| config.direct_wan))
         .collect()
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Egress {
     pub id: String,
     pub name: String,

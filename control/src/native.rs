@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::OnceLock};
 use wayline_support::{FIRMWARE_CONTRACT, digest, read, text};
 
 pub const MAX_TUNNELS: usize = 8;
@@ -82,7 +82,7 @@ pub enum Level {
     Full,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Compat {
     pub level: Level,
     pub verified: bool,
@@ -91,7 +91,19 @@ pub struct Compat {
     pub features: Vec<Feature>,
 }
 
-#[derive(Serialize)]
+impl Compat {
+    pub fn monitoring_only(&mut self) {
+        self.level = Level::Monitoring;
+        self.verified = false;
+        self.features = features(self.level);
+        self.message = format!(
+            "Firmware {} replies in a format that Wayline does not know. Monitoring and history work. Exit selection and Start and Stop are off.",
+            self.firmware
+        );
+    }
+}
+
+#[derive(Clone, Serialize)]
 pub struct Feature {
     pub name: &'static str,
     pub available: bool,
@@ -159,15 +171,13 @@ fn decide(firmware: &str, digest: Option<&str>) -> (Level, bool, String) {
     }
 }
 
-pub fn compat() -> Compat {
-    let firmware = fs::read_to_string("/etc/glversion")
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
+fn assess() -> Compat {
+    let firmware = fs::read_to_string("/etc/glversion").unwrap_or_default();
+    let firmware = firmware.trim();
     let digest = read(Path::new(VPN_MODULE), 131_072)
         .ok()
         .map(|data| digest(&data));
-    let (level, verified, message) = decide(&firmware, digest.as_deref());
+    let (level, verified, message) = decide(firmware, digest.as_deref());
     Compat {
         features: features(level),
         level,
@@ -175,24 +185,33 @@ pub fn compat() -> Compat {
         firmware: if firmware.is_empty() {
             "unknown".into()
         } else {
-            firmware
+            firmware.into()
         },
         message,
     }
 }
 
+fn assessed() -> &'static Compat {
+    static ASSESSED: OnceLock<Compat> = OnceLock::new();
+    ASSESSED.get_or_init(assess)
+}
+
+pub fn compat() -> Compat {
+    assessed().clone()
+}
+
 pub fn require(level: Level) -> Result<()> {
-    let compat = compat();
+    let compat = assessed();
     ensure!(compat.level >= level, "{}", compat.message);
     Ok(())
 }
 
 pub fn contract() -> bool {
-    compat().level == Level::Full
+    assessed().level == Level::Full
 }
 
 pub fn supported() -> bool {
-    compat().level >= Level::Monitoring
+    assessed().level >= Level::Monitoring
 }
 
 pub fn bus<T: DeserializeOwned>(object: &str, method: &str, params: &Value) -> Result<T> {

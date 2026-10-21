@@ -1,7 +1,7 @@
 use crate::runtime::SETTINGS;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{fmt, net::Ipv4Addr, path::Path, str::FromStr};
+use std::{fmt, io, net::Ipv4Addr, path::Path, str::FromStr};
 
 const MAX_TARGETS: usize = 5;
 static FALLBACK: Target = Target::Address(Ipv4Addr::new(1, 1, 1, 1));
@@ -219,11 +219,16 @@ impl<'de> Deserialize<'de> for Target {
 
 impl Settings {
     pub fn read() -> Result<Self> {
-        let path = Path::new(SETTINGS);
-        let value: Self = if path.exists() {
-            serde_json::from_slice(&wayline_support::read(path, 32768)?)?
-        } else {
-            Self::default()
+        let value: Self = match wayline_support::read(Path::new(SETTINGS), 32768) {
+            Ok(data) => serde_json::from_slice(&data)?,
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+            {
+                Self::default()
+            }
+            Err(error) => return Err(error),
         };
         value.validate()?;
         Ok(value)
@@ -258,31 +263,26 @@ impl Settings {
                     .is_some_and(|number| number > 0)),
             "Invalid tunnel identity."
         );
-        for (index, value) in self.tunnels.iter().enumerate() {
-            ensure!(
-                !self.tunnels[..index].contains(value),
-                "Duplicate tunnel identity."
-            );
-        }
-        for (index, value) in self.targets.iter().enumerate() {
-            ensure!(!self.targets[..index].contains(value), "Duplicate target.");
-        }
+        ensure!(unique(&self.tunnels), "Duplicate tunnel identity.");
+        ensure!(unique(&self.targets), "Duplicate target.");
         ensure!(
             self.auto_tunnels.len() <= 8 && (!self.auto_exit || self.auto_tunnels.len() >= 2),
             "Choose at least two monitored tunnels for automatic switching."
         );
-        for (index, id) in self.auto_tunnels.iter().enumerate() {
-            ensure!(
-                self.tunnels.contains(id),
-                "Automatic switching only permits monitored tunnels."
-            );
-            ensure!(
-                !self.auto_tunnels[..index].contains(id),
-                "Duplicate automatic tunnel."
-            );
-        }
+        ensure!(
+            self.auto_tunnels.iter().all(|id| self.tunnels.contains(id)),
+            "Automatic switching only permits monitored tunnels."
+        );
+        ensure!(unique(&self.auto_tunnels), "Duplicate automatic tunnel.");
         Ok(())
     }
+}
+
+fn unique<T: PartialEq>(items: &[T]) -> bool {
+    items
+        .iter()
+        .enumerate()
+        .all(|(index, item)| !items[..index].contains(item))
 }
 
 #[cfg(test)]
