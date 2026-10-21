@@ -6,7 +6,7 @@ use std::{
 };
 
 const SIZE: usize = 60;
-const REPLY_READS: usize = 4;
+const REPLY_READS: usize = 16;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_GETROUTE: u16 = 26;
 const RTA_DST: u16 = 1;
