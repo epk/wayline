@@ -6,13 +6,13 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, fs, iter, path::Path};
 use wayline_support::atomic;
 
 pub const RECENT: usize = 50;
 const MAX_EVENTS: usize = 100;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Event {
     pub at: u64,
     pub subject: String,
@@ -20,10 +20,10 @@ pub struct Event {
     pub text: String,
 }
 
-pub struct Fact {
+pub struct Fact<'a> {
     key: String,
-    subject: String,
-    label: String,
+    subject: &'a str,
+    label: &'a str,
     fields: BTreeMap<&'static str, String>,
 }
 
@@ -38,22 +38,22 @@ pub fn read(config: &Settings) -> Vec<Event> {
     load(&history::database(config).with_file_name("events.json"))
 }
 
-fn fact<const N: usize>(
+fn fact<'a, const N: usize>(
     key: String,
-    subject: &str,
-    label: &str,
+    subject: &'a str,
+    label: &'a str,
     fields: [(&'static str, String); N],
-) -> Fact {
+) -> Fact<'a> {
     Fact {
         key,
-        subject: subject.into(),
-        label: label.into(),
+        subject,
+        label,
         fields: fields.into_iter().collect(),
     }
 }
 
-fn tunnel_fact(path: &PathInfo) -> Vec<Fact> {
-    let mut facts = vec![fact(
+fn tunnel_facts(path: &PathInfo) -> impl Iterator<Item = Fact<'_>> {
+    let tunnel = fact(
         format!("tunnel:{}", path.id),
         &path.id,
         "Tunnel",
@@ -62,22 +62,21 @@ fn tunnel_fact(path: &PathInfo) -> Vec<Fact> {
             ("address", path.source.to_string()),
             ("profile", path.profile.clone()),
         ],
-    )];
-    if let Some(server) = &path.endpoint {
-        facts.push(fact(
+    );
+    let server = path.endpoint.as_ref().map(|server| {
+        fact(
             format!("server:{}", path.id),
             &path.id,
             "Server",
             [("server", server.to_string())],
-        ));
-    }
-    facts
+        )
+    });
+    iter::once(tunnel).chain(server)
 }
 
-fn facts(inventory: &Inventory) -> Vec<Fact> {
-    let mut facts: Vec<Fact> = inventory.paths.iter().flat_map(tunnel_fact).collect();
-    if let Some(wan) = &inventory.wan {
-        facts.push(fact(
+fn facts(inventory: &Inventory) -> Vec<Fact<'_>> {
+    let wan = inventory.wan.as_ref().map(|wan| {
+        fact(
             "wan".into(),
             "wan",
             "Direct WAN",
@@ -86,9 +85,9 @@ fn facts(inventory: &Inventory) -> Vec<Fact> {
                 ("interface", wan.interface.clone()),
                 ("address", wan.source.to_string()),
             ],
-        ));
-    }
-    facts.extend(inventory.uplinks.iter().map(|uplink| {
+        )
+    });
+    let uplinks = inventory.uplinks.iter().map(|uplink| {
         fact(
             uplink.id.clone(),
             &uplink.id,
@@ -98,8 +97,14 @@ fn facts(inventory: &Inventory) -> Vec<Fact> {
                 ("address", uplink.source.to_string()),
             ],
         )
-    }));
-    facts
+    });
+    inventory
+        .paths
+        .iter()
+        .flat_map(tunnel_facts)
+        .chain(wan)
+        .chain(uplinks)
+        .collect()
 }
 
 fn describe(label: &str, field: &str, before: &str, after: &str) -> String {
@@ -110,48 +115,53 @@ fn describe(label: &str, field: &str, before: &str, after: &str) -> String {
     }
 }
 
-pub fn diff(at: u64, stored: &mut BTreeMap<String, String>, facts: &[Fact]) -> Vec<Event> {
+pub fn diff(at: u64, stored: &mut BTreeMap<String, String>, facts: &[Fact]) -> (Vec<Event>, bool) {
     let mut events = Vec::new();
+    let mut changed = false;
     for fact in facts {
         let encoded = serde_json::to_string(&fact.fields).unwrap_or_default();
-        if let Some(previous) = stored
-            .get(&fact.key)
-            .filter(|value| value.as_str() != encoded)
-        {
-            let before: BTreeMap<String, String> =
-                serde_json::from_str(previous).unwrap_or_default();
-            for (field, after) in &fact.fields {
-                if let Some(old) = before.get(*field).filter(|old| *old != after) {
-                    events.push(Event {
+        match stored.get_mut(&fact.key) {
+            Some(previous) if *previous == encoded => {}
+            Some(previous) => {
+                let before: BTreeMap<String, String> =
+                    serde_json::from_str(previous).unwrap_or_default();
+                events.extend(fact.fields.iter().filter_map(|(field, after)| {
+                    let old = before.get(*field).filter(|old| *old != after)?;
+                    Some(Event {
                         at,
-                        subject: fact.subject.clone(),
+                        subject: fact.subject.into(),
                         kind: (*field).into(),
-                        text: describe(&fact.label, field, old, after),
-                    });
-                }
+                        text: describe(fact.label, field, old, after),
+                    })
+                }));
+                *previous = encoded;
+                changed = true;
+            }
+            None => {
+                stored.insert(fact.key.clone(), encoded);
+                changed = true;
             }
         }
-        stored.insert(fact.key.clone(), encoded);
     }
-    events
+    (events, changed)
 }
 
 pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
-    let facts_path = history::database(config).with_file_name("facts.json");
+    let database = history::database(config);
+    let facts_path = database.with_file_name("facts.json");
     directory(facts_path.parent().context("Invalid history directory.")?)?;
     let mut stored: BTreeMap<String, String> = load(&facts_path);
-    let before = stored.clone();
-    let added = diff(now() * 1000, &mut stored, &facts(inventory));
-    if stored != before {
+    let (added, changed) = diff(now() * 1000, &mut stored, &facts(inventory));
+    if changed {
         atomic(&facts_path, &serde_json::to_vec(&stored)?)?;
     }
     if !added.is_empty() {
-        append(&history::database(config), added)?;
+        append(&database, added)?;
     }
     Ok(())
 }
 
-pub fn append(database: &Path, added: Vec<Event>) -> Result<()> {
+pub fn append(database: &Path, added: impl IntoIterator<Item = Event>) -> Result<()> {
     let path = database.with_file_name("events.json");
     let mut events: Vec<Event> = load(&path);
     events.extend(added);
@@ -166,7 +176,7 @@ mod tests {
     use anyhow::{Result, ensure};
     use std::collections::BTreeMap;
 
-    fn server(address: &str) -> Vec<Fact> {
+    fn server(address: &str) -> Vec<Fact<'static>> {
         vec![fact(
             "server:a".into(),
             "a",
@@ -178,16 +188,21 @@ mod tests {
     #[test]
     fn diff_reports_changes_but_not_first_sightings() -> Result<()> {
         let mut stored = BTreeMap::new();
-        ensure!(diff(1, &mut stored, &server("184.147.43.41")).is_empty());
-        let events = diff(2, &mut stored, &server("184.147.43.99"));
-        ensure!(events.len() == 1, "Expected one server event.");
+        let (events, changed) = diff(1, &mut stored, &server("184.147.43.41"));
+        ensure!(events.is_empty() && changed, "A first sighting is silent.");
+        let (events, changed) = diff(2, &mut stored, &server("184.147.43.99"));
+        ensure!(changed && events.len() == 1, "Expected one server event.");
         ensure!(events[0].kind == "server" && events[0].subject == "a");
         ensure!(
             events[0].text == "Server address changed from 184.147.43.41 to 184.147.43.99.",
             "Unexpected text: {}",
             events[0].text
         );
-        ensure!(diff(3, &mut stored, &server("184.147.43.99")).is_empty());
+        let (events, changed) = diff(3, &mut stored, &server("184.147.43.99"));
+        ensure!(
+            events.is_empty() && !changed,
+            "An unchanged fact is silent."
+        );
         Ok(())
     }
 
@@ -203,7 +218,7 @@ mod tests {
         };
         let mut stored = BTreeMap::new();
         diff(1, &mut stored, &wan("wan"));
-        let events = diff(2, &mut stored, &wan("wwan"));
+        let (events, _) = diff(2, &mut stored, &wan("wwan"));
         ensure!(events.len() == 1 && events[0].kind == "uplink");
         ensure!(events[0].text == "Direct WAN moved from wan to wwan.");
         Ok(())
