@@ -28,12 +28,6 @@ jobs:
             dist/*.ipk
             dist/licenses.tar.gz
           if-no-files-found: error
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: release-lab-results
-          path: artifacts/local/current/*.json
-          if-no-files-found: ignore
   publish:
     needs: build
     runs-on: ubuntu-24.04-arm
