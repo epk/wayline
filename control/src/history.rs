@@ -1,7 +1,7 @@
 use crate::{
     changes::{self, Event},
     router::{Inventory, endpoint_series, endpoints_enabled, series_id, tunnel_prefix},
-    runtime::{RUNTIME, directory, milliseconds, now},
+    runtime::{RUNTIME, directory, milliseconds, now, snapshot_since},
     settings::{self, Settings, Target},
 };
 use anyhow::{Context, Error, Result, ensure};
@@ -12,26 +12,42 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use wayline_protocol::{MAX_SERIES, Sample, Series};
+use wayline_protocol::{BUCKET_SECONDS, Bucket, MAX_SERIES, Series};
 use wayline_support::{atomic, digest};
 
+const HOUR: u64 = 3_600;
+const DAY: u64 = 86_400;
 const MINUTE_MS: u64 = 60_000;
-const DAY_MS: u64 = 86_400_000;
+const MAX_POINTS: u64 = 2_500;
+const MEMORY_PAGES: u64 = 1_024;
+const PAGES: u64 = 8_192;
+const PAGE_BYTES: u64 = 4_096;
 const MARKER: &[u8] = br#"{"version":1}"#;
 const OUTPUT_LIMIT: usize = 262_144;
 const HISTORY_LIMIT: usize = 2 * 1024 * 1024;
-const PAGE_LIMIT: u64 = 2048;
 const HEADER: &[u8] = b"SQLite format 3\0";
-const PRAGMAS: &str = "PRAGMA page_size=4096; PRAGMA max_page_count=2048; PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL;";
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS series(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE); CREATE TABLE IF NOT EXISTS samples(series INTEGER NOT NULL, minute INTEGER NOT NULL, min_us INTEGER, median_us INTEGER, max_us INTEGER, sent INTEGER NOT NULL, lost INTEGER NOT NULL, PRIMARY KEY(series, minute)) WITHOUT ROWID;";
+const LEVELS: [(u64, &str); 4] = [
+    (BUCKET_SECONDS, "s15"),
+    (60, "s1m"),
+    (300, "s5m"),
+    (3_600, "s1h"),
+];
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Copy)]
 struct Bin {
     min: Option<u32>,
     median: Option<u32>,
     max: Option<u32>,
     sent: u32,
     lost: u32,
+}
+
+type Rows = BTreeMap<String, BTreeMap<u64, Bin>>;
+
+struct Level {
+    step: u64,
+    table: &'static str,
+    rows: Rows,
 }
 
 #[derive(Deserialize)]
@@ -42,7 +58,7 @@ struct Bin {
 pub struct Query {
     start: u64,
     end: u64,
-    step: usize,
+    step: u64,
     #[serde(default)]
     target: Option<Target>,
     tunnel: String,
@@ -79,11 +95,37 @@ struct Point {
     lost: u32,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Availability {
+    days: u32,
+    tiers: Vec<Kept>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Kept {
+    step: u64,
+    kept_seconds: u64,
+}
+
+pub struct Report {
+    pub bytes: u64,
+    pub cap: u64,
+    pub lines: Vec<String>,
+}
+
+struct Subject {
+    id: String,
+    name: String,
+    identity: String,
+}
+
 pub fn database(config: &Settings) -> PathBuf {
-    if config.history_hours == 24 {
-        PathBuf::from("/etc/wayline/history/latency.sqlite")
-    } else {
+    if config.history_days == 0 {
         PathBuf::from(format!("{RUNTIME}/history/latency.sqlite"))
+    } else {
+        PathBuf::from("/etc/wayline/history/latency.sqlite")
     }
 }
 
@@ -104,6 +146,58 @@ fn refresh_known(path: &Path) -> Result<()> {
         .map(str::to_owned)
         .collect();
     atomic(&known_cache(), &serde_json::to_vec(&prefixes)?)
+}
+
+const fn retained(days: u32, step: u64) -> u64 {
+    match (days, step) {
+        (0, 15) => 3 * HOUR,
+        (1 | 7 | 30, 15) => 6 * HOUR,
+        (0 | 1, 60) => DAY,
+        (7 | 30, 60) => 3 * DAY,
+        (7, 300) => 7 * DAY,
+        (30, 300 | 3_600) => 30 * DAY,
+        _ => 0,
+    }
+}
+
+fn table(step: u64) -> &'static str {
+    LEVELS
+        .iter()
+        .find(|(width, _)| *width == step)
+        .map_or(LEVELS[0].1, |level| level.1)
+}
+
+fn resolution(days: u32, step: u64, start: u64, end: u64, now: u64) -> Result<u64> {
+    let step = if matches!(step, 1 | 5) {
+        step * 60
+    } else {
+        step
+    };
+    let kept = retained(days, step);
+    ensure!(start < end, "Invalid history range.");
+    ensure!(
+        kept > 0 && start.saturating_add(kept * 1_000 + MINUTE_MS) >= now && end <= now + MINUTE_MS,
+        "That range is not kept at this resolution."
+    );
+    ensure!(
+        end / 1_000 / step - start / 1_000 / step < MAX_POINTS,
+        "That range has too many points."
+    );
+    Ok(step)
+}
+
+pub fn availability(config: &Settings) -> Availability {
+    Availability {
+        days: config.history_days,
+        tiers: LEVELS
+            .iter()
+            .map(|(step, _)| Kept {
+                step: *step,
+                kept_seconds: retained(config.history_days, *step),
+            })
+            .filter(|kept| kept.kept_seconds > 0)
+            .collect(),
+    }
 }
 
 pub fn migrate(config: &Settings, inventory: &Inventory) -> Result<()> {
@@ -157,13 +251,24 @@ fn renames(
     (ids, prefixes)
 }
 
-fn merge(predicate: &str, target: &str) -> String {
-    format!(
-        "INSERT OR IGNORE INTO series(name) SELECT {target} FROM series o WHERE {predicate}; \
-         INSERT OR IGNORE INTO samples SELECT t.id,s.minute,s.min_us,s.median_us,s.max_us,s.sent,s.lost FROM samples s JOIN series o ON o.id=s.series JOIN series t ON t.name={target} WHERE {predicate}; \
-         DELETE FROM samples WHERE series IN (SELECT id FROM series o WHERE {predicate}); \
-         DELETE FROM series WHERE id IN (SELECT id FROM series o WHERE {predicate});"
-    )
+fn merge(predicate: &str, target: &str) -> Result<String> {
+    let mut statement = String::new();
+    write!(
+        statement,
+        "INSERT OR IGNORE INTO series(name) SELECT {target} FROM series o WHERE {predicate}; "
+    )?;
+    for (_, table) in LEVELS {
+        write!(
+            statement,
+            "INSERT OR IGNORE INTO {table} SELECT t.id,s.period,s.min_us,s.median_us,s.max_us,s.sent,s.lost FROM {table} s JOIN series o ON o.id=s.series JOIN series t ON t.name={target} WHERE {predicate}; \
+             DELETE FROM {table} WHERE series IN (SELECT id FROM series o WHERE {predicate}); "
+        )?;
+    }
+    write!(
+        statement,
+        "DELETE FROM series WHERE id IN (SELECT id FROM series o WHERE {predicate});"
+    )?;
+    Ok(statement)
 }
 
 fn migrate_at(
@@ -178,7 +283,7 @@ fn migrate_at(
             settings::id(old) && settings::id(new),
             "Invalid measurement identity."
         );
-        statement.push_str(&merge(&format!("o.name='{old}'"), &format!("'{new}'")));
+        statement.push_str(&merge(&format!("o.name='{old}'"), &format!("'{new}'"))?);
     }
     for (old, new) in prefixes {
         ensure!(
@@ -188,7 +293,7 @@ fn migrate_at(
         statement.push_str(&merge(
             &format!("substr(o.name,1,48)='{old}'"),
             &format!("'{new}'||substr(o.name,49)"),
-        ));
+        )?);
     }
     statement.push_str("COMMIT;");
     sql(path, &statement, false)?;
@@ -207,6 +312,36 @@ fn pages(path: &Path) -> u64 {
         .unwrap_or_default()
 }
 
+fn cap(path: &Path) -> u64 {
+    if path.starts_with(RUNTIME) {
+        MEMORY_PAGES
+    } else {
+        PAGES
+    }
+}
+
+fn pragmas(path: &Path) -> String {
+    format!(
+        "PRAGMA page_size=4096; PRAGMA max_page_count={}; PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL;",
+        cap(path)
+    )
+}
+
+fn schema() -> String {
+    let tables = LEVELS
+        .iter()
+        .map(|(_, table)| {
+            format!(
+                "CREATE TABLE IF NOT EXISTS {table}(series INTEGER NOT NULL, period INTEGER NOT NULL, min_us INTEGER, median_us INTEGER, max_us INTEGER, sent INTEGER NOT NULL, lost INTEGER NOT NULL, PRIMARY KEY(series, period)) WITHOUT ROWID;"
+            )
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    format!(
+        "CREATE TABLE IF NOT EXISTS series(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE); CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID; {tables}"
+    )
+}
+
 fn convert(path: &Path) -> Result<()> {
     let state = sql(
         path,
@@ -216,21 +351,26 @@ fn convert(path: &Path) -> Result<()> {
     let mut lines = state.lines();
     let version: u32 = lines.next().context("Missing schema version.")?.parse()?;
     let legacy = lines.next() == Some("1");
-    if version >= 2 {
+    if version >= 3 {
         return Ok(());
     }
-    let mut script = format!("{PRAGMAS} BEGIN IMMEDIATE; {SCHEMA}");
+    let mut script = format!("{} BEGIN IMMEDIATE; {}", pragmas(path), schema());
     if legacy {
         ensure!(healthy(path), "History database is damaged.");
         script.push_str(
             "INSERT OR IGNORE INTO series(name) SELECT DISTINCT series FROM bins; \
-             INSERT INTO samples SELECT s.id,b.minute,b.min_us,b.median_us,b.max_us,b.sent,b.lost FROM bins b JOIN series s ON s.name=b.series; \
+             INSERT OR IGNORE INTO s1m SELECT s.id,b.minute,b.min_us,b.median_us,b.max_us,b.sent,b.lost FROM bins b JOIN series s ON s.name=b.series; \
              DROP TABLE bins;",
         );
     }
-    script.push_str("PRAGMA user_version=2; COMMIT;");
+    if version == 2 {
+        script.push_str(
+            "INSERT OR IGNORE INTO s1m SELECT series,minute,min_us,median_us,max_us,sent,lost FROM samples; DROP TABLE samples;",
+        );
+    }
+    script.push_str("PRAGMA user_version=3; COMMIT;");
     sql(path, &script, false)?;
-    if legacy {
+    if legacy || version == 2 {
         sql(path, "VACUUM;", false)?;
     }
     Ok(())
@@ -264,132 +404,58 @@ fn sql_with(path: &Path, statement: &str, readonly: bool, limit: usize) -> Resul
     )?)?)
 }
 
-fn bins(samples: &[Sample]) -> BTreeMap<u64, Bin> {
-    let now = now() * 1000;
-    let mut grouped = BTreeMap::<u64, (Vec<u32>, u32)>::new();
-    for sample in samples
-        .iter()
-        .filter(|sample| sample.at_ms >= now.saturating_sub(DAY_MS) && sample.at_ms <= now)
-    {
-        let (values, sent) = grouped.entry(sample.at_ms / MINUTE_MS).or_default();
-        *sent += 1;
-        if let Some(us) = sample.us.filter(|us| *us <= 5_000_000) {
-            values.push(us);
-        }
-    }
-    grouped
-        .into_iter()
-        .map(|(minute, (mut values, sent))| {
-            values.sort_unstable();
-            let bin = Bin {
-                min: values.first().copied(),
-                median: values.get(values.len().saturating_sub(1) / 2).copied(),
-                max: values.last().copied(),
-                sent,
-                lost: sent - u32::try_from(values.len()).unwrap_or(sent),
-            };
-            (minute, bin)
-        })
-        .collect()
-}
-
 fn number(value: Option<u32>) -> String {
     value.map_or_else(|| "NULL".into(), |value| value.to_string())
 }
 
-pub fn collect(config: &Settings, snapshot: &[Series]) -> Result<()> {
-    let path = database(config);
-    directory(path.parent().context("Invalid history directory.")?)?;
-    collect_at(&path, snapshot)?;
-    refresh_known(&path)
+fn bin(bucket: &Bucket) -> Bin {
+    Bin {
+        min: bucket.min_us,
+        median: bucket.median_us,
+        max: bucket.max_us,
+        sent: u32::from(bucket.sent),
+        lost: u32::from(bucket.lost),
+    }
 }
 
-fn collect_at(path: &Path, snapshot: &[Series]) -> Result<()> {
-    store(path, snapshot).or_else(|error| repair(path, snapshot, error))
+fn combine(bins: &[Bin]) -> Bin {
+    let mut medians: Vec<u32> = bins.iter().filter_map(|bin| bin.median).collect();
+    medians.sort_unstable();
+    Bin {
+        min: bins.iter().filter_map(|bin| bin.min).min(),
+        median: medians.get(medians.len().saturating_sub(1) / 2).copied(),
+        max: bins.iter().filter_map(|bin| bin.max).max(),
+        sent: bins.iter().map(|bin| bin.sent).sum(),
+        lost: bins.iter().map(|bin| bin.lost).sum(),
+    }
 }
 
-fn store(path: &Path, snapshot: &[Series]) -> Result<()> {
-    if now() < 1_704_067_200 {
-        return Ok(());
+fn parents(children: &BTreeMap<u64, Bin>, ratio: u64) -> BTreeMap<u64, Bin> {
+    let mut groups: BTreeMap<u64, Vec<Bin>> = BTreeMap::new();
+    for (period, bin) in children {
+        groups.entry(period / ratio).or_default().push(*bin);
     }
-    convert(path)?;
-    let current = now() / 60;
-    let mut statement = format!(
-        "{PRAGMAS} BEGIN IMMEDIATE; DELETE FROM samples WHERE minute < {} OR minute > {current};",
-        current.saturating_sub(1439)
-    );
-    for series in snapshot.iter().take(MAX_SERIES) {
-        ensure!(settings::id(&series.id), "Invalid measurement identity.");
-        let id = &series.id;
-        write!(
-            statement,
-            "INSERT OR IGNORE INTO series(name) VALUES('{id}');"
-        )?;
-        for (minute, bin) in bins(&series.history)
-            .into_iter()
-            .filter(|(minute, _)| *minute < current)
-        {
-            write!(
-                statement,
-                "INSERT INTO samples SELECT id,{minute},{},{},{},{},{} FROM series WHERE name='{id}' ON CONFLICT(series,minute) DO UPDATE SET min_us=excluded.min_us,median_us=excluded.median_us,max_us=excluded.max_us,sent=excluded.sent,lost=excluded.lost WHERE excluded.sent>samples.sent;",
-                number(bin.min),
-                number(bin.median),
-                number(bin.max),
-                bin.sent,
-                bin.lost
-            )?;
-        }
-    }
-    write!(
-        statement,
-        "DELETE FROM samples WHERE series NOT IN (SELECT series FROM samples GROUP BY series ORDER BY max(minute) DESC LIMIT {MAX_SERIES}); DELETE FROM series WHERE id NOT IN (SELECT series FROM samples); COMMIT;"
-    )?;
-    sql(path, &statement, false)?;
-    Ok(())
+    groups
+        .into_iter()
+        .map(|(period, bins)| (period, combine(&bins)))
+        .collect()
 }
 
-fn repair(path: &Path, snapshot: &[Series], error: Error) -> Result<()> {
-    if path.exists() && !healthy(path) {
-        fs::rename(path, path.with_file_name("latency.sqlite.broken"))?;
-        let _ = fs::remove_file(path.with_file_name("latency.sqlite-journal"));
-        changes::append(
-            path,
-            vec![Event {
-                at: now() * 1000,
-                subject: "history".into(),
-                kind: "history".into(),
-                text: "The history database was damaged and was reset.".into(),
-            }],
-        )?;
-        return store(path, snapshot);
-    }
-    if pages(path) >= PAGE_LIMIT {
-        sql(
-            path,
-            "BEGIN IMMEDIATE; DELETE FROM samples WHERE minute < (SELECT min(minute) FROM samples)+360; COMMIT;",
-            false,
-        )?;
-        return store(path, snapshot);
-    }
-    Err(error)
-}
-
-fn stored(
-    config: &Settings,
-    identities: &[String],
-    start: u64,
-    last: u64,
-) -> Result<BTreeMap<String, BTreeMap<u64, Bin>>> {
-    stored_at(&database(config), identities, start, last)
+fn cursor(path: &Path) -> u64 {
+    sql(path, "SELECT value FROM meta WHERE key='cursor';", true)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_default()
 }
 
 fn stored_at(
     path: &Path,
+    table: &str,
     identities: &[String],
     start: u64,
     last: u64,
-) -> Result<BTreeMap<String, BTreeMap<u64, Bin>>> {
-    let mut result: BTreeMap<String, BTreeMap<u64, Bin>> = BTreeMap::new();
+) -> Result<Rows> {
+    let mut result: Rows = BTreeMap::new();
     if !path.exists() || identities.is_empty() {
         return Ok(result);
     }
@@ -397,7 +463,7 @@ fn stored_at(
         identities.iter().all(|identity| settings::id(identity)),
         "Invalid measurement identity."
     );
-    if sql(path, "PRAGMA user_version;", true)?.trim() != "2" {
+    if sql(path, "PRAGMA user_version;", true)?.trim() != "3" {
         return Ok(result);
     }
     let quoted = identities
@@ -423,8 +489,7 @@ fn stored_at(
         .collect::<Vec<_>>()
         .join(",");
     let statement = format!(
-        "SELECT series,minute,min_us,median_us,max_us,sent,lost FROM samples WHERE series IN ({ids}) AND minute BETWEEN {start} AND {last} ORDER BY series,minute LIMIT {};",
-        1441 * names.len()
+        "SELECT series,period,min_us,median_us,max_us,sent,lost FROM {table} WHERE series IN ({ids}) AND period BETWEEN {start} AND {last} ORDER BY series,period;"
     );
     for line in sql_with(path, &statement, true, HISTORY_LIMIT)?.lines() {
         let fields: Vec<_> = line.split('|').collect();
@@ -446,79 +511,270 @@ fn stored_at(
     Ok(result)
 }
 
-struct Subject {
-    id: String,
-    name: String,
-    identity: String,
+fn fresh(snapshot: &[Series], since: u64) -> Rows {
+    snapshot
+        .iter()
+        .take(MAX_SERIES)
+        .map(|series| {
+            (
+                series.id.clone(),
+                series
+                    .buckets
+                    .iter()
+                    .filter(|bucket| bucket.at > since)
+                    .map(|bucket| (bucket.at / BUCKET_SECONDS, bin(bucket)))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        })
+        .filter(|(_, rows)| !rows.is_empty())
+        .collect()
 }
 
-fn line(
-    mut history: BTreeMap<u64, Bin>,
-    snapshot: &[Series],
-    subject: Subject,
-    query: &Query,
-) -> Result<Line> {
-    let (start, last) = (query.start / MINUTE_MS, query.end / MINUTE_MS);
-    let identity = subject.identity;
-    if let Some(live) = snapshot.iter().find(|series| series.id == identity) {
-        for (minute, bin) in bins(&live.history) {
-            if history.get(&minute).is_none_or(|old| old.sent <= bin.sent) {
-                history.insert(minute, bin);
+fn levels(path: &Path, days: u32, fresh: Rows) -> Result<Vec<Level>> {
+    let mut levels = vec![Level {
+        step: LEVELS[0].0,
+        table: LEVELS[0].1,
+        rows: fresh,
+    }];
+    for (step, table) in LEVELS.into_iter().skip(1) {
+        if retained(days, step) == 0 {
+            continue;
+        }
+        let Some(child) = levels.last() else {
+            break;
+        };
+        let periods: Vec<u64> = child
+            .rows
+            .values()
+            .flat_map(|rows| rows.keys().copied())
+            .collect();
+        let (Some(&first), Some(&last)) = (periods.iter().min(), periods.iter().max()) else {
+            break;
+        };
+        let ratio = step / child.step;
+        let names: Vec<String> = child.rows.keys().cloned().collect();
+        let mut children = stored_at(
+            path,
+            child.table,
+            &names,
+            first / ratio * ratio,
+            (last / ratio + 1) * ratio - 1,
+        )?;
+        for (name, rows) in &child.rows {
+            children
+                .entry(name.clone())
+                .or_default()
+                .extend(rows.clone());
+        }
+        let rows = children
+            .iter()
+            .map(|(name, rows)| (name.clone(), parents(rows, ratio)))
+            .collect();
+        levels.push(Level { step, table, rows });
+    }
+    Ok(levels)
+}
+
+fn write(path: &Path, days: u32, levels: &[Level], newest: u64) -> Result<()> {
+    let mut statement = format!("{} BEGIN IMMEDIATE;", pragmas(path));
+    for (index, level) in levels.iter().enumerate() {
+        let verb = if index == 0 {
+            "INSERT OR IGNORE"
+        } else {
+            "INSERT OR REPLACE"
+        };
+        for (name, rows) in &level.rows {
+            ensure!(settings::id(name), "Invalid measurement identity.");
+            write!(
+                statement,
+                "INSERT OR IGNORE INTO series(name) VALUES('{name}');"
+            )?;
+            for (period, bin) in rows {
+                write!(
+                    statement,
+                    "{verb} INTO {} SELECT id,{period},{},{},{},{},{} FROM series WHERE name='{name}';",
+                    level.table,
+                    number(bin.min),
+                    number(bin.median),
+                    number(bin.max),
+                    bin.sent,
+                    bin.lost
+                )?;
             }
         }
     }
-    let width = u64::try_from(query.step)?;
-    let points = (start..=last)
-        .step_by(query.step)
-        .map(|minute| {
-            let group: Vec<_> = (minute..minute + width)
-                .filter_map(|at| history.get(&at))
-                .collect();
-            let mut medians: Vec<u32> = group.iter().filter_map(|bin| bin.median).collect();
-            medians.sort_unstable();
-            Point {
-                at: minute * MINUTE_MS,
-                median: medians
-                    .get(medians.len().saturating_sub(1) / 2)
-                    .copied()
-                    .map(milliseconds),
-                min: group
-                    .iter()
-                    .filter_map(|bin| bin.min)
-                    .min()
-                    .map(milliseconds),
-                max: group
-                    .iter()
-                    .filter_map(|bin| bin.max)
-                    .max()
-                    .map(milliseconds),
-                sent: group.iter().map(|bin| bin.sent).sum(),
-                lost: group.iter().map(|bin| bin.lost).sum(),
+    for (step, table) in LEVELS {
+        let kept = retained(days, step);
+        let cutoff = now().saturating_sub(kept) / step + u64::from(kept == 0);
+        write!(
+            statement,
+            "DELETE FROM {table} WHERE period < {cutoff} OR series NOT IN (SELECT series FROM {table} GROUP BY series ORDER BY max(period) DESC LIMIT {MAX_SERIES});"
+        )?;
+    }
+    let members = LEVELS
+        .iter()
+        .map(|(_, table)| format!("SELECT series FROM {table}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ");
+    write!(
+        statement,
+        "DELETE FROM series WHERE id NOT IN ({members}); INSERT OR REPLACE INTO meta VALUES('cursor',{newest}); COMMIT;"
+    )?;
+    sql(path, &statement, false)?;
+    Ok(())
+}
+
+fn store(path: &Path, days: u32, snapshot: &[Series]) -> Result<()> {
+    if now() < 1_704_067_200 {
+        return Ok(());
+    }
+    convert(path)?;
+    let since = cursor(path);
+    let newest = snapshot
+        .iter()
+        .flat_map(|series| &series.buckets)
+        .map(|bucket| bucket.at)
+        .filter(|at| *at > since)
+        .max();
+    let Some(newest) = newest else {
+        return Ok(());
+    };
+    let levels = levels(path, days, fresh(snapshot, since))?;
+    write(path, days, &levels, newest)
+}
+
+fn repair(path: &Path, days: u32, snapshot: &[Series], error: Error) -> Result<()> {
+    if path.exists() && !healthy(path) {
+        fs::rename(path, path.with_file_name("latency.sqlite.broken"))?;
+        let _ = fs::remove_file(path.with_file_name("latency.sqlite-journal"));
+        changes::append(
+            path,
+            vec![Event {
+                at: now() * 1000,
+                subject: "history".into(),
+                kind: "history".into(),
+                text: "The history database was damaged and was reset.".into(),
+            }],
+        )?;
+        return store(path, days, snapshot);
+    }
+    if pages(path) >= cap(path) {
+        let mut statement = format!("{} BEGIN IMMEDIATE;", pragmas(path));
+        for (_, table) in LEVELS.iter().rev() {
+            write!(
+                statement,
+                "DELETE FROM {table} WHERE period <= (SELECT period FROM {table} ORDER BY period LIMIT 1 OFFSET (SELECT count(*) / 10 FROM {table}));"
+            )?;
+        }
+        statement.push_str("COMMIT;");
+        sql(path, &statement, false)?;
+        return store(path, days, snapshot);
+    }
+    Err(error)
+}
+
+fn collect_at(path: &Path, days: u32, snapshot: &[Series]) -> Result<()> {
+    store(path, days, snapshot).or_else(|error| repair(path, days, snapshot, error))
+}
+
+pub fn collect(config: &Settings) -> Result<()> {
+    let path = database(config);
+    directory(path.parent().context("Invalid history directory.")?)?;
+    collect_at(&path, config.history_days, &snapshot_since(cursor(&path)))?;
+    refresh_known(&path)
+}
+
+pub fn report(config: &Settings) -> Result<Report> {
+    let path = database(config);
+    let bytes = fs::metadata(&path).map_or(0, |meta| meta.len());
+    let mut lines = Vec::new();
+    if path.exists() {
+        let query = LEVELS
+            .iter()
+            .map(|(_, table)| {
+                format!("SELECT '{table}',count(*),min(period),max(period) FROM {table};")
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        for line in sql(&path, &query, true)?.lines() {
+            let fields: Vec<&str> = line.split('|').collect();
+            if let &[table, rows, oldest, newest] = fields.as_slice() {
+                lines.push(format!(
+                    "{table}: {rows} rows, oldest period {oldest}, newest period {newest}"
+                ));
             }
-        })
-        .collect();
-    Ok(Line {
-        id: subject.id,
-        name: subject.name,
-        points,
+        }
+    }
+    Ok(Report {
+        bytes,
+        cap: cap(&path) * PAGE_BYTES,
+        lines,
     })
 }
 
-pub fn query(
-    config: &Settings,
-    snapshot: &[Series],
-    inventory: &Inventory,
+fn point(period: u64, step: u64, bin: Option<&Bin>) -> Point {
+    let bin = bin.copied().unwrap_or_default();
+    Point {
+        at: period * step * 1_000,
+        median: bin.median.map(milliseconds),
+        min: bin.min.map(milliseconds),
+        max: bin.max.map(milliseconds),
+        sent: bin.sent,
+        lost: bin.lost,
+    }
+}
+
+fn line(
+    path: &Path,
+    step: u64,
     query: &Query,
-) -> Result<Response> {
-    let now = now() * 1000;
-    ensure!(
-        query.start < query.end
-            && query.end - query.start <= DAY_MS
-            && query.start >= now.saturating_sub(DAY_MS + MINUTE_MS)
-            && query.end <= now + MINUTE_MS
-            && [1, 5].contains(&query.step),
-        "History range exceeds its limit."
-    );
+    snapshot: &[Series],
+    subject: Subject,
+) -> Result<Line> {
+    let live = snapshot
+        .iter()
+        .find(|series| series.id == subject.identity)
+        .map_or(&[][..], |series| series.buckets.as_slice());
+    let (first, last) = (query.start / 1_000 / step, query.end / 1_000 / step);
+    let identities = std::slice::from_ref(&subject.identity);
+    let mut bins = stored_at(path, table(step), identities, first, last)?
+        .remove(&subject.identity)
+        .unwrap_or_default();
+    let fresh: BTreeMap<u64, Bin> = live
+        .iter()
+        .map(|bucket| (bucket.at / BUCKET_SECONDS, bin(bucket)))
+        .collect();
+    if let (Some(&low), Some(&high)) = (fresh.keys().next(), fresh.keys().next_back()) {
+        let ratio = step / BUCKET_SECONDS;
+        let mut children = stored_at(
+            path,
+            LEVELS[0].1,
+            identities,
+            low / ratio * ratio,
+            (high / ratio + 1) * ratio - 1,
+        )?
+        .remove(&subject.identity)
+        .unwrap_or_default();
+        children.extend(fresh);
+        bins.extend(parents(&children, ratio));
+    }
+    Ok(Line {
+        id: subject.id,
+        name: subject.name,
+        points: (first..=last)
+            .map(|period| point(period, step, bins.get(&period)))
+            .collect(),
+    })
+}
+
+pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {
+    let step = resolution(
+        config.history_days,
+        query.step,
+        query.start,
+        query.end,
+        now() * 1_000,
+    )?;
     let known = known_prefixes();
     let target = query.target.as_ref().unwrap_or_else(|| config.primary());
     let mut subjects: Vec<Subject> = Vec::new();
@@ -568,22 +824,11 @@ pub fn query(
             identity: series_id(wan.prefix(), target),
         });
     }
-    let identities: Vec<String> = subjects
-        .iter()
-        .map(|subject| subject.identity.clone())
-        .collect();
-    let mut stored = stored(
-        config,
-        &identities,
-        query.start / MINUTE_MS,
-        query.end / MINUTE_MS,
-    )?;
+    let path = database(config);
+    let snapshot = snapshot_since(cursor(&path));
     let series = subjects
         .into_iter()
-        .map(|subject| {
-            let history = stored.remove(&subject.identity).unwrap_or_default();
-            line(history, snapshot, subject, query)
-        })
+        .map(|subject| line(&path, step, query, &snapshot, subject))
         .collect::<Result<_>>()?;
     let events = changes::read(config)
         .into_iter()
@@ -594,11 +839,14 @@ pub fn query(
 
 #[cfg(test)]
 mod tests {
-    use super::{bins, collect_at, convert, migrate_at, sql, stored_at};
+    use super::{
+        DAY, HOUR, LEVELS, Query, Subject, collect_at, convert, line, migrate_at, resolution, sql,
+        stored_at,
+    };
     use crate::runtime::now;
-    use anyhow::{Context, Result, ensure};
-    use std::{collections::BTreeMap, fs, net::Ipv4Addr, ops::Range, process::Command};
-    use wayline_protocol::{Sample, Series, State};
+    use anyhow::{Result, ensure};
+    use std::{collections::BTreeMap, fs, net::Ipv4Addr, process::Command};
+    use wayline_protocol::{Bucket, Series, State};
 
     fn sqlite_available() -> bool {
         Command::new("sqlite3")
@@ -611,7 +859,7 @@ mod tests {
         format!("{}_1_1_1_{index}", "a".repeat(48))
     }
 
-    fn series(id: &str, history: Vec<Sample>) -> Series {
+    fn series(id: &str, buckets: Vec<Bucket>) -> Series {
         Series {
             id: id.into(),
             name: "Test".into(),
@@ -623,26 +871,219 @@ mod tests {
             sent: 6,
             received: 4,
             success_age_ms: Some(0),
-            history,
+            history: Vec::new(),
+            buckets,
         }
     }
 
-    fn minutes(id: &str, range: Range<u64>) -> Series {
-        let history = range
-            .flat_map(|minute| {
-                [
-                    Sample {
-                        at_ms: minute * 60_000,
-                        us: Some(20_000),
-                    },
-                    Sample {
-                        at_ms: minute * 60_000 + 1_000,
-                        us: None,
-                    },
-                ]
-            })
+    fn bucket(at: u64, value: u32, lost: u16) -> Bucket {
+        Bucket {
+            at,
+            sent: 4,
+            lost,
+            min_us: Some(value),
+            median_us: Some(value),
+            max_us: Some(value),
+        }
+    }
+
+    fn value(index: u64) -> u32 {
+        u32::try_from(1_000 * ((index * 37) % 97 + 1)).unwrap_or_default()
+    }
+
+    fn hour(start: u64) -> Vec<Bucket> {
+        (0..240)
+            .map(|index| bucket(start + 15 * index, value(index), u16::from(index % 3 == 0)))
+            .collect()
+    }
+
+    fn lower_median(mut values: Vec<u32>) -> u32 {
+        values.sort_unstable();
+        values
+            .get(values.len().saturating_sub(1) / 2)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn hour_row() -> String {
+        let minutes: Vec<u32> = (0..60)
+            .map(|minute| lower_median((4 * minute..4 * minute + 4).map(value).collect()))
             .collect();
-        series(id, history)
+        let fives: Vec<u32> = minutes
+            .chunks(5)
+            .map(|chunk| lower_median(chunk.to_vec()))
+            .collect();
+        let values: Vec<u32> = (0..240).map(value).collect();
+        let lost = (0..240).filter(|index| index % 3 == 0).count();
+        format!(
+            "960|{lost}|{}|{}|{}",
+            values.iter().min().copied().unwrap_or_default(),
+            lower_median(fives),
+            values.iter().max().copied().unwrap_or_default()
+        )
+    }
+
+    fn hour_query(start: u64) -> String {
+        format!(
+            "SELECT sent,lost,min_us,median_us,max_us FROM s1h WHERE period={};",
+            start / HOUR
+        )
+    }
+
+    #[test]
+    fn buckets_roll_up_exactly() -> Result<()> {
+        if !sqlite_available() {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("latency.sqlite");
+        let start = now() / HOUR * HOUR - 2 * HOUR;
+        collect_at(&database, 30, &[series(&identity(1), hour(start))])?;
+        let row = sql(&database, &hour_query(start), true)?;
+        ensure!(row.trim() == hour_row(), "Unexpected hour: {row}");
+        let counts = sql(
+            &database,
+            "SELECT (SELECT count(*) FROM s15), (SELECT count(*) FROM s1m), (SELECT count(*) FROM s5m), (SELECT count(*) FROM s1h);",
+            true,
+        )?;
+        ensure!(
+            counts.trim() == "240|60|12|1",
+            "Unexpected counts: {counts}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_collection_never_double_counts() -> Result<()> {
+        if !sqlite_available() {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("latency.sqlite");
+        let start = now() / HOUR * HOUR - 2 * HOUR;
+        let buckets = hour(start);
+        collect_at(
+            &database,
+            30,
+            &[series(&identity(1), buckets[..120].to_vec())],
+        )?;
+        collect_at(&database, 30, &[series(&identity(1), buckets.clone())])?;
+        collect_at(&database, 30, &[series(&identity(1), buckets)])?;
+        let row = sql(&database, &hour_query(start), true)?;
+        ensure!(row.trim() == hour_row(), "Double count: {row}");
+        Ok(())
+    }
+
+    #[test]
+    fn tiers_prune_to_their_retention() -> Result<()> {
+        if !sqlite_available() {
+            return Ok(());
+        }
+        let now = now();
+        let minute = now / 60 * 60 - 120;
+        for (days, expected) in [(1_u32, "2|1|0|0"), (7, "2|2|1|0")] {
+            let directory = tempfile::tempdir()?;
+            let database = directory.path().join("latency.sqlite");
+            collect_at(
+                &database,
+                days,
+                &[series(&identity(1), vec![bucket(minute, 20_000, 0)])],
+            )?;
+            sql(
+                &database,
+                &format!(
+                    "INSERT INTO s15 SELECT id,{},1,1,1,1,0 FROM series; INSERT INTO s1m SELECT id,{},1,1,1,1,0 FROM series; INSERT INTO s5m SELECT id,{},1,1,1,1,0 FROM series;",
+                    (now - 7 * HOUR) / 15,
+                    (now - 2 * DAY) / 60,
+                    (now - 8 * DAY) / 300
+                ),
+                false,
+            )?;
+            collect_at(
+                &database,
+                days,
+                &[series(&identity(1), vec![bucket(minute + 15, 20_000, 0)])],
+            )?;
+            let counts = sql(
+                &database,
+                "SELECT (SELECT count(*) FROM s15), (SELECT count(*) FROM s1m), (SELECT count(*) FROM s5m), (SELECT count(*) FROM s1h);",
+                true,
+            )?;
+            ensure!(counts.trim() == expected, "Days {days}: {counts}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn schema_v2_moves_samples_into_one_minute() -> Result<()> {
+        if !sqlite_available() {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("latency.sqlite");
+        sql(
+            &database,
+            "CREATE TABLE series(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE); CREATE TABLE samples(series INTEGER NOT NULL, minute INTEGER NOT NULL, min_us INTEGER, median_us INTEGER, max_us INTEGER, sent INTEGER NOT NULL, lost INTEGER NOT NULL, PRIMARY KEY(series, minute)) WITHOUT ROWID; INSERT INTO series(name) VALUES('x'),('y'); INSERT INTO samples VALUES(1,100,1,2,3,4,0),(1,101,1,2,3,4,0),(2,100,NULL,NULL,NULL,0,1); PRAGMA user_version=2;",
+            false,
+        )?;
+        convert(&database)?;
+        let state = sql(
+            &database,
+            "PRAGMA user_version; SELECT count(*), sum(sent), sum(lost) FROM s1m; SELECT count(*) FROM sqlite_master WHERE name='samples';",
+            true,
+        )?;
+        let lines: Vec<&str> = state.lines().collect();
+        ensure!(lines == ["3", "3|8|1", "0"], "Unexpected schema: {state}");
+        Ok(())
+    }
+
+    #[test]
+    fn query_tiers_and_limits_are_enforced() -> Result<()> {
+        let now = 1_800_000_000_000;
+        ensure!(resolution(7, 60, now - DAY * 1_000, now, now)? == 60);
+        ensure!(resolution(7, 1, now - DAY * 1_000, now, now)? == 60);
+        ensure!(resolution(30, 3_600, now - 20 * DAY * 1_000, now, now)? == 3_600);
+        for (days, step, back) in [
+            (7, 15, DAY),
+            (7, 3_600, DAY),
+            (1, 300, DAY),
+            (7, 60, 4 * DAY),
+            (7, 60, 3 * DAY),
+        ] {
+            ensure!(
+                resolution(days, step, now - back * 1_000, now, now).is_err(),
+                "Accepted {days} {step} {back}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn damaged_database_is_moved_aside_and_recorded() -> Result<()> {
+        if !sqlite_available() {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("latency.sqlite");
+        fs::write(&database, [0x5a_u8; 8192])?;
+        let fresh = now() / 15 * 15 - 60;
+        collect_at(
+            &database,
+            7,
+            &[series(&identity(1), vec![bucket(fresh, 20_000, 0)])],
+        )?;
+        ensure!(
+            directory.path().join("latency.sqlite.broken").exists(),
+            "Damaged database was not moved aside."
+        );
+        let rows = sql(&database, "SELECT count(*) FROM s15;", true)?;
+        ensure!(rows.trim() == "1", "Unexpected rows: {rows}");
+        let events = fs::read_to_string(directory.path().join("events.json"))?;
+        ensure!(
+            events.contains("The history database was damaged and was reset."),
+            "Missing recovery event."
+        );
+        Ok(())
     }
 
     #[test]
@@ -676,7 +1117,7 @@ mod tests {
             format!("{new}_9_9_9_9"),
             new_endpoint,
         ];
-        let stored = stored_at(&database, &identities, minute, minute)?;
+        let stored = stored_at(&database, "s1m", &identities, minute, minute)?;
         ensure!(stored.len() == 3, "Expected three migrated series.");
         ensure!(
             stored[&identities[1]][&minute].sent == 9,
@@ -697,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_converts_to_v2() -> Result<()> {
+    fn schema_v1_converts_to_v3() -> Result<()> {
         if !sqlite_available() {
             return Ok(());
         }
@@ -721,180 +1162,53 @@ mod tests {
         convert(&database)?;
         let state = sql(
             &database,
-            "PRAGMA user_version; SELECT count(*) FROM series; SELECT count(*) FROM samples; SELECT count(*) FROM sqlite_master WHERE name='bins';",
+            "PRAGMA user_version; SELECT count(*) FROM series; SELECT count(*) FROM s1m; SELECT count(*) FROM sqlite_master WHERE name='bins';",
             true,
         )?;
         let lines: Vec<&str> = state.lines().collect();
-        ensure!(lines == ["2", "2", "3", "0"], "Unexpected schema: {state}");
+        ensure!(lines == ["3", "2", "3", "0"], "Unexpected schema: {state}");
         Ok(())
     }
 
     #[test]
-    fn history_round_trips_through_sqlite() -> Result<()> {
+    fn eleven_series_for_a_week_stay_small() -> Result<()> {
         if !sqlite_available() {
             return Ok(());
         }
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("latency.sqlite");
-        let current = now() / 60;
-        let (first, second) = (current - 3, current - 2);
-        let sample = |minute: u64, offset: u64, us: Option<u32>| Sample {
-            at_ms: minute * 60_000 + offset,
-            us,
-        };
-        let snapshot = [series(
-            "abc_1_1_1_1",
-            vec![
-                sample(first, 0, Some(30_000)),
-                sample(first, 1_000, Some(10_000)),
-                sample(first, 2_000, Some(20_000)),
-                sample(first, 3_000, None),
-                sample(second, 0, Some(40_000)),
-                sample(second, 1_000, None),
-            ],
-        )];
-        collect_at(&database, &snapshot)?;
-        collect_at(&database, &snapshot)?;
-        let rows = sql(&database, "SELECT count(*) FROM samples;", true)?;
-        ensure!(
-            rows.lines().last() == Some("2"),
-            "Unexpected row count: {rows}"
-        );
-        let mut all = stored_at(&database, &["abc_1_1_1_1".to_owned()], first, second)?;
-        let stored = all
-            .remove("abc_1_1_1_1")
-            .context("Missing stored series.")?;
-        ensure!(stored.len() == 2, "Expected two stored minutes.");
-        let check = |minute: u64, expected: (u32, u32, u32, u32, u32)| -> Result<()> {
-            let bin = stored.get(&minute).context("Missing stored minute.")?;
-            let actual = (
-                bin.sent,
-                bin.lost,
-                bin.min.unwrap_or_default(),
-                bin.median.unwrap_or_default(),
-                bin.max.unwrap_or_default(),
-            );
-            ensure!(
-                actual == expected,
-                "Unexpected bin {actual:?} for minute {minute}."
-            );
-            Ok(())
-        };
-        check(first, (4, 1, 10_000, 20_000, 30_000))?;
-        check(second, (2, 1, 40_000, 40_000, 40_000))
-    }
-
-    #[test]
-    fn full_day_reads_without_hitting_limits() -> Result<()> {
-        if !sqlite_available() {
-            return Ok(());
-        }
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let current = now() / 60;
-        let first = current - 1439;
-        let identities: Vec<String> = (1..=9).map(identity).collect();
-        for start in (first..current).step_by(60) {
+        let start = now() / HOUR * HOUR - 168 * HOUR;
+        let identities: Vec<String> = (1..=11).map(identity).collect();
+        for hours in 0..168 {
             let snapshot: Vec<Series> = identities
                 .iter()
-                .map(|id| minutes(id, start..start + 60))
+                .map(|id| series(id, hour(start + hours * HOUR)))
                 .collect();
-            collect_at(&database, &snapshot)?;
+            collect_at(&database, 7, &snapshot)?;
         }
-        let read = stored_at(&database, &identities, first, current - 1)?;
-        let points: usize = read.values().map(BTreeMap::len).sum();
-        ensure!(
-            read.len() == 9 && points == 9 * 1439,
-            "Unexpected points: {points}"
-        );
         let size = fs::metadata(&database)?.len();
         ensure!(size < 4 * 1024 * 1024, "Database is {size} bytes.");
-        Ok(())
-    }
-
-    #[test]
-    fn retention_drops_rows_older_than_a_day() -> Result<()> {
-        if !sqlite_available() {
-            return Ok(());
-        }
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let current = now() / 60;
-        let snapshot = [minutes(&identity(1), current - 2..current - 1)];
-        collect_at(&database, &snapshot)?;
-        sql(
-            &database,
-            &format!(
-                "INSERT INTO samples SELECT id,{},1,1,1,1,0 FROM series;",
-                current - 1500
-            ),
-            false,
-        )?;
-        collect_at(&database, &snapshot)?;
-        let old = sql(
-            &database,
-            &format!(
-                "SELECT count(*) FROM samples WHERE minute<{};",
-                current - 1439
-            ),
-            true,
-        )?;
-        ensure!(old.trim() == "0", "Old rows remain: {old}");
-        Ok(())
-    }
-
-    #[test]
-    fn damaged_database_is_moved_aside_and_recorded() -> Result<()> {
-        if !sqlite_available() {
-            return Ok(());
-        }
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        fs::write(&database, [0x5a_u8; 8192])?;
-        let current = now() / 60;
-        collect_at(
-            &database,
-            &[minutes(&identity(1), current - 2..current - 1)],
-        )?;
-        ensure!(
-            directory.path().join("latency.sqlite.broken").exists(),
-            "Damaged database was not moved aside."
-        );
-        let rows = sql(&database, "SELECT count(*) FROM samples;", true)?;
-        ensure!(rows.trim() == "1", "Unexpected rows: {rows}");
-        let events = fs::read_to_string(directory.path().join("events.json"))?;
-        ensure!(
-            events.contains("The history database was damaged and was reset."),
-            "Missing recovery event."
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn bins_count_losses_and_take_the_median() {
-        let base = (now() * 1000 / 60_000 - 2) * 60_000;
-        let sample = |offset: u64, us: Option<u32>| Sample {
-            at_ms: base + offset,
-            us,
+        let query = Query {
+            start: (now() - DAY) * 1_000,
+            end: now() * 1_000,
+            step: 60,
+            target: None,
+            tunnel: String::new(),
+            include_wan: false,
+            all: false,
+            endpoints: false,
+            uplinks: false,
         };
-        let samples = [
-            sample(0, Some(30_000)),
-            sample(1_000, Some(10_000)),
-            sample(2_000, Some(20_000)),
-            sample(3_000, None),
-            sample(4_000, Some(9_000_000)),
-            Sample {
-                at_ms: 1,
-                us: Some(1),
-            },
-        ];
-        let result = bins(&samples);
-        assert_eq!(result.len(), 1);
-        let bin = &result[&(base / 60_000)];
-        assert_eq!((bin.sent, bin.lost), (5, 2));
-        assert_eq!(
-            (bin.min, bin.median, bin.max),
-            (Some(10_000), Some(20_000), Some(30_000))
-        );
+        let subject = Subject {
+            id: "tunnel".into(),
+            name: "Tunnel".into(),
+            identity: identity(1),
+        };
+        let line = line(&database, 60, &query, &[], subject)?;
+        ensure!(line.points.len() <= 1_441, "Too many points.");
+        let json = serde_json::to_vec(&line)?.len();
+        ensure!(json < 262_144, "Response is {json} bytes.");
+        ensure!(LEVELS.len() == 4, "Unexpected tiers.");
+        Ok(())
     }
 }

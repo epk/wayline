@@ -24,7 +24,7 @@ pub struct Settings {
     pub tunnels: Vec<String>,
     pub targets: Vec<Target>,
     pub direct_wan: bool,
-    pub history_hours: u32,
+    pub history_days: u32,
     pub auto_updates: bool,
     pub auto_exit: bool,
     pub auto_tunnels: Vec<String>,
@@ -46,7 +46,8 @@ struct Stored {
     target: Option<Target>,
     diagnostics: Option<bool>,
     direct_wan: bool,
-    history_hours: u32,
+    history_hours: Option<u32>,
+    history_days: Option<u32>,
     auto_updates: bool,
     #[serde(default)]
     auto_exit: bool,
@@ -76,6 +77,16 @@ impl TryFrom<Stored> for Settings {
     type Error = anyhow::Error;
 
     fn try_from(stored: Stored) -> Result<Self> {
+        ensure!(
+            stored
+                .history_hours
+                .is_none_or(|hours| [0, 24].contains(&hours)),
+            "Invalid history retention."
+        );
+        let history_days = stored.history_days.unwrap_or(match stored.history_hours {
+            Some(0) => 0,
+            _ => 7,
+        });
         let targets = if let Some(primary) = stored.target {
             let mut targets = vec![primary];
             if stored.diagnostics.unwrap_or(false) {
@@ -97,7 +108,7 @@ impl TryFrom<Stored> for Settings {
             tunnels: stored.tunnels,
             targets,
             direct_wan: stored.direct_wan,
-            history_hours: stored.history_hours,
+            history_days,
             auto_updates: stored.auto_updates,
             auto_exit: stored.auto_exit && stored.auto_tunnels.is_some(),
             auto_tunnels: stored.auto_tunnels.unwrap_or_default(),
@@ -118,7 +129,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
-            interval: 15,
+            interval: 5,
             tunnels: Vec::new(),
             targets: vec![
                 Target::Address(Ipv4Addr::new(1, 1, 1, 1)),
@@ -126,7 +137,7 @@ impl Default for Settings {
                 Target::Address(Ipv4Addr::new(9, 9, 9, 9)),
             ],
             direct_wan: false,
-            history_hours: 24,
+            history_days: 7,
             auto_updates: false,
             auto_exit: false,
             auto_tunnels: Vec::new(),
@@ -223,9 +234,12 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!([15, 30, 60].contains(&self.interval), "Invalid interval.");
         ensure!(
-            [0, 24].contains(&self.history_hours),
+            [1, 5, 15, 30, 60].contains(&self.interval),
+            "Invalid interval."
+        );
+        ensure!(
+            [0, 1, 7, 30].contains(&self.history_days),
             "Invalid history retention."
         );
         ensure!(
@@ -401,6 +415,36 @@ mod tests {
                 .validate()
                 .is_err(),
             "Duplicate targets accepted."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn history_retention_maps_legacy_hours() -> Result<()> {
+        let legacy = |hours: u32| {
+            format!(
+                r#"{{"enabled":false,"interval":5,"tunnels":[],"targets":["1.1.1.1"],"directWan":false,"historyHours":{hours},"autoUpdates":false}}"#
+            )
+        };
+        ensure!(serde_json::from_str::<Settings>(&legacy(24))?.history_days == 7);
+        ensure!(serde_json::from_str::<Settings>(&legacy(0))?.history_days == 0);
+        ensure!(serde_json::from_str::<Settings>(&legacy(12)).is_err());
+        let json = serde_json::to_string(&Settings::default())?;
+        ensure!(json.contains("\"historyDays\":7") && !json.contains("historyHours"));
+        ensure!(Settings::default().interval == 5);
+        Settings {
+            history_days: 30,
+            interval: 1,
+            ..Settings::default()
+        }
+        .validate()?;
+        ensure!(
+            Settings {
+                history_days: 2,
+                ..Settings::default()
+            }
+            .validate()
+            .is_err()
         );
         Ok(())
     }

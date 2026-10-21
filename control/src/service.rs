@@ -2,7 +2,7 @@ use crate::{
     auto, changes, egress, history, native,
     resolve::Resolved,
     router,
-    runtime::{DAEMON, MONITOR_CONFIG, RUNTIME, STATUS_SOCKET, locked, now, snapshot},
+    runtime::{DAEMON, MONITOR_CONFIG, RUNTIME, STATUS_SOCKET, locked, now},
     settings::Settings,
     update,
 };
@@ -15,7 +15,7 @@ fn flush() {
     if let Ok(config) = Settings::read()
         && config.enabled
     {
-        let _ = history::collect(&config, &snapshot());
+        let _ = history::collect(&config);
     }
 }
 
@@ -161,7 +161,7 @@ fn routine() -> Result<()> {
         .unwrap_or(0);
     let now = now();
     if config.enabled && (now.saturating_sub(last) >= 300 || now < last) {
-        let result = history::collect(&config, &snapshot())
+        let result = history::collect(&config)
             .and_then(|()| router::inventory())
             .and_then(|inventory| history::migrate(&config, &inventory));
         atomic(Path::new(&collected), now.to_string().as_bytes())?;

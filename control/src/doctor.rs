@@ -1,5 +1,5 @@
 use crate::{
-    changes,
+    changes, history,
     native::{self, Level},
     router,
     runtime::{MONITOR_CONFIG, SETTINGS, STATUS_SOCKET, snapshot, version},
@@ -81,6 +81,32 @@ fn topology(
     }
 }
 
+fn history(warnings: &mut usize, settings: &Result<Settings>) {
+    let Ok(config) = settings else {
+        return;
+    };
+    println!("probe interval: {} s", config.interval);
+    match history::report(config) {
+        Ok(report) => {
+            println!(
+                "history database: {} bytes of {} bytes cap",
+                report.bytes, report.cap
+            );
+            for line in &report.lines {
+                println!("history {line}");
+            }
+            if report.bytes * 5 > report.cap * 4 {
+                warn(
+                    warnings,
+                    "history database",
+                    "Above 80% of its cap. The oldest rows of the coarsest tiers are removed when it fills.",
+                );
+            }
+        }
+        Err(error) => warn(warnings, "history database", &error.to_string()),
+    }
+}
+
 fn recent_changes(settings: &Result<Settings>) {
     if let Ok(config) = settings {
         for event in changes::read(config).iter().rev().take(5) {
@@ -143,6 +169,7 @@ pub fn run() -> bool {
             }),
     );
     topology(&mut warnings, &settings, &inventory);
+    history(&mut warnings, &settings);
     recent_changes(&settings);
     let list = native::List::read();
     let detail = list.as_ref().map_or_else(ToString::to_string, |value| {

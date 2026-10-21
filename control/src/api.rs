@@ -27,6 +27,7 @@ const STALE: &str = "State changed. Refresh first.";
 pub struct State {
     version: String,
     config: Settings,
+    history: history::Availability,
     pub tunnels: Vec<Tunnel>,
     diagnostics: BTreeMap<String, BTreeMap<String, Option<f64>>>,
     endpoints: Vec<EndpointView>,
@@ -245,8 +246,9 @@ fn tunnels(
                 "The primary destination is not reachable through this tunnel."
             );
             ensure!(
-                item.success_age_ms
-                    .is_some_and(|age| age <= u64::from(config.interval) * 3000),
+                item.success_age_ms.is_some_and(
+                    |age| age <= u64::from(config.interval).saturating_mul(3).max(15) * 1000
+                ),
                 "The last successful probe is too old."
             );
             let recent: Vec<_> = item.history.iter().rev().take(RECENT).collect();
@@ -363,6 +365,7 @@ fn unsupported(compat: native::Compat) -> State {
     State {
         version: version(),
         config: Settings::read().unwrap_or_default(),
+        history: history::availability(&Settings::read().unwrap_or_default()),
         tunnels: Vec::new(),
         diagnostics: BTreeMap::new(),
         endpoints: Vec::new(),
@@ -428,6 +431,7 @@ pub fn state() -> Result<State> {
         && !tunnels.iter().any(|tunnel| {
             tunnel.preferred && tunnel.enabled && config.auto_tunnels.contains(&tunnel.monitor_id)
         });
+    let availability = history::availability(&config);
     let resolved = resolved(&config, &inventory);
     let endpoints = router::endpoints(&config, &inventory);
     let diagnostics = diagnostics(&config, &inventory, &endpoints, &snapshot);
@@ -447,6 +451,7 @@ pub fn state() -> Result<State> {
     Ok(State {
         version: version(),
         config,
+        history: availability,
         tunnels,
         diagnostics,
         resolved,
@@ -477,12 +482,7 @@ pub fn state() -> Result<State> {
 }
 
 pub fn history(query: &history::Query) -> Result<history::Response> {
-    history::query(
-        &Settings::read()?,
-        &snapshot(),
-        &router::inventory()?,
-        query,
-    )
+    history::query(&Settings::read()?, &router::inventory()?, query)
 }
 
 pub fn set_config(request: SetConfig) -> Result<Value> {

@@ -53,15 +53,25 @@ pub fn directory(path: &Path) -> Result<()> {
 }
 
 pub fn snapshot() -> Vec<Series> {
-    output(
-        DAEMON,
-        &["status", "--socket", STATUS_SOCKET],
-        MAX_STATUS,
-        3,
-    )
-    .ok()
-    .and_then(|data| serde_json::from_slice::<Status>(&data).ok())
-    .map_or_else(Vec::new, |status| status.tunnels)
+    status(&["status", "--socket", STATUS_SOCKET])
+}
+
+pub fn snapshot_since(since: u64) -> Vec<Series> {
+    let since = since.to_string();
+    status(&[
+        "status",
+        "--socket",
+        STATUS_SOCKET,
+        "--since",
+        since.as_str(),
+    ])
+}
+
+fn status(args: &[&str]) -> Vec<Series> {
+    output(DAEMON, args, MAX_STATUS, 3)
+        .ok()
+        .and_then(|data| serde_json::from_slice::<Status>(&data).ok())
+        .map_or_else(Vec::new, |status| status.tunnels)
 }
 
 pub fn milliseconds(micros: u32) -> f64 {
