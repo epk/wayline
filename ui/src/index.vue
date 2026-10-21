@@ -20,21 +20,15 @@
       </ul>
       <p>Update Wayline below. A newer release may support this firmware.</p>
       <p class="vph-muted">Run wayline-ctl doctor on the router and send the output.</p>
-      <div class="vph-updates">
-        <button type="button" class="vph-button" :disabled="busy" @click="checkUpdates">
-          Check for update
-        </button>
-        <button
-          v-if="updateAvailable"
-          type="button"
-          class="vph-button vph-primary"
-          :disabled="busy"
-          @click="installUpdate"
-        >
-          Install update
-        </button>
-        <span v-if="updateText" class="vph-muted">{{ updateText }}</span>
-      </div>
+      <update-panel
+        compact
+        :info="updateState"
+        :disabled="updatesDisabled"
+        :waiting="updateWaiting"
+        @check="checkUpdates"
+        @install="installUpdate"
+        @reload="reloadPage"
+      />
     </section>
     <div
       v-else-if="showCompat"
@@ -50,21 +44,15 @@
           {{ f.name }}: <strong>{{ f.available ? 'Available' : 'Off' }}</strong>
         </li>
       </ul>
-      <div class="vph-updates">
-        <button type="button" class="vph-button" :disabled="busy" @click="checkUpdates">
-          Check for update
-        </button>
-        <button
-          v-if="updateAvailable"
-          type="button"
-          class="vph-button vph-primary"
-          :disabled="busy"
-          @click="installUpdate"
-        >
-          Install update
-        </button>
-        <span v-if="updateText" class="vph-muted">{{ updateText }}</span>
-      </div>
+      <update-panel
+        compact
+        :info="updateState"
+        :disabled="updatesDisabled"
+        :waiting="updateWaiting"
+        @check="checkUpdates"
+        @install="installUpdate"
+        @reload="reloadPage"
+      />
     </div>
     <header class="vph-heading">
       <div>
@@ -138,21 +126,15 @@
         <p class="vph-fail-text">{{ readError }}</p>
         <p class="vph-muted">Run wayline-ctl doctor on the router and send the output.</p>
         <button type="button" class="vph-button" :disabled="loading" @click="retry">Retry</button>
-        <div class="vph-updates">
-          <button type="button" class="vph-button" :disabled="busy" @click="checkUpdates">
-            Check for update
-          </button>
-          <button
-            v-if="updateAvailable"
-            type="button"
-            class="vph-button vph-primary"
-            :disabled="busy"
-            @click="installUpdate"
-          >
-            Install update
-          </button>
-          <span v-if="updateText" class="vph-muted">{{ updateText }}</span>
-        </div>
+        <update-panel
+          compact
+          :info="updateState"
+          :disabled="updatesDisabled"
+          :waiting="updateWaiting"
+          @check="checkUpdates"
+          @install="installUpdate"
+          @reload="reloadPage"
+        />
       </div>
       <div v-if="error || (ready && readError)" ref="alert" class="vph-error">
         <span>{{ error || readError }}</span>
@@ -319,23 +301,17 @@
           automatically</label
         >
         <p class="vph-muted">
-          The updater installs only signed releases that support this firmware.
+          Checks once a day and installs the newest signed release, including alpha and beta
+          releases.
         </p>
-        <div class="vph-updates">
-          <button type="button" class="vph-button" :disabled="busy" @click="checkUpdates">
-            Check for update
-          </button>
-          <button
-            v-if="updateAvailable"
-            type="button"
-            class="vph-button vph-primary"
-            :disabled="busy"
-            @click="installUpdate"
-          >
-            Install update
-          </button>
-          <span v-if="updateText" class="vph-muted">{{ updateText }}</span>
-        </div>
+        <update-panel
+          :info="updateState"
+          :disabled="updatesDisabled"
+          :waiting="updateWaiting"
+          @check="checkUpdates"
+          @install="installUpdate"
+          @reload="reloadPage"
+        />
       </section>
       <footer>
         <button type="button" class="vph-button" @click="closeSettings">Cancel</button
@@ -786,6 +762,7 @@
 </template>
 
 <script>
+import UpdatePanel from './update-panel.vue';
 const defaults = () => ({
   enabled: false,
   interval: 15,
@@ -826,6 +803,7 @@ const historyInterval = 30000;
 const endpointPrefix = 'endpoint:';
 const uplinkPrefix = 'uplink:';
 const changeWindow = 60 * 60000;
+const updatePhases = ['checking', 'downloading', 'verifying', 'installing'];
 const targetKey = 'wayline.target';
 const storage = {
   get(key) {
@@ -855,6 +833,7 @@ const countryName = (code) => {
 };
 export default {
   name: 'WaylineDashboard',
+  components: { UpdatePanel },
   props: { api: Object, preview: Boolean },
   data() {
     return {
@@ -873,7 +852,11 @@ export default {
         wan: { available: true, interface: null, reason: '' },
       },
       ready: false,
-      updateInfo: null,
+      updateError: '',
+      updateWaiting: false,
+      updateTimer: null,
+      updatePolling: false,
+      updateLostSince: 0,
       pendingStop: '',
       busyAction: '',
       noticeTimer: null,
@@ -932,16 +915,23 @@ export default {
     showCompat() {
       return this.level !== 'full' || !this.compat.verified;
     },
-    updateAvailable() {
-      return !!(
-        (this.updateInfo && this.updateInfo.available) ||
-        (this.state.update || {}).available
-      );
+    updateState() {
+      const u = this.state.update || {};
+      return {
+        current: u.current || this.state.version || '',
+        latest: u.latest || null,
+        available: !!u.available,
+        phase: u.phase || 'idle',
+        message: this.updateError || u.message || '',
+        failed: !!this.updateError || !!u.failed,
+        checkedAt: u.checkedAt || 0,
+      };
     },
-    updateText() {
-      return (
-        (this.updateInfo && this.updateInfo.message) || (this.state.update || {}).message || ''
-      );
+    updateActive() {
+      return updatePhases.includes((this.state.update || {}).phase);
+    },
+    updatesDisabled() {
+      return (this.state.capabilities || {}).update === false;
     },
     level() {
       return this.compat.level;
@@ -1268,6 +1258,7 @@ export default {
   },
   mounted() {
     this.refresh();
+    if (this.updateActive) this.startUpdatePoll();
     document.addEventListener('visibilitychange', this.visibility);
     this.resize =
       typeof ResizeObserver === 'undefined'
@@ -1283,6 +1274,7 @@ export default {
     this.stopped = true;
     clearTimeout(this.timer);
     clearTimeout(this.noticeTimer);
+    this.stopUpdatePoll();
     document.removeEventListener('visibilitychange', this.visibility);
     if (this.resize) this.resize.disconnect();
   },
@@ -1347,6 +1339,7 @@ export default {
         next.wan = Object.assign({ available: true, interface: null, reason: '' }, next.wan);
         this.state = next;
         this.ready = true;
+        if (this.updateActive && !this.updateTimer) this.startUpdatePoll();
         if (!this.destinations.includes(this.selectedTarget)) {
           this.selectedTarget = this.primary;
           this.historyAt = 0;
@@ -1632,29 +1625,59 @@ export default {
       }
     },
     async installUpdate() {
-      this.busy = true;
-      this.error = '';
+      this.updateError = '';
       try {
         const r = await this.call('install_update');
-        this.updateInfo = r;
-        this.notice = r.message;
+        this.setUpdate(r.update);
       } catch (e) {
-        this.error = this.describe(e, 'Update unavailable.');
-      } finally {
-        this.busy = false;
+        this.updateError = this.describe(e, 'Update unavailable.');
       }
     },
     async checkUpdates() {
-      this.busy = true;
-      this.error = '';
+      this.updateError = '';
       try {
         const r = await this.call('check_update');
-        this.updateInfo = r;
-        this.notice = r.message;
+        this.setUpdate(r.update);
       } catch (e) {
-        this.error = this.describe(e, 'Update check unavailable.');
+        this.updateError = this.describe(e, 'Update check unavailable.');
+      }
+    },
+    setUpdate(update) {
+      if (!update || typeof update !== 'object') return;
+      this.$set(this.state, 'update', update);
+      if (this.updateActive) this.startUpdatePoll();
+      else this.stopUpdatePoll();
+    },
+    startUpdatePoll() {
+      clearInterval(this.updateTimer);
+      this.updateTimer = setInterval(this.pollUpdate, 1000);
+    },
+    stopUpdatePoll() {
+      clearInterval(this.updateTimer);
+      this.updateTimer = null;
+      this.updateWaiting = false;
+      this.updateLostSince = 0;
+    },
+    async pollUpdate() {
+      if (this.updatePolling || this.stopped) return;
+      this.updatePolling = true;
+      try {
+        const next = await this.call('get_state');
+        if (this.stopped || !next || !next.update) return;
+        this.$set(this.state, 'update', next.update);
+        this.updateWaiting = false;
+        this.updateLostSince = 0;
+        if (!this.updateActive) this.stopUpdatePoll();
+      } catch {
+        if (!this.updateLostSince) this.updateLostSince = Date.now();
+        this.updateWaiting = true;
+        if (Date.now() - this.updateLostSince >= 60000) {
+          this.stopUpdatePoll();
+          this.updateError =
+            'Lost contact with the router. Refresh the page to see the update status.';
+        }
       } finally {
-        this.busy = false;
+        this.updatePolling = false;
       }
     },
     chooseTarget(target) {
@@ -2874,13 +2897,6 @@ button.vph-legend-item {
   gap: 4px 20px;
   padding: 0;
   margin: 8px 0 12px;
-}
-.vph-updates {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 12px;
-  margin: 10px 0 4px;
 }
 .vph-fail {
   padding: 20px;
