@@ -180,6 +180,7 @@
         lost: 0,
         samples: 64,
         eligible: true,
+        selectable: true,
         recent: Array.from({ length: 64 }, (_, i) => 32 + Math.sin(i * 1.8) * 4),
       },
       {
@@ -195,6 +196,7 @@
         lost: 0,
         samples: 64,
         eligible: true,
+        selectable: true,
         recent: Array.from({ length: 64 }, (_, i) => 24 + Math.sin(i * 1.2) * 3),
       },
       {
@@ -210,6 +212,7 @@
         lost: 4,
         samples: 64,
         eligible: false,
+        selectable: true,
         reason: 'Recent packet loss',
         recent: Array.from({ length: 64 }, (_, i) =>
           i > 37 && i < 42 ? null : 130 + Math.sin(i) * 17,
@@ -228,6 +231,8 @@
         lost: 0,
         samples: 0,
         eligible: false,
+        selectable: false,
+        selectReason: 'The tunnel is stopped.',
         historyAvailable: true,
         recent: [],
       },
@@ -359,7 +364,7 @@
     select_tunnel: async ({ section_id, expected_revision }) => {
       if (expected_revision !== state.revision) throw Error('State changed. Refresh first.');
       const t = state.tunnels.find((t) => t.id === section_id);
-      if (!t || !t.eligible) throw Error('Tunnel is not eligible.');
+      if (!t || !t.selectable) throw Error(t ? t.selectReason : 'Unknown tunnel.');
       if (!t.preferred) {
         state.tunnels.forEach((t) => (t.preferred = t.id === section_id));
         state.revision = String(++revision);
@@ -376,6 +381,7 @@
           enabled,
           connected: false,
           eligible: false,
+          selectable: true,
           historyAvailable: true,
           stateLabel: enabled ? 'Enabled, offline' : 'Stopped',
           age: 'unknown',

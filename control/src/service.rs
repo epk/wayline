@@ -68,7 +68,7 @@ fn reconcile_inner() -> Result<()> {
             &config,
             &router::inventory()?,
             &Resolved::read(),
-        )?)
+        ))
     } else {
         None
     };

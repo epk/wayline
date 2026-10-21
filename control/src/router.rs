@@ -570,13 +570,12 @@ pub fn check_capacity(settings: &Settings, inventory: &Inventory) -> Result<()> 
     let wanted = (settings.tunnels.len() + uplinks) * settings.targets.len() + endpoints;
     ensure!(
         wanted <= MAX_SERIES,
-        "This configuration needs {wanted} measurements. The limit is {MAX_SERIES}. Remove a destination, tunnel, or optional check."
+        "This configuration needs {wanted} measurements, and the limit is {MAX_SERIES}. The lowest-priority measurements are skipped. Remove a destination, tunnel, or optional check to measure everything."
     );
     Ok(())
 }
 
-pub fn monitor(settings: &Settings, inventory: &Inventory, resolved: &Resolved) -> Result<Config> {
-    check_capacity(settings, inventory)?;
+pub fn monitor(settings: &Settings, inventory: &Inventory, resolved: &Resolved) -> Config {
     let mut wanted = Vec::new();
     for item in monitored(settings, inventory) {
         wanted.extend(
@@ -620,21 +619,18 @@ pub fn monitor(settings: &Settings, inventory: &Inventory, resolved: &Resolved) 
                 measurement(path, id, address)
             })
         })
+        .take(MAX_SERIES)
         .collect();
-    ensure!(
-        tunnels.len() <= MAX_SERIES,
-        "The measurement limit was exceeded."
-    );
     let target = resolved
         .address(settings.primary())
         .or_else(|| tunnels.first().and_then(|tunnel| tunnel.target))
         .unwrap_or(Ipv4Addr::new(1, 1, 1, 1));
-    Ok(Config {
+    Config {
         target,
         interval_ms: u64::from(settings.interval) * 1000,
         timeout_ms: 2000,
         tunnels,
-    })
+    }
 }
 
 fn measurement(path: &PathInfo, id: String, address: Ipv4Addr) -> Tunnel {
@@ -778,7 +774,7 @@ mod tests {
             "1.1.1.1".parse()?,
             "missing.example.com".parse()?,
         ];
-        let config = monitor(&settings, &inventory(), &resolved()?)?;
+        let config = monitor(&settings, &inventory(), &resolved()?);
         let on_tunnel = config
             .tunnels
             .iter()
@@ -822,7 +818,10 @@ mod tests {
             .map(|target| target.parse())
             .collect::<Result<Vec<_>>>()?;
         assert!(check_capacity(&settings, &inventory()).is_err());
-        assert!(monitor(&settings, &inventory(), &resolved()?).is_err());
+        assert!(
+            monitor(&settings, &inventory(), &resolved()?).tunnels.len()
+                <= wayline_protocol::MAX_SERIES
+        );
         settings.endpoint_diagnostics = false;
         check_capacity(&settings, &inventory())?;
         Ok(())

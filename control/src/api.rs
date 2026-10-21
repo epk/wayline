@@ -18,6 +18,8 @@ use std::{
 use wayline_protocol::{Series, State as Measurement};
 use wayline_support::atomic;
 
+const RECENT: usize = 8;
+const MAX_RECENT_LOSS: usize = 2;
 const STALE: &str = "State changed. Refresh first.";
 
 #[derive(Serialize)]
@@ -106,6 +108,8 @@ pub struct Tunnel {
     history_available: bool,
     controllable: bool,
     pub preferred: bool,
+    selectable: bool,
+    select_reason: String,
     pub eligible: bool,
     reason: String,
     state_label: &'static str,
@@ -220,38 +224,42 @@ fn tunnels(
     for tunnel in &inventory.tunnels {
         let path = inventory.paths.iter().find(|path| path.id == tunnel.id);
         let item = path.and_then(|path| measurement(snapshot, path, config.primary()));
-        let eligibility = (|| -> Result<()> {
-            ensure!(
-                compatible,
-                "Firmware or monitoring configuration prevents selection."
-            );
+        let selection = (|| -> Result<()> {
+            ensure!(compatible, "Firmware support prevents exit changes.");
             ensure!(tunnel.enabled, "The tunnel is stopped.");
-            ensure!(
-                path.is_some(),
-                "The tunnel is enabled but has no connected path."
-            );
-            ensure!(
-                config.tunnels.contains(&tunnel.key),
-                "Select this tunnel for monitoring in Settings."
-            );
-            let item = item.context("No measurement exists for the primary destination yet.")?;
-            ensure!(
-                item.state.live(),
-                "The primary destination is not reachable through this tunnel."
-            );
-            ensure!(item.lost() == 0, "Recent probes include packet loss.");
-            ensure!(
-                item.success_age_ms
-                    .is_some_and(|age| age <= u64::from(config.interval) * 3000),
-                "The last successful probe is too old."
-            );
+            ensure!(path.is_some(), "The tunnel is enabled but not connected.");
             let list = native
                 .as_ref()
                 .map_err(|error| anyhow::anyhow!("Cannot read native tunnel state: {error}"))?;
             router::safe_order(list, inventory, &tunnel.id)?;
             Ok(())
         })();
-        let eligible = eligibility.is_ok();
+        let health = (|| -> Result<()> {
+            ensure!(
+                config.tunnels.contains(&tunnel.key),
+                "Not monitored, so automatic switching ignores it."
+            );
+            let item = item.context("No measurement to the primary destination yet.")?;
+            ensure!(
+                item.state.live(),
+                "The primary destination is not reachable through this tunnel."
+            );
+            ensure!(
+                item.success_age_ms
+                    .is_some_and(|age| age <= u64::from(config.interval) * 3000),
+                "The last successful probe is too old."
+            );
+            let recent: Vec<_> = item.history.iter().rev().take(RECENT).collect();
+            let lost = recent.iter().filter(|sample| sample.us.is_none()).count();
+            ensure!(
+                lost <= MAX_RECENT_LOSS,
+                "{lost} of the last {} probes were lost.",
+                recent.len()
+            );
+            Ok(())
+        })();
+        let selectable = selection.is_ok();
+        let eligible = selectable && health.is_ok();
         tunnels.push(Tunnel {
             id: tunnel.id.clone(),
             monitor_id: tunnel.key.clone(),
@@ -266,8 +274,14 @@ fn tunnels(
                         .is_ok_and(|native| tunnel.enabled || native.startable())
                 }),
             preferred: preferred == Some(tunnel.id.as_str()),
+            selectable,
+            select_reason: selection
+                .as_ref()
+                .err()
+                .map_or_else(String::new, ToString::to_string),
             eligible,
-            reason: eligibility
+            reason: selection
+                .and(health)
                 .err()
                 .map_or_else(String::new, |error| error.to_string()),
             state_label: if !tunnel.enabled {
@@ -405,7 +419,7 @@ pub fn state() -> Result<State> {
     let monitoring_issue = router::check_capacity(&config, &inventory)
         .err()
         .map(|error| error.to_string());
-    let compatible = compat.level == native::Level::Full && monitoring_issue.is_none();
+    let compatible = compat.level == native::Level::Full;
     let known = history::known_prefixes();
     let tunnels = tunnels(&config, &inventory, &snapshot, &native, &known, compatible);
     let auto_enabled = config.auto_exit;
@@ -558,7 +572,7 @@ pub fn set_tunnel_enabled(request: &SetEnabled) -> Result<Value> {
 
 pub fn select(request: &Select) -> Result<Value> {
     locked("selection", || {
-        let result = apply(&request.section_id, &request.expected_revision)?;
+        let result = apply(&request.section_id, &request.expected_revision, false)?;
         if result["unchanged"] != true {
             auto::Record::touch(true)?;
         }
@@ -566,7 +580,7 @@ pub fn select(request: &Select) -> Result<Value> {
     })
 }
 
-pub fn apply(id: &str, expected_revision: &str) -> Result<Value> {
+pub fn apply(id: &str, expected_revision: &str, require_health: bool) -> Result<Value> {
     native::require(native::Level::Full)?;
     let inventory = router::inventory()?;
     let list = native::List::read()?;
@@ -575,13 +589,15 @@ pub fn apply(id: &str, expected_revision: &str) -> Result<Value> {
         return Ok(json!({"applied":true,"unchanged":true}));
     }
     ensure!(expected_revision == router::revision()?, STALE);
-    ensure!(
-        state()?
-            .tunnels
-            .iter()
-            .any(|item| item.id == id && item.eligible),
-        "The selected tunnel has no recent healthy measurements."
-    );
+    if require_health {
+        ensure!(
+            state()?
+                .tunnels
+                .iter()
+                .any(|item| item.id == id && item.eligible),
+            "The selected tunnel has no recent healthy measurements."
+        );
+    }
     ensure!(
         expected_revision == router::revision()?,
         "State changed before selection. Refresh first."

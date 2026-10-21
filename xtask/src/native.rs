@@ -347,26 +347,15 @@ fn compatibility_checks() -> Result<()> {
     let result = (|| -> Result<()> {
         let state = request("get_state", &json!({}))?;
         ensure!(
-            state["compat"]["level"] == "monitoring"
-                && state["capabilities"]["select"] == false
-                && state["capabilities"]["control"] == false
+            state["compat"]["level"] == "full"
+                && state["compat"]["verified"] == false
+                && state["compat"]["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty())
+                && state["capabilities"]["select"] == true
+                && state["capabilities"]["control"] == true
                 && state["capabilities"]["update"] == true,
-            "An unverified module retained mutation controls."
-        );
-        ensure!(
-            call(
-                "/usr/sbin/wayline-ctl",
-                &[
-                    "set_tunnel_enabled",
-                    &json!({
-                        "section_id":"wayline_lab", "enabled":false,
-                        "expected_revision":state["revision"]
-                    })
-                    .to_string()
-                ]
-            )
-            .is_err(),
-            "An unverified module accepted a tunnel request."
+            "A newer VPN module did not keep full controls with a note."
         );
         ensure!(
             fs::read(&policy)? == saved,
@@ -376,7 +365,7 @@ fn compatibility_checks() -> Result<()> {
     })();
     fs::write(module, original)?;
     result?;
-    println!("Unverified-module mutation guards passed in the native sandbox.");
+    println!("Newer-module compatibility checks passed in the native sandbox.");
     Ok(())
 }
 

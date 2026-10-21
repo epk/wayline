@@ -434,9 +434,7 @@
                 >
               </div>
               <div v-else class="vph-muted vph-status">{{ t.stateLabel }}</div>
-              <div v-if="notEligible(t)" class="vph-muted vph-status">
-                Not eligible: {{ t.reason || 'not ready yet' }}
-              </div>
+              <div v-if="rowNote(t)" class="vph-muted vph-status">{{ rowNote(t) }}</div>
             </td>
             <td class="vph-metric" data-label="Through tunnel">
               <template v-if="primarySelected">
@@ -1412,8 +1410,16 @@ export default {
       if (!t.enabled) return 'stopped';
       return t.connected ? 'connected' : 'offline';
     },
-    notEligible(t) {
-      return !t.preferred && t.enabled && !t.eligible && this.can.select;
+    selectableTunnel(t) {
+      return t.selectable === undefined ? t.eligible : t.selectable;
+    },
+    rowNote(t) {
+      if (t.preferred || !t.enabled || !this.can.select) return '';
+      if (!this.selectableTunnel(t)) return 'Cannot be the exit: ' + (t.selectReason || t.reason);
+      const pool = this.state.config.autoTunnels || [];
+      if (this.state.auto && this.state.auto.enabled && pool.includes(t.monitorId) && !t.eligible)
+        return 'Automatic switching skips it: ' + t.reason;
+      return '';
     },
     exitIdentity(id) {
       const e = this.egressFor(id);
@@ -1475,11 +1481,11 @@ export default {
       return null;
     },
     useDisabled(t) {
-      return this.busy || !t.eligible || !this.can.select;
+      return this.busy || !this.selectableTunnel(t) || !this.can.select;
     },
     useReason(t) {
       if (!this.can.select) return this.selectReason;
-      if (!t.eligible) return t.reason || 'This tunnel is not ready.';
+      if (!this.selectableTunnel(t)) return t.selectReason || t.reason;
       return '';
     },
     toggleDisabled(t) {
@@ -1555,7 +1561,7 @@ export default {
       return paths.find((p) => p.id === id) || null;
     },
     async selectExit(t) {
-      if (this.busy || t.preferred || !t.eligible || !this.can.select) return;
+      if (this.busy || t.preferred || !this.selectableTunnel(t) || !this.can.select) return;
       this.busy = true;
       this.busyTunnel = t.id;
       this.busyAction = 'select';

@@ -209,7 +209,7 @@ pub fn step(config: &Settings) -> Result<()> {
         record.at = now();
         record.needs_attention = true;
         record.write()?;
-        api::apply(&target, &revision)?;
+        api::apply(&target, &revision, true)?;
         Record {
             at: now(),
             last: Some(switch),
