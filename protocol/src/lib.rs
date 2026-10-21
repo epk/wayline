@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
 pub const HISTORY: usize = 64;
-pub const MAX_SERIES: usize = 45;
-pub const MAX_STATUS: usize = 384 * 1024;
+pub const MAX_SERIES: usize = 90;
+pub const MAX_STATUS: usize = 768 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

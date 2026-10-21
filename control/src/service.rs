@@ -93,7 +93,7 @@ fn reconcile_inner() -> Result<()> {
             "set",
             &json!({"name":"wayline","instances":{"monitor":{
             "command":[DAEMON,"monitor","--config",path,"--socket",STATUS_SOCKET],
-            "respawn":["3600","5","3"],"limits":{"core":"0","nofile":"128 128"},"stderr":true,"file":[path]}}}),
+            "respawn":["3600","5","3"],"limits":{"core":"0","nofile":"256 256"},"stderr":true,"file":[path]}}}),
         )?;
     }
     Ok(())

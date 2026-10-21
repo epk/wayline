@@ -65,7 +65,7 @@ A faster exit needs at least 20% and 10 ms improvement, with a five-minute hold 
 
 An uncertain switch stops further automatic requests until you review the native state and reset automatic switching in Settings. Older configurations without an explicit pool migrate with automatic switching off.
 
-The monitor supports at most 45 simultaneous measurements. Configuration that exceeds this bound shows an error instead of silently omitting destinations or paths.
+The monitor supports at most 90 simultaneous measurements. If a configuration needs more, the page warns, and the lowest-priority measurements are skipped; monitoring and exit controls keep working.
 
 ## Update and remove
 

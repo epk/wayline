@@ -30,7 +30,7 @@ pub fn read(path: &Path) -> Result<Config, Box<dyn Error>> {
     }
     let config: Config = serde_json::from_slice(&bytes)?;
     if config.tunnels.is_empty() || config.tunnels.len() > MAX_SERIES {
-        return Err("configure between one and 45 measurement series".into());
+        return Err(format!("configure between one and {MAX_SERIES} measurement series").into());
     }
     if !(1_000..=300_000).contains(&config.interval_ms)
         || !(50..=5_000).contains(&config.timeout_ms)

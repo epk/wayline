@@ -227,7 +227,7 @@ fn wireguard(index: u32) -> Result<()> {
             "wg0",
         ],
     )?;
-    for target in 1..=10 {
+    for target in 1..=12 {
         ip(
             &exit,
             &[
@@ -315,13 +315,13 @@ fn key(name: &str) -> Result<String> {
 fn configuration(interval: u64, timeout: u64, multiple: bool) -> Value {
     let mut series = Vec::new();
     for index in 1..=8 {
-        for target in 1..=if multiple { 5 } else { 1 } {
+        for target in 1..=if multiple { 11 } else { 1 } {
             series.push(json!({"id":format!("exit{index}_{target}"),"name":format!("Exit {index}"),"interface":format!("wg{index}"),"source":format!("10.90.{index}.2"),"mark":index*4096,"target":format!("198.18.0.{target}")}));
         }
     }
     if multiple {
-        for target in 1..=5 {
-            series.push(json!({"id":format!("extra{target}"),"name":"Additional destination","interface":"wg8","source":"10.90.8.2","mark":32_768,"target":format!("198.18.0.{}",target+5)}));
+        for index in 1..=2 {
+            series.push(json!({"id":format!("extra{index}"),"name":"Additional destination","interface":format!("wg{index}"),"source":format!("10.90.{index}.2"),"mark":index*4096,"target":"198.18.0.12"}));
         }
     }
     json!({"target":"198.18.0.1","interval_ms":interval,"timeout_ms":timeout,"tunnels":series})
@@ -351,8 +351,8 @@ fn snapshot() -> Result<Value> {
     let socket = UnixStream::connect("/run/wayline/status.sock")?;
     socket.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut data = Vec::new();
-    socket.take(393_217).read_to_end(&mut data)?;
-    ensure!(data.len() <= 393_216, "Oversized status snapshot.");
+    socket.take(786_433).read_to_end(&mut data)?;
+    ensure!(data.len() <= 786_432, "Oversized status snapshot.");
     Ok(serde_json::from_slice(&data)?)
 }
 
@@ -433,7 +433,7 @@ fn failures(child: &mut Child) -> Result<()> {
     ensure!(
         outage["tunnels"]
             .as_array()
-            .is_some_and(|items| items.len() == 45
+            .is_some_and(|items| items.len() == 90
                 && items
                     .iter()
                     .all(|item| item["sent"].as_u64().unwrap_or(0) >= 6)),

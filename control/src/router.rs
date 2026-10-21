@@ -817,9 +817,14 @@ mod tests {
             .iter()
             .map(|target| target.parse())
             .collect::<Result<Vec<_>>>()?;
-        assert!(check_capacity(&settings, &inventory()).is_err());
+        check_capacity(&settings, &inventory())?;
+        let mut crowded = inventory();
+        crowded.uplinks = (0..9)
+            .map(|index| path(&format!("uplink:u{index}"), &format!("eth{index}"), None))
+            .collect();
+        assert!(check_capacity(&settings, &crowded).is_err());
         assert!(
-            monitor(&settings, &inventory(), &resolved()?).tunnels.len()
+            monitor(&settings, &crowded, &resolved()?).tunnels.len()
                 <= wayline_protocol::MAX_SERIES
         );
         settings.endpoint_diagnostics = false;

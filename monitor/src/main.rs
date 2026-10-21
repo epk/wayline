@@ -24,7 +24,7 @@ use std::{future::Future, pin::Pin};
 use wayline_protocol::{Config, MAX_SERIES, MAX_STATUS, Series, Status};
 
 const MAX_CLIENTS: usize = 4;
-const MAX_INFLIGHT: usize = 8;
+const MAX_INFLIGHT: usize = 16;
 
 struct Endpoint {
     listener: UnixListener,
