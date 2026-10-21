@@ -11,6 +11,7 @@ use wayline_support::atomic;
 
 const HOLD_SECONDS: u64 = 300;
 const RECOVERY_SECONDS: u64 = 60;
+const OBSERVATION_GAP: u64 = 120;
 const MIN_RATIO: f64 = 0.8;
 const MIN_GAIN_MS: f64 = 10.0;
 
@@ -18,6 +19,14 @@ const MIN_GAIN_MS: f64 = 10.0;
 pub struct Record {
     pub at: u64,
     pub last: Option<Switch>,
+    #[serde(default)]
+    pub needs_attention: bool,
+    #[serde(default)]
+    observed_exit: Option<String>,
+    #[serde(default)]
+    unhealthy_since: Option<u64>,
+    #[serde(default)]
+    observed_at: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -30,6 +39,7 @@ pub struct Switch {
 
 pub struct View<'a> {
     pub id: &'a str,
+    pub key: &'a str,
     pub eligible: bool,
     pub median_ms: Option<f64>,
 }
@@ -54,30 +64,74 @@ impl Record {
     }
 
     pub fn read() -> Self {
-        fs::read(Self::path())
-            .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or_default()
+        match fs::read(Self::path()) {
+            Ok(data) => serde_json::from_slice(&data).unwrap_or_else(|_| Self {
+                at: now(),
+                needs_attention: true,
+                ..Self::default()
+            }),
+            Err(error) => Self {
+                at: now(),
+                needs_attention: error.kind() != std::io::ErrorKind::NotFound,
+                ..Self::default()
+            },
+        }
     }
 
     fn write(&self) -> Result<()> {
         atomic(Path::new(&Self::path()), &serde_json::to_vec(self)?)
     }
 
-    pub fn touch() -> Result<()> {
+    pub fn touch(clear_attention: bool) -> Result<()> {
+        let previous = Self::read();
         Self {
             at: now(),
-            ..Self::read()
+            needs_attention: previous.needs_attention && !clear_attention,
+            observed_exit: None,
+            unhealthy_since: None,
+            observed_at: 0,
+            ..previous
         }
         .write()
     }
+
+    fn observe(&mut self, id: &str, healthy: bool, at: u64) -> u64 {
+        if self.observed_exit.as_deref() != Some(id)
+            || at < self.observed_at
+            || at.saturating_sub(self.observed_at) > OBSERVATION_GAP
+        {
+            self.observed_exit = Some(id.to_owned());
+            self.unhealthy_since = None;
+        }
+        self.observed_at = at;
+        if healthy {
+            self.unhealthy_since = None;
+            return 0;
+        }
+        let since = self.unhealthy_since.get_or_insert(at);
+        if at < *since {
+            *since = at;
+        }
+        at.saturating_sub(*since)
+    }
 }
 
-pub fn decide(views: &[View], current: &str, idle: u64) -> Option<(String, Reason)> {
+pub fn decide(
+    views: &[View],
+    current: &str,
+    pool: &[String],
+    idle: u64,
+    unhealthy_for: u64,
+) -> Option<(String, Reason)> {
     let current = views.iter().find(|view| view.id == current)?;
+    if !pool.iter().any(|key| key == current.key) {
+        return None;
+    }
     let best = views
         .iter()
-        .filter(|view| view.id != current.id && view.eligible)
+        .filter(|view| {
+            view.id != current.id && view.eligible && pool.iter().any(|key| key == view.key)
+        })
         .filter_map(|view| Some((view, view.median_ms?)))
         .min_by(|left, right| left.1.total_cmp(&right.1))?;
     match current.median_ms.filter(|_| current.eligible) {
@@ -88,7 +142,9 @@ pub fn decide(views: &[View], current: &str, idle: u64) -> Option<(String, Reaso
         {
             Some((best.0.id.to_owned(), Reason::Faster))
         }
-        None if idle >= RECOVERY_SECONDS => Some((best.0.id.to_owned(), Reason::Unhealthy)),
+        None if idle >= RECOVERY_SECONDS && unhealthy_for >= RECOVERY_SECONDS => {
+            Some((best.0.id.to_owned(), Reason::Unhealthy))
+        }
         _ => None,
     }
 }
@@ -98,13 +154,22 @@ pub fn step(config: &Settings) -> Result<()> {
         return Ok(());
     }
     locked("selection", || {
+        if Settings::read()? != *config {
+            return Ok(());
+        }
         let revision = crate::router::revision()?;
         let state = api::state()?;
-        let record = Record::read();
+        let mut record = Record::read();
+        if record.needs_attention {
+            return Ok(());
+        }
         let Some(current) = state.tunnels.iter().find(|tunnel| tunnel.preferred) else {
             return Ok(());
         };
-        if !current.enabled || !config.tunnels.contains(&current.monitor_id) {
+        if !current.enabled || !config.auto_tunnels.contains(&current.monitor_id) {
+            record.observed_exit = None;
+            record.unhealthy_since = None;
+            record.write()?;
             return Ok(());
         }
         let views: Vec<_> = state
@@ -112,12 +177,26 @@ pub fn step(config: &Settings) -> Result<()> {
             .iter()
             .map(|tunnel| View {
                 id: &tunnel.id,
-                eligible: tunnel.eligible && config.tunnels.contains(&tunnel.monitor_id),
+                key: &tunnel.monitor_id,
+                eligible: tunnel.eligible && config.auto_tunnels.contains(&tunnel.monitor_id),
                 median_ms: tunnel.median,
             })
             .collect();
-        let Some((target, reason)) = decide(&views, &current.id, now().saturating_sub(record.at))
-        else {
+        let at = now();
+        let unhealthy_for = record.observe(
+            &current.monitor_id,
+            current.eligible && current.median.is_some(),
+            at,
+        );
+        let decision = decide(
+            &views,
+            &current.id,
+            &config.auto_tunnels,
+            at.saturating_sub(record.at),
+            unhealthy_for,
+        );
+        record.write()?;
+        let Some((target, reason)) = decision else {
             return Ok(());
         };
         let name = |id: &str| state_name(&state, id);
@@ -127,10 +206,14 @@ pub fn step(config: &Settings) -> Result<()> {
             to: name(&target),
             reason: reason.text().into(),
         };
+        record.at = now();
+        record.needs_attention = true;
+        record.write()?;
         api::apply(&target, &revision)?;
         Record {
             at: now(),
             last: Some(switch),
+            ..Record::default()
         }
         .write()
     })
@@ -146,28 +229,33 @@ fn state_name(state: &State, id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Reason, View, decide};
+    use super::{Reason, Record, View, decide};
 
     fn view(id: &str, eligible: bool, median: Option<f64>) -> View<'_> {
         View {
             id,
+            key: id,
             eligible,
             median_ms: median,
         }
     }
 
+    fn pool() -> [String; 2] {
+        ["a".into(), "b".into()]
+    }
+
     #[test]
     fn holds_until_time_and_gain() {
         let views = [view("a", true, Some(50.0)), view("b", true, Some(30.0))];
-        assert!(decide(&views, "a", 100).is_none());
+        assert!(decide(&views, "a", &pool(), 100, 0).is_none());
         assert!(matches!(
-            decide(&views, "a", 300),
+            decide(&views, "a", &pool(), 300, 0),
             Some((id, Reason::Faster)) if id == "b"
         ));
         let small = [view("a", true, Some(50.0)), view("b", true, Some(45.0))];
-        assert!(decide(&small, "a", 900).is_none());
+        assert!(decide(&small, "a", &pool(), 900, 0).is_none());
         let tiny = [view("a", true, Some(8.0)), view("b", true, Some(2.0))];
-        assert!(decide(&tiny, "a", 900).is_none());
+        assert!(decide(&tiny, "a", &pool(), 900, 0).is_none());
     }
 
     #[test]
@@ -177,17 +265,37 @@ mod tests {
             view("b", true, Some(90.0)),
             view("c", true, Some(40.0)),
         ];
-        assert!(decide(&views, "a", 30).is_none());
+        let mut record = Record::default();
+        let allowed = ["a".into(), "b".into(), "c".into()];
+        assert_eq!(record.observe("a", false, 1000), 0);
+        assert!(decide(&views, "a", &allowed, 900, 0).is_none());
+        assert!(decide(&views, "a", &allowed, 900, record.observe("a", false, 1059)).is_none());
         assert!(matches!(
-            decide(&views, "a", 60),
+            decide(&views, "a", &allowed, 900, record.observe("a", false, 1060)),
             Some((id, Reason::Unhealthy)) if id == "c"
         ));
+        assert_eq!(record.observe("a", true, 1061), 0);
+        assert_eq!(record.observe("a", false, 1062), 0);
+        assert_eq!(record.observe("b", false, 1200), 0);
+        assert_eq!(record.observe("b", false, 1100), 0);
+        assert_eq!(record.observe("b", false, 1160), 60);
+        assert_eq!(record.observe("b", false, 1281), 0);
     }
 
     #[test]
     fn never_picks_unhealthy_or_unknown() {
         let views = [view("a", false, None), view("b", false, Some(5.0))];
-        assert!(decide(&views, "a", 900).is_none());
-        assert!(decide(&views, "missing", 900).is_none());
+        assert!(decide(&views, "a", &pool(), 900, 900).is_none());
+        assert!(decide(&views, "missing", &pool(), 900, 900).is_none());
+        let four = [
+            view("a", true, Some(50.0)),
+            view("b", true, Some(30.0)),
+            view("c", true, Some(1.0)),
+            view("d", true, Some(2.0)),
+        ];
+        assert!(
+            matches!(decide(&four, "a", &pool(), 900, 0), Some((id, Reason::Faster)) if id == "b")
+        );
+        assert!(decide(&four, "c", &pool(), 900, 0).is_none());
     }
 }

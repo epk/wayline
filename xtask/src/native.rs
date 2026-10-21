@@ -303,6 +303,7 @@ fn package_checks() -> Result<()> {
         fs::metadata(&path)?.modified()? == modified,
         "Unchanged settings caused a write."
     );
+    compatibility_checks()?;
     tunnel_controls()?;
     bridge_checks()?;
     request("install", &json!({}))?;
@@ -332,6 +333,50 @@ fn package_checks() -> Result<()> {
                 "authenticated_bridge":true,"single_http_worker":true,"missing_session_rejected":true,"revoked_session_rejected":true,"local_session_bypass_rejected":true,"physical_router":false}),
         )?,
     )?;
+    Ok(())
+}
+
+fn compatibility_checks() -> Result<()> {
+    let module = Path::new(ROOT).join("usr/lib/oui-httpd/rpc/vpn-client");
+    let original = fs::read(&module)?;
+    let mut changed = original.clone();
+    changed.push(b'\n');
+    fs::write(&module, changed)?;
+    let policy = Path::new(ROOT).join("etc/config/route_policy");
+    let saved = fs::read(&policy)?;
+    let result = (|| -> Result<()> {
+        let state = request("get_state", &json!({}))?;
+        ensure!(
+            state["compat"]["level"] == "monitoring"
+                && state["capabilities"]["select"] == false
+                && state["capabilities"]["control"] == false
+                && state["capabilities"]["update"] == true,
+            "An unverified module retained mutation controls."
+        );
+        ensure!(
+            call(
+                "/usr/sbin/wayline-ctl",
+                &[
+                    "set_tunnel_enabled",
+                    &json!({
+                        "section_id":"wayline_lab", "enabled":false,
+                        "expected_revision":state["revision"]
+                    })
+                    .to_string()
+                ]
+            )
+            .is_err(),
+            "An unverified module accepted a tunnel request."
+        );
+        ensure!(
+            fs::read(&policy)? == saved,
+            "An unverified module changed VPN policy."
+        );
+        Ok(())
+    })();
+    fs::write(module, original)?;
+    result?;
+    println!("Unverified-module mutation guards passed in the native sandbox.");
     Ok(())
 }
 

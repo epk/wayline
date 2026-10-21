@@ -34,11 +34,20 @@ impl Cache {
             .unwrap_or_default()
     }
 
-    fn matches(&self, inventory: &Inventory) -> bool {
-        let wanted: Vec<_> = inventory
-            .paths
+    pub fn view(config: &crate::settings::Settings, inventory: &Inventory) -> Self {
+        let mut cache = Self::read();
+        let paths = scheduled_paths(config, inventory);
+        cache.paths.retain(|cached| {
+            paths
+                .iter()
+                .any(|path| path.id == cached.id && path.interface == cached.interface)
+        });
+        cache
+    }
+
+    fn matches(&self, paths: &[&PathInfo]) -> bool {
+        let wanted: Vec<_> = paths
             .iter()
-            .chain(inventory.wan.as_ref())
             .map(|path| (path.id.as_str(), path.interface.as_str()))
             .collect();
         let cached: Vec<_> = self
@@ -49,20 +58,33 @@ impl Cache {
         wanted == cached
     }
 
-    pub fn refresh(inventory: &Inventory) -> Result<()> {
+    pub fn refresh(config: &crate::settings::Settings, inventory: &Inventory) -> Result<()> {
         let cache = Self::read();
-        if now().saturating_sub(cache.checked_at) < MAX_AGE && cache.matches(inventory) {
+        let paths = scheduled_paths(config, inventory);
+        if now().saturating_sub(cache.checked_at) < MAX_AGE && cache.matches(&paths) {
             return Ok(());
         }
         let fresh = Self {
             checked_at: now(),
-            paths: probe(inventory),
+            paths: probe_paths(&paths),
         };
         wayline_support::atomic(
             std::path::Path::new(&Self::path()),
             &serde_json::to_vec(&fresh)?,
         )
     }
+}
+
+pub fn scheduled_paths<'a>(
+    config: &'a crate::settings::Settings,
+    inventory: &'a Inventory,
+) -> Vec<&'a PathInfo> {
+    if !config.enabled {
+        return Vec::new();
+    }
+    crate::router::monitored(config, inventory)
+        .chain(inventory.wan.iter().filter(|_| config.direct_wan))
+        .collect()
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -84,15 +106,19 @@ struct Trace {
 
 #[must_use]
 pub fn probe(inventory: &Inventory) -> Vec<Egress> {
-    let deadline = Instant::now() + LIMIT;
     let paths: Vec<&PathInfo> = inventory
         .paths
         .iter()
         .chain(inventory.wan.as_ref())
         .collect();
+    probe_paths(&paths)
+}
+
+fn probe_paths(paths: &[&PathInfo]) -> Vec<Egress> {
+    let deadline = Instant::now() + LIMIT;
     let pending: Vec<_> = paths.iter().map(|path| start(path)).collect();
     paths
-        .into_iter()
+        .iter()
         .zip(pending)
         .map(|(path, pending)| {
             let mut egress = Egress {

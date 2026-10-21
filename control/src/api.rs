@@ -38,6 +38,7 @@ pub struct State {
     scope: &'static str,
     capabilities: Capabilities,
     compat: native::Compat,
+    monitoring_issue: Option<String>,
     update: Option<update::Status>,
 }
 
@@ -69,9 +70,12 @@ struct UplinkView {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AutoView {
     enabled: bool,
     last: Option<auto::Switch>,
+    needs_attention: bool,
+    paused: bool,
 }
 
 #[derive(Serialize)]
@@ -103,7 +107,7 @@ pub struct Tunnel {
     controllable: bool,
     pub preferred: bool,
     pub eligible: bool,
-    reason: &'static str,
+    reason: String,
     state_label: &'static str,
     measurement_state: Option<Measurement>,
     age: String,
@@ -216,17 +220,38 @@ fn tunnels(
     for tunnel in &inventory.tunnels {
         let path = inventory.paths.iter().find(|path| path.id == tunnel.id);
         let item = path.and_then(|path| measurement(snapshot, path, config.primary()));
-        let eligible = compatible
-            && item.is_some_and(|item| {
-                item.state.live()
-                    && item.lost() == 0
-                    && item
-                        .success_age_ms
-                        .is_some_and(|age| age <= u64::from(config.interval) * 3000)
-            })
-            && native
+        let eligibility = (|| -> Result<()> {
+            ensure!(
+                compatible,
+                "Firmware or monitoring configuration prevents selection."
+            );
+            ensure!(tunnel.enabled, "The tunnel is stopped.");
+            ensure!(
+                path.is_some(),
+                "The tunnel is enabled but has no connected path."
+            );
+            ensure!(
+                config.tunnels.contains(&tunnel.key),
+                "Select this tunnel for monitoring in Settings."
+            );
+            let item = item.context("No measurement exists for the primary destination yet.")?;
+            ensure!(
+                item.state.live(),
+                "The primary destination is not reachable through this tunnel."
+            );
+            ensure!(item.lost() == 0, "Recent probes include packet loss.");
+            ensure!(
+                item.success_age_ms
+                    .is_some_and(|age| age <= u64::from(config.interval) * 3000),
+                "The last successful probe is too old."
+            );
+            let list = native
                 .as_ref()
-                .is_ok_and(|list| router::safe_order(list, inventory, &tunnel.id).is_ok());
+                .map_err(|error| anyhow::anyhow!("Cannot read native tunnel state: {error}"))?;
+            router::safe_order(list, inventory, &tunnel.id)?;
+            Ok(())
+        })();
+        let eligible = eligibility.is_ok();
         tunnels.push(Tunnel {
             id: tunnel.id.clone(),
             monitor_id: tunnel.key.clone(),
@@ -242,11 +267,9 @@ fn tunnels(
                 }),
             preferred: preferred == Some(tunnel.id.as_str()),
             eligible,
-            reason: if eligible {
-                ""
-            } else {
-                "The traffic rules or recent measurements prevent selection."
-            },
+            reason: eligibility
+                .err()
+                .map_or_else(String::new, |error| error.to_string()),
             state_label: if !tunnel.enabled {
                 "Stopped"
             } else if path.is_none() {
@@ -340,8 +363,10 @@ fn unsupported(compat: native::Compat) -> State {
         auto: AutoView {
             enabled: false,
             last: None,
+            needs_attention: false,
+            paused: false,
         },
-        egress: egress::Cache::read(),
+        egress: egress::Cache::default(),
         revision: String::new(),
         scope: "Equivalent native traffic rules",
         capabilities: Capabilities {
@@ -352,6 +377,7 @@ fn unsupported(compat: native::Compat) -> State {
             reason: compat.message.clone(),
         },
         compat,
+        monitoring_issue: None,
         update: update::Status::read(),
     }
 }
@@ -376,15 +402,24 @@ pub fn state() -> Result<State> {
             compat.firmware
         );
     }
-    let compatible = compat.level == native::Level::Full;
+    let monitoring_issue = router::check_capacity(&config, &inventory)
+        .err()
+        .map(|error| error.to_string());
+    let compatible = compat.level == native::Level::Full && monitoring_issue.is_none();
     let known = history::known_prefixes();
     let tunnels = tunnels(&config, &inventory, &snapshot, &native, &known, compatible);
     let auto_enabled = config.auto_exit;
+    let auto_record = auto::Record::read();
+    let auto_paused = auto_enabled
+        && !tunnels.iter().any(|tunnel| {
+            tunnel.preferred && tunnel.enabled && config.auto_tunnels.contains(&tunnel.monitor_id)
+        });
     let resolved = resolved(&config, &inventory);
     let endpoints = router::endpoints(&config, &inventory);
     let diagnostics = diagnostics(&config, &inventory, &endpoints, &snapshot);
     let endpoint_list = endpoint_views(&config, &inventory);
     let wan = wan_view(&inventory);
+    let egress = egress::Cache::view(&config, &inventory);
     let uplinks = uplink_views(&config, &inventory, &snapshot);
     let events = changes::read(&config)
         .into_iter()
@@ -407,9 +442,11 @@ pub fn state() -> Result<State> {
         events,
         auto: AutoView {
             enabled: auto_enabled,
-            last: auto::Record::read().last,
+            last: auto_record.last,
+            needs_attention: auto_record.needs_attention,
+            paused: auto_paused,
         },
-        egress: egress::Cache::read(),
+        egress,
         revision,
         scope: "Equivalent native traffic rules",
         capabilities: Capabilities {
@@ -420,6 +457,7 @@ pub fn state() -> Result<State> {
             reason: compat.message.clone(),
         },
         compat,
+        monitoring_issue,
         update: update::Status::read(),
     })
 }
@@ -434,30 +472,35 @@ pub fn history(query: &history::Query) -> Result<history::Response> {
 }
 
 pub fn set_config(request: SetConfig) -> Result<Value> {
-    locked("settings", || {
-        native::require(native::Level::Monitoring)?;
-        ensure!(request.expected_revision == router::revision()?, STALE);
-        let mut config = request.config;
-        let inventory = router::inventory()?;
-        router::normalize(&mut config, &inventory);
-        config.validate()?;
-        ensure!(
-            config
-                .tunnels
-                .iter()
-                .all(|id| inventory.tunnels.iter().any(|tunnel| &tunnel.key == id)),
-            "A selected tunnel is unavailable."
-        );
-        if Settings::read()? != config {
-            atomic(Path::new(SETTINGS), &serde_json::to_vec(&config)?)?;
-            let hosts = router::hosts(&config, &inventory);
-            let mut resolved = Resolved::read();
-            if resolved.stale(&hosts) {
-                resolved.refresh(&hosts)?;
+    locked("selection", || {
+        locked("settings", || {
+            native::require(native::Level::Monitoring)?;
+            ensure!(request.expected_revision == router::revision()?, STALE);
+            let mut config = request.config;
+            let inventory = router::inventory()?;
+            router::normalize(&mut config, &inventory);
+            config.validate()?;
+            router::check_capacity(&config, &inventory)?;
+            ensure!(
+                config
+                    .tunnels
+                    .iter()
+                    .all(|id| inventory.tunnels.iter().any(|tunnel| &tunnel.key == id)),
+                "A selected tunnel is unavailable."
+            );
+            let previous = Settings::read()?;
+            if previous != config {
+                auto::Record::touch(previous.auto_exit != config.auto_exit)?;
+                atomic(Path::new(SETTINGS), &serde_json::to_vec(&config)?)?;
+                let hosts = router::hosts(&config, &inventory);
+                let mut resolved = Resolved::read();
+                if resolved.stale(&hosts) {
+                    resolved.refresh(&hosts)?;
+                }
+                reconcile()?;
             }
-            reconcile()?;
-        }
-        Ok(json!({"applied":true}))
+            Ok(json!({"applied":true}))
+        })
     })
 }
 
@@ -517,7 +560,7 @@ pub fn select(request: &Select) -> Result<Value> {
     locked("selection", || {
         let result = apply(&request.section_id, &request.expected_revision)?;
         if result["unchanged"] != true {
-            auto::Record::touch()?;
+            auto::Record::touch(true)?;
         }
         Ok(result)
     })

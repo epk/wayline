@@ -68,7 +68,7 @@ fn reconcile_inner() -> Result<()> {
             &config,
             &router::inventory()?,
             &Resolved::read(),
-        ))
+        )?)
     } else {
         None
     };
@@ -152,7 +152,7 @@ fn routine() -> Result<()> {
         Ok(())
     };
     if config.enabled && native::supported() {
-        egress::Cache::refresh(&router::inventory()?)?;
+        egress::Cache::refresh(&config, &router::inventory()?)?;
     }
     let collected = format!("{RUNTIME}/last-collect");
     let last = fs::read_to_string(&collected)

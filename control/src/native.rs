@@ -150,10 +150,10 @@ fn decide(firmware: &str, digest: Option<&str>) -> (Level, bool, String) {
         ),
         Some(FIRMWARE_CONTRACT) => (Level::Full, true, String::new()),
         Some(_) => (
-            Level::Full,
+            Level::Monitoring,
             false,
             format!(
-                "Firmware {firmware} is newer than the firmware that Wayline was tested on. Wayline checks every native reply and turns controls off if the format differs."
+                "The VPN module on firmware {firmware} is unverified. Monitoring and updates remain available. Exit selection and tunnel controls require a tested module."
             ),
         ),
     }
@@ -253,7 +253,7 @@ mod tests {
         }
         for firmware in ["4.9.2", "4.10.0", "5.1.0"] {
             let (level, verified, message) = decide(firmware, Some("changed"));
-            assert!(level == Level::Full && !verified && !message.is_empty());
+            assert!(level == Level::Monitoring && !verified && !message.is_empty());
         }
         assert!(decide("4.8.9", known).0 == Level::Unsupported);
         assert!(decide("3.0.0", known).0 == Level::Unsupported);

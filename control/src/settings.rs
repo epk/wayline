@@ -27,6 +27,7 @@ pub struct Settings {
     pub history_hours: u32,
     pub auto_updates: bool,
     pub auto_exit: bool,
+    pub auto_tunnels: Vec<String>,
     pub endpoint_diagnostics: bool,
 }
 
@@ -49,6 +50,8 @@ struct Stored {
     auto_updates: bool,
     #[serde(default)]
     auto_exit: bool,
+    #[serde(default, deserialize_with = "optional_tunnels")]
+    auto_tunnels: Option<Vec<String>>,
     #[serde(default)]
     endpoint_diagnostics: bool,
 }
@@ -61,6 +64,12 @@ fn tunnel_list<'de, D: serde::Deserializer<'de>>(
         return Ok(Vec::new());
     }
     serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+fn optional_tunnels<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error> {
+    tunnel_list(deserializer).map(Some)
 }
 
 impl TryFrom<Stored> for Settings {
@@ -90,7 +99,8 @@ impl TryFrom<Stored> for Settings {
             direct_wan: stored.direct_wan,
             history_hours: stored.history_hours,
             auto_updates: stored.auto_updates,
-            auto_exit: stored.auto_exit,
+            auto_exit: stored.auto_exit && stored.auto_tunnels.is_some(),
+            auto_tunnels: stored.auto_tunnels.unwrap_or_default(),
             endpoint_diagnostics: stored.endpoint_diagnostics,
         })
     }
@@ -119,6 +129,7 @@ impl Default for Settings {
             history_hours: 24,
             auto_updates: false,
             auto_exit: false,
+            auto_tunnels: Vec::new(),
             endpoint_diagnostics: false,
         }
     }
@@ -242,6 +253,20 @@ impl Settings {
         for (index, value) in self.targets.iter().enumerate() {
             ensure!(!self.targets[..index].contains(value), "Duplicate target.");
         }
+        ensure!(
+            self.auto_tunnels.len() <= 8 && (!self.auto_exit || self.auto_tunnels.len() >= 2),
+            "Choose at least two monitored tunnels for automatic switching."
+        );
+        for (index, id) in self.auto_tunnels.iter().enumerate() {
+            ensure!(
+                self.tunnels.contains(id),
+                "Automatic switching only permits monitored tunnels."
+            );
+            ensure!(
+                !self.auto_tunnels[..index].contains(id),
+                "Duplicate automatic tunnel."
+            );
+        }
         Ok(())
     }
 }
@@ -318,6 +343,38 @@ mod tests {
         let loaded: Settings = serde_json::from_str(&json)?;
         ensure!(loaded == settings, "The round trip changed settings.");
         loaded.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_pool_requires_explicit_monitored_members() -> Result<()> {
+        let mut settings = Settings {
+            tunnels: vec![
+                "vpn:1".into(),
+                "vpn:2".into(),
+                "vpn:3".into(),
+                "vpn:4".into(),
+            ],
+            auto_exit: true,
+            auto_tunnels: vec!["vpn:1".into(), "vpn:2".into()],
+            ..Settings::default()
+        };
+        settings.validate()?;
+        let mut old = serde_json::to_value(&settings)?;
+        old.as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Missing settings object."))?
+            .remove("autoTunnels");
+        let migrated: Settings = serde_json::from_value(old)?;
+        assert!(!migrated.auto_exit && migrated.auto_tunnels.is_empty());
+        migrated.validate()?;
+        for pool in [
+            vec!["vpn:1"],
+            vec!["vpn:1", "vpn:1"],
+            vec!["vpn:1", "vpn:5"],
+        ] {
+            settings.auto_tunnels = pool.into_iter().map(str::to_owned).collect();
+            assert!(settings.validate().is_err());
+        }
         Ok(())
     }
 

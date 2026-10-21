@@ -249,9 +249,12 @@
         <h3 id="vph-set-tunnels">Tunnels to monitor</h3>
         <div class="vph-tunnels">
           <label v-for="t in state.tunnels" :key="t.id" class="vph-check"
-            ><input type="checkbox" :value="t.monitorId" v-model="draft.tunnels" />{{
-              t.name
-            }}</label
+            ><input
+              type="checkbox"
+              :value="t.monitorId"
+              v-model="draft.tunnels"
+              @change="pruneAutomaticTunnels"
+            />{{ t.name }}</label
           >
         </div>
       </section>
@@ -279,6 +282,23 @@
         <p class="vph-muted">
           Moves to a clearly faster healthy tunnel (20% and 10 ms better, at most every 5 minutes)
           or away from an unhealthy one after 1 minute.
+        </p>
+        <fieldset v-if="draft.autoExit" class="vph-tunnels">
+          <legend>Tunnels allowed for automatic switching</legend>
+          <label v-for="t in state.tunnels" :key="t.id" class="vph-check">
+            <input
+              type="checkbox"
+              :value="t.monitorId"
+              v-model="draft.autoTunnels"
+              :disabled="!draft.tunnels.includes(t.monitorId)"
+            />
+            {{ t.name }}
+          </label>
+        </fieldset>
+        <p v-if="draft.autoExit" class="vph-muted">
+          Choose at least two monitored tunnels. Only healthy, connected members can become the
+          exit. Automatic switching pauses when the current exit is outside this pool. Stopped
+          tunnels stay stopped.
         </p>
         <p v-if="draft.autoExit" class="vph-warning" role="note">
           Warning: this changes the native VPN priority by itself. Existing connections do not move.
@@ -326,8 +346,16 @@
     </form>
 
     <p v-if="!can.select && selectReason" class="vph-muted vph-hint">{{ selectReason }}</p>
+    <p v-if="state.monitoringIssue" class="vph-notice" role="alert">{{ state.monitoringIssue }}</p>
     <div v-if="state.auto && state.auto.enabled" class="vph-panel vph-info">
       <strong>Automatic exit switching is on.</strong>
+      <p v-if="state.auto.needsAttention" role="alert">
+        Automatic switching stopped after an uncertain request. Check the native VPN state. Disable
+        automatic switching. Save Settings. Enable it again.
+      </p>
+      <p v-else-if="state.auto.paused">
+        Automatic switching is paused because the current exit is outside the allowed pool.
+      </p>
       <span v-if="state.auto.last">
         Last switch
         <time :title="new Date(state.auto.last.at).toLocaleString()">{{
@@ -761,6 +789,7 @@ const defaults = () => ({
   historyHours: 24,
   autoUpdates: false,
   autoExit: false,
+  autoTunnels: [],
   endpointDiagnostics: false,
 });
 const validTarget = (value) =>
@@ -974,7 +1003,12 @@ export default {
       return this.diagnosticValue('wan');
     },
     showWan() {
-      return !!(this.exitTunnel && this.wanEgress && (this.wanEgress.ip || this.wanEgress.error));
+      return !!(
+        this.state.config.directWan &&
+        this.exitTunnel &&
+        this.wanEgress &&
+        (this.wanEgress.ip || this.wanEgress.error)
+      );
     },
     comparison() {
       if (!this.exitTunnel) return null;
@@ -1282,6 +1316,9 @@ export default {
         next.tunnels = Array.isArray(next.tunnels) ? next.tunnels : [];
         next.config = next.config || {};
         next.config.tunnels = Array.isArray(next.config.tunnels) ? next.config.tunnels : [];
+        next.config.autoTunnels = Array.isArray(next.config.autoTunnels)
+          ? next.config.autoTunnels
+          : [];
         next.capabilities = Object.assign(
           { configure: false, select: false, control: false },
           next.capabilities,
@@ -1461,6 +1498,11 @@ export default {
         if (c) c.focus();
       });
     },
+    pruneAutomaticTunnels() {
+      this.draft.autoTunnels = this.draft.autoTunnels.filter((id) =>
+        this.draft.tunnels.includes(id),
+      );
+    },
     async saveSettings() {
       if (this.busy) return;
       this.error = '';
@@ -1476,6 +1518,11 @@ export default {
       }
       if (this.draft.enabled && !this.draft.tunnels.length) {
         this.error = 'Choose at least one tunnel to monitor.';
+        return;
+      }
+      this.pruneAutomaticTunnels();
+      if (this.draft.autoExit && this.draft.autoTunnels.length < 2) {
+        this.error = 'Choose at least two monitored tunnels for automatic switching.';
         return;
       }
       this.busy = true;

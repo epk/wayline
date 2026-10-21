@@ -1,10 +1,10 @@
 (() => {
   const anchor = Math.floor(Date.now() / 60000) * 60000;
   const names = {
-    home: 'Home (Amsterdam)',
-    backup: 'Backup (Frankfurt)',
-    tokyo: 'Tokyo',
-    zurich: 'Zurich',
+    home: 'Tunnel A',
+    backup: 'Tunnel B',
+    tokyo: 'Tunnel C',
+    zurich: 'Tunnel D',
     wan: 'Direct WAN',
   };
   const query = new URLSearchParams(window.location.search);
@@ -18,7 +18,7 @@
     full: '',
     monitoring: 'This firmware is newer than the tested range. Monitoring works.',
     unsupported: 'This firmware is older than 4.9.0. Wayline cannot control its VPN module.',
-    newer: 'The VPN module is newer than the tested one. Wayline works but is not verified.',
+    newer: 'The VPN module is unverified. Monitoring and updates work. Tunnel controls are off.',
   };
   const featureList = (on) =>
     ['Monitoring', 'History', 'Exit selection', 'Start and Stop', 'Signed updates'].map(
@@ -27,20 +27,25 @@
         available: i < on || i === 4,
       }),
     );
-  const features = { full: 4, newer: 4, monitoring: 2, unsupported: 0 };
+  const features = { full: 4, newer: 2, monitoring: 2, unsupported: 0 };
   let revision = 1;
   const state = {
-    version: '0.1.0-alpha.5',
+    version: '0.1.0-alpha.6',
     revision: '1',
     scope: 'All clients',
     compat: {
-      level: level === 'newer' ? 'full' : level,
+      level: level === 'newer' ? 'monitoring' : level,
       verified: level !== 'newer',
       firmware: level === 'unsupported' ? '4.8.1' : '4.9.2',
       message: compatMessages[level],
       features: level === 'full' ? [] : featureList(features[level]),
     },
-    capabilities: { configure: true, select: true, control: true },
+    capabilities: {
+      configure: level !== 'unsupported',
+      select: level === 'full',
+      control: level === 'full',
+      update: true,
+    },
     config: {
       enabled: true,
       interval: 15,
@@ -50,6 +55,7 @@
       historyHours: 24,
       autoUpdates: false,
       autoExit: true,
+      autoTunnels: ['home', 'backup'],
       endpointDiagnostics: true,
     },
     egress: {
@@ -60,7 +66,7 @@
           name: names.home,
           interface: 'wg-home',
           ip: '203.0.113.5',
-          location: 'CA',
+          location: null,
           error: null,
         },
         {
@@ -68,7 +74,7 @@
           name: names.backup,
           interface: 'wg-backup',
           ip: '198.51.100.7',
-          location: 'DE',
+          location: null,
           error: null,
         },
         {
@@ -84,7 +90,7 @@
           name: names.wan,
           interface: wanDown ? null : 'eth1',
           ip: wanDown ? null : '203.0.113.80',
-          location: wanDown ? null : 'US',
+          location: null,
           error: wanDown ? 'Direct WAN is unavailable.' : null,
         },
       ],
@@ -95,7 +101,7 @@
         at: Date.now() - 12 * 60000,
         from: 'backup',
         to: 'home',
-        reason: 'Home is 38% faster and healthy.',
+        reason: 'Lower latency',
       },
     },
     wan: wanDown

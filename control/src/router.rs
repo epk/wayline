@@ -20,7 +20,7 @@ const NO_PEER: &str = "The tunnel has no active WireGuard peer endpoint yet.";
 const OPENVPN: &str = "OpenVPN endpoint discovery is not supported.";
 const IPV6: &str = "The endpoint is an IPv6 address, which Wayline does not measure.";
 
-const IGNORED: [&str; 7] = [
+const IGNORED: [&str; 8] = [
     ".name",
     ".anonymous",
     "peer_id",
@@ -28,6 +28,7 @@ const IGNORED: [&str; 7] = [
     "client_id",
     "profiles",
     "options_in_used",
+    "mark",
 ];
 
 #[derive(Deserialize)]
@@ -455,7 +456,11 @@ pub fn inventory() -> Result<Inventory> {
 }
 
 pub fn normalize(settings: &mut Settings, inventory: &Inventory) {
-    for id in &mut settings.tunnels {
+    for id in settings
+        .tunnels
+        .iter_mut()
+        .chain(&mut settings.auto_tunnels)
+    {
         if let Some(tunnel) = inventory.tunnels.iter().find(|item| item.id == *id) {
             id.clone_from(&tunnel.key);
         }
@@ -548,7 +553,30 @@ pub fn hosts(settings: &Settings, inventory: &Inventory) -> Vec<String> {
     hosts.into_iter().collect()
 }
 
-pub fn monitor(settings: &Settings, inventory: &Inventory, resolved: &Resolved) -> Config {
+pub fn check_capacity(settings: &Settings, inventory: &Inventory) -> Result<()> {
+    if !settings.enabled {
+        return Ok(());
+    }
+    let uplinks = if settings.direct_wan {
+        inventory.uplinks.len().max(1)
+    } else {
+        0
+    };
+    let endpoints = if settings.endpoint_diagnostics {
+        settings.tunnels.len()
+    } else {
+        0
+    };
+    let wanted = (settings.tunnels.len() + uplinks) * settings.targets.len() + endpoints;
+    ensure!(
+        wanted <= MAX_SERIES,
+        "This configuration needs {wanted} measurements. The limit is {MAX_SERIES}. Remove a destination, tunnel, or optional check."
+    );
+    Ok(())
+}
+
+pub fn monitor(settings: &Settings, inventory: &Inventory, resolved: &Resolved) -> Result<Config> {
+    check_capacity(settings, inventory)?;
     let mut wanted = Vec::new();
     for item in monitored(settings, inventory) {
         wanted.extend(
@@ -592,18 +620,21 @@ pub fn monitor(settings: &Settings, inventory: &Inventory, resolved: &Resolved) 
                 measurement(path, id, address)
             })
         })
-        .take(MAX_SERIES)
         .collect();
+    ensure!(
+        tunnels.len() <= MAX_SERIES,
+        "The measurement limit was exceeded."
+    );
     let target = resolved
         .address(settings.primary())
         .or_else(|| tunnels.first().and_then(|tunnel| tunnel.target))
         .unwrap_or(Ipv4Addr::new(1, 1, 1, 1));
-    Config {
+    Ok(Config {
         target,
         interval_ms: u64::from(settings.interval) * 1000,
         timeout_ms: 2000,
         tunnels,
-    }
+    })
 }
 
 fn measurement(path: &PathInfo, id: String, address: Ipv4Addr) -> Tunnel {
@@ -645,10 +676,7 @@ pub fn safe_order(
         ensure!(
             settings::id(id)
                 && !ids.iter().any(|other| other == id)
-                && inventory
-                    .tunnels
-                    .iter()
-                    .any(|item| item.id == id && (!item.enabled || inventory.has_path(id))),
+                && inventory.tunnels.iter().any(|item| item.id == id),
             "The tunnel group is not eligible."
         );
         let fields = inventory
@@ -682,7 +710,10 @@ pub fn safe_order(
 
 #[cfg(test)]
 mod tests {
-    use super::{Inventory, PathInfo, endpoint_series, monitor, series_id};
+    use super::{
+        Inventory, PathInfo, Rule, TunnelInfo, check_capacity, endpoint_series, monitor,
+        safe_order, series_id,
+    };
     use crate::{
         resolve::Resolved,
         settings::{Settings, Target},
@@ -747,7 +778,7 @@ mod tests {
             "1.1.1.1".parse()?,
             "missing.example.com".parse()?,
         ];
-        let config = monitor(&settings, &inventory(), &resolved()?);
+        let config = monitor(&settings, &inventory(), &resolved()?)?;
         let on_tunnel = config
             .tunnels
             .iter()
@@ -772,6 +803,82 @@ mod tests {
                 .iter()
                 .any(|tunnel| tunnel.interface == "wwan0")
         );
+        assert_eq!(
+            crate::egress::scheduled_paths(&settings, &inventory()).len(),
+            2
+        );
+        settings.direct_wan = false;
+        assert_eq!(
+            crate::egress::scheduled_paths(&settings, &inventory()).len(),
+            1
+        );
+        settings.enabled = false;
+        assert!(crate::egress::scheduled_paths(&settings, &inventory()).is_empty());
+        settings.enabled = true;
+        settings.direct_wan = true;
+        settings.tunnels = (1..=8).map(|number| format!("vpn:{number}")).collect();
+        settings.targets = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "4.4.4.4", "5.5.5.5"]
+            .iter()
+            .map(|target| target.parse())
+            .collect::<Result<Vec<_>>>()?;
+        assert!(check_capacity(&settings, &inventory()).is_err());
+        assert!(monitor(&settings, &inventory(), &resolved()?).is_err());
+        settings.endpoint_diagnostics = false;
+        check_capacity(&settings, &inventory())?;
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_signatures_keep_policy_and_exclude_routing_identity() -> Result<()> {
+        let left: Rule =
+            serde_json::from_str(r#"{"mark":"0x1000","killswitch":"1","from":["client-a"]}"#)?;
+        let right: Rule =
+            serde_json::from_str(r#"{"mark":"0x2000","killswitch":"1","from":["client-a"]}"#)?;
+        assert_eq!(left.signature(), right.signature());
+        for changed in [
+            r#"{"mark":"0x2000","killswitch":"0","from":["client-a"]}"#,
+            r#"{"mark":"0x2000","killswitch":"1","from":["client-b"]}"#,
+        ] {
+            let changed: Rule = serde_json::from_str(changed)?;
+            assert_ne!(left.signature(), changed.signature());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn priority_can_recover_past_an_offline_tunnel() -> Result<()> {
+        let mut inventory = inventory();
+        inventory.paths = vec![path("b", "wg2", None)];
+        inventory.tunnels = [("a", "vpn:1"), ("b", "vpn:2")]
+            .into_iter()
+            .map(|(id, key)| TunnelInfo {
+                id: id.into(),
+                key: key.into(),
+                name: id.into(),
+                enabled: true,
+            })
+            .collect();
+        inventory.rules = [("a", 1, "0x1000"), ("b", 2, "0x2000")]
+            .into_iter()
+            .map(|(id, number, mark)| {
+                let rule = serde_json::json!({
+                    "tunnel_id": number.to_string(),
+                    "enabled": "1",
+                    "killswitch": "1",
+                    "mark": mark
+                });
+                Ok((id.into(), serde_json::from_value(rule)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let native = serde_json::from_value(serde_json::json!({"tunnels":[
+            {"id":"a","tunnel_id":1,"enabled":true,"via":{"type":"wireguard"}},
+            {"id":"b","tunnel_id":2,"enabled":true,"via":{"type":"wireguard"}}
+        ]}))?;
+        assert_eq!(
+            safe_order(&native, &inventory, "b")?,
+            (vec!["b".into(), "a".into()], true)
+        );
+        assert!(safe_order(&native, &inventory, "a").is_err());
         Ok(())
     }
 }
