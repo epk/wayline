@@ -729,26 +729,34 @@
           <ul class="vph-legend" aria-label="Tunnels in the graph">
             <li v-for="item in legendItems" :key="item.id">
               <button
-                v-if="item.tunnel"
                 type="button"
                 class="vph-legend-item"
-                :class="{ active: item.selected }"
-                :aria-pressed="item.selected ? 'true' : 'false'"
-                @click="highlight(item.owner)"
+                :class="{
+                  active: isolated.includes(item.owner),
+                  dimmed: isolated.length && !isolated.includes(item.owner),
+                }"
+                :aria-pressed="isolated.includes(item.owner) ? 'true' : 'false'"
+                @click="isolate(item, $event)"
               >
                 <span
+                  v-if="item.tunnel"
                   class="vph-legend-dot"
                   :style="{ '--series': item.color }"
                   aria-hidden="true"
                 ></span
+                ><span v-else class="vph-swatch vph-swatch-wan" aria-hidden="true"></span
                 >{{ item.name }}<span v-if="item.preferred" class="vph-muted"> Active exit</span
                 ><span v-if="item.stored" class="vph-muted"> Stored</span>
               </button>
-              <span v-else class="vph-legend-item vph-muted">
-                <span class="vph-swatch vph-swatch-wan" aria-hidden="true"></span>{{ item.name }}
-              </span>
             </li>
           </ul>
+          <p class="vph-muted vph-legend-hint">
+            {{
+              isolated.length
+                ? 'Showing selected lines. Click a selected line again to show all.'
+                : 'Click a line to show only it. Ctrl- or Cmd-click to add more.'
+            }}
+          </p>
         </div>
         <span class="vph-muted vph-range-label">{{
           clock(windowStart) + ' – ' + clock(windowStart + range * 60000)
@@ -871,6 +879,7 @@ export default {
       noticeTimer: null,
       draft: defaults(),
       selectedTunnel: '',
+      isolated: [],
       selectedTarget: storage.get(targetKey) || '1.1.1.1',
       settingsOpen: false,
       loading: false,
@@ -1141,7 +1150,7 @@ export default {
     },
     yMax() {
       let n = 25;
-      this.history.forEach((s) =>
+      this.visibleHistory.forEach((s) =>
         s.points.forEach((p) => {
           if (isNumber(p.max)) n = Math.max(n, p.max);
           if (isNumber(p.median)) n = Math.max(n, p.median);
@@ -1152,13 +1161,17 @@ export default {
     endpointHistory() {
       return !!this.state.config.endpointDiagnostics;
     },
+    visibleHistory() {
+      if (!this.isolated.length) return this.history;
+      return this.history.filter((s) => this.isolated.includes(this.ownerOf(s)));
+    },
     drawOrder() {
       const rank = (s) => {
         if (this.isServer(s)) return 0;
         if (s.id === 'wan' || this.isUplink(s)) return 1;
         return this.isSelected(s) ? 3 : 2;
       };
-      return this.history.slice().sort((a, b) => rank(a) - rank(b));
+      return this.visibleHistory.slice().sort((a, b) => rank(a) - rank(b));
     },
     wanGraph() {
       return !!(this.state.config.directWan && this.wanAvailable);
@@ -1200,10 +1213,12 @@ export default {
             nearest = p;
         return nearest && isNumber(nearest.median) ? nearest.median : null;
       };
-      const tunnels = this.history
+      const tunnels = this.visibleHistory
         .filter((s) => !this.isServer(s) && !this.isUplink(s) && s.id !== 'wan')
         .map((s) => {
-          const server = this.history.find((v) => this.isServer(v) && this.ownerOf(v) === s.id);
+          const server = this.visibleHistory.find(
+            (v) => this.isServer(v) && this.ownerOf(v) === s.id,
+          );
           const through = valueAt(s);
           const toServer = server ? valueAt(server) : null;
           let text =
@@ -1221,7 +1236,7 @@ export default {
             text,
           };
         });
-      const others = this.history
+      const others = this.visibleHistory
         .filter((s) => s.id === 'wan' || this.isUplink(s))
         .map((s) => {
           const value = valueAt(s);
@@ -1237,7 +1252,7 @@ export default {
         });
       return tunnels.concat(others).sort((a, b) => {
         if (a.value === null || b.value === null) return (a.value === null) - (b.value === null);
-        return a.value - b.value || a.name.localeCompare(b.name);
+        return b.value - a.value || a.name.localeCompare(b.name);
       });
     },
   },
@@ -1843,6 +1858,17 @@ export default {
     highlight(id) {
       this.selectedTunnel = id;
     },
+    isolate(item, event) {
+      const id = item.owner;
+      if (event && (event.ctrlKey || event.metaKey || event.shiftKey)) {
+        this.isolated = this.isolated.includes(id)
+          ? this.isolated.filter((other) => other !== id)
+          : this.isolated.concat(id);
+      } else {
+        this.isolated = this.isolated.length === 1 && this.isolated[0] === id ? [] : [id];
+      }
+      if (item.tunnel) this.highlight(id);
+    },
     isServer(series) {
       return series.id.startsWith(endpointPrefix);
     },
@@ -2397,6 +2423,13 @@ export default {
 }
 .vph-key-line .vph-key-dashed {
   stroke-dasharray: 4 3;
+}
+.vph-legend-item.dimmed {
+  opacity: 0.45;
+}
+.vph-legend-hint {
+  margin: 6px 0 0;
+  font-size: 12px;
 }
 .vph-legend-dot {
   display: inline-block;
