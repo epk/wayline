@@ -83,39 +83,30 @@ fn attribute(data: &mut [u8], kind: u16, value: &[u8]) -> io::Result<()> {
 
 fn decode(data: &[u8]) -> Option<Reply> {
     let message = NetlinkBuffer::new_checked(data).ok()?;
-    let sequence = message.sequence_number();
-    let mut reply = Reply {
-        sequence,
-        interface: None,
-    };
-    let body = message.payload();
+    Some(Reply {
+        sequence: message.sequence_number(),
+        interface: route_interface(&message),
+    })
+}
 
-    if message.message_type() != RTM_NEWROUTE
-        || body.len() < 12
-        || body[0] != AF_INET
-        || body[7] != RTN_UNICAST
-    {
-        return Some(reply);
+fn route_interface(message: &NetlinkBuffer<&[u8]>) -> Option<u32> {
+    if message.message_type() != RTM_NEWROUTE {
+        return None;
     }
-    for attr in NlasIterator::new(&body[12..]) {
-        let Ok(attr) = attr else {
-            return Some(Reply {
-                sequence,
-                interface: None,
-            });
-        };
-        if attr.kind() == RTA_OIF {
-            if reply.interface.is_some() || attr.nested_flag() || attr.network_byte_order_flag() {
-                return Some(Reply {
-                    sequence,
-                    interface: None,
-                });
+    let (head, attributes) = message.payload().split_at_checked(12)?;
+    let [AF_INET, _, _, _, _, _, _, RTN_UNICAST, ..] = head else {
+        return None;
+    };
+    let mut interface = None;
+    for attribute in NlasIterator::new(attributes) {
+        let attribute = attribute.ok()?;
+        if attribute.kind() == RTA_OIF {
+            if interface.is_some() || attribute.nested_flag() || attribute.network_byte_order_flag()
+            {
+                return None;
             }
-            reply.interface = parse_u32(attr.value()).ok();
-            if reply.interface.is_none() {
-                return Some(reply);
-            }
+            interface = Some(parse_u32(attribute.value()).ok()?);
         }
     }
-    Some(reply)
+    interface
 }
