@@ -14,7 +14,7 @@ Existing policy must permit the WAN path.
 Wayline never adds a bypass exception.
 
 The RPC bridge requires an active root administrator session.
-It exposes six fixed methods.
+It exposes seven fixed methods.
 The bridge cannot invoke arbitrary native modules or commands.
 Rust validates every control request.
 The frontend provides no security boundary.
@@ -24,7 +24,9 @@ Expected revisions reject stale UI writes.
 Repeated unchanged settings do not rewrite the configuration.
 Service reconciliation changes only Wayline's own service.
 
-Exit selection requires the exact firmware contract and equivalent active traffic rules.
+Exit selection requires the exact firmware contract and equivalent traffic rules.
+All enabled members need connected paths.
+Disabled members retain their position in the group.
 The selected exit needs fresh successful measurements and no recent loss.
 The helper preserves every native group member and the separate default tunnel group.
 It reads the complete native order after a change.
@@ -34,6 +36,14 @@ A factory UI change can race with a Wayline request.
 Wayline detects revision changes before the call and checks the result afterward.
 It does not blindly retry or restore an assumed previous order.
 An uncertain result requires a refresh.
+
+Start and Stop require matching native and UCI identities.
+Start also requires an assigned profile.
+The helper sends only the numeric identifier and the requested boolean state.
+It checks the resulting state, group order, other enabled states, and default group.
+It does not retry a failed or uncertain request.
+Stopping a tunnel can permit WAN traffic under the native traffic policy.
+Wayline does not change kill switches or promise a working connection after Start.
 
 Update checks authenticate a signed manifest before trusting package metadata.
 Installation requires matching architecture, firmware, package identity, size, and SHA-256.

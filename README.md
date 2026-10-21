@@ -1,7 +1,7 @@
 # Wayline
 
 Wayline compares VPN latency in the GL.iNet admin UI.
-Choose an active exit, inspect latency graphs, and compare destinations through a tunnel or directly through WAN.
+Start or stop VPN tunnels, choose an active exit, and compare latency through a tunnel or directly through WAN.
 
 **MVP: experimental alpha.**
 The first package targets Beryl 7 (GL-MT3600BE), firmware 4.9.0 release1, and `aarch64_cortex-a53`.
@@ -12,6 +12,8 @@ Other firmware contracts remain disabled.
 ## Features
 
 - Manual exit selection through GL.iNet's native priority API.
+- Start and Stop controls through GL.iNet's native VPN manager.
+- Configured tunnels stay visible while stopped or offline.
 - Recent latency, loss, and path state for up to eight active tunnels.
 - Graphs with 15-minute, one-hour, six-hour, and 24-hour ranges.
 - Optional destination checks through tunnels and direct WAN.
@@ -21,11 +23,22 @@ Other firmware contracts remain disabled.
 
 All settings appear in **VPN → Wayline**.
 Monitoring starts disabled.
-Create and connect tunnels in the factory VPN page first.
+Create tunnels and assign profiles in the factory VPN page first.
+Use Wayline to start or stop those tunnels.
 
 Wayline changes priority only when the native traffic rules match and the chosen exit has recent healthy measurements.
 It does not automatically switch exits.
-Different traffic rules, inactive group members, unknown firmware, or uncertain routing prevent selection.
+Different traffic rules, enabled but disconnected group members, unknown firmware, or uncertain routing prevent selection.
+Stopped group members retain their priority and do not prevent selection between equivalent connected tunnels.
+
+**Use exit** moves a connected tunnel to the highest native priority.
+It preserves the order of all other tunnels.
+**Start** enables the selected tunnel without changing priority.
+**Stop** disables the selected tunnel without changing priority.
+GL.iNet controls connection establishment and traffic handling.
+Stopping a tunnel can permit WAN traffic under your GL.iNet policy.
+Check **All Other Traffic** in the native VPN dashboard before stopping your current exit.
+The [native documentation](https://docs.gl-inet.com/router/en/4/interface_guide/vpn_dashboard/) explains priority and kill switches.
 
 ## Install
 
@@ -51,20 +64,20 @@ usign -V -p /tmp/release.pub -m /tmp/manifest.json -x /tmp/manifest.json.sig
 7. Compare the package size and SHA-256 with its signed manifest entry:
 
 ```sh
-wc -c /tmp/wayline_0.1.0-alpha.1_aarch64_cortex-a53.ipk
-sha256sum /tmp/wayline_0.1.0-alpha.1_aarch64_cortex-a53.ipk
+wc -c /tmp/wayline_0.1.0-alpha.2_aarch64_cortex-a53.ipk
+sha256sum /tmp/wayline_0.1.0-alpha.2_aarch64_cortex-a53.ipk
 ```
 
 8. Install the package:
 
 ```sh
 opkg update
-opkg install /tmp/wayline_0.1.0-alpha.1_aarch64_cortex-a53.ipk
+opkg install /tmp/wayline_0.1.0-alpha.2_aarch64_cortex-a53.ipk
 ```
 
 9. Refresh the admin UI.
 10. Open **VPN → Wayline → Settings**.
-11. Select the connected tunnels.
+11. Select the tunnels to monitor.
 12. Enable monitoring.
 
 Installation uses SSH because the factory plugin catalog does not list this package.
@@ -148,7 +161,7 @@ The [research](docs/research.md) and [firmware evidence](docs/firmware-evidence.
 
 These screenshots use labeled sample data.
 
-![Wayline overview](artifacts/screenshots/wayline-overview.jpg)
+![Wayline tunnel controls](artifacts/screenshots/wayline-lifecycle.jpg)
 
 ![Wayline settings](artifacts/screenshots/wayline-settings.jpg)
 

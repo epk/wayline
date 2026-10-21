@@ -8,6 +8,7 @@ const CONTRACT: &str = "9c8a9102c046ff12ba95e4c9a03b4e5392c461584c5d4d8ab9c5591a
 
 pub struct PathInfo {
     pub id: String,
+    pub key: String,
     pub name: String,
     pub interface: String,
     pub source: String,
@@ -16,9 +17,17 @@ pub struct PathInfo {
 }
 
 pub struct Inventory {
+    pub tunnels: Vec<TunnelInfo>,
     pub paths: Vec<PathInfo>,
     pub wan: Option<PathInfo>,
     pub rules: Vec<(String, Value)>,
+}
+
+pub struct TunnelInfo {
+    pub id: String,
+    pub key: String,
+    pub name: String,
+    pub enabled: bool,
 }
 
 pub fn contract() -> bool {
@@ -38,11 +47,18 @@ pub fn bus(object: &str, method: &str, params: &Value) -> Result<Value> {
 }
 
 pub fn native(method: &str, params: &Value) -> Result<Value> {
-    let response = bus(
-        "gl-session",
-        "call",
-        &json!({"module":"vpn-client","func":method,"params":params}),
-    )?;
+    let params = json!({"module":"vpn-client","func":method,"params":params}).to_string();
+    let (timeout, deadline) = if method == "set_tunnel" {
+        ("30", 35)
+    } else {
+        ("3", 4)
+    };
+    let response: Value = serde_json::from_str(&text(
+        "ubus",
+        &["-t", timeout, "call", "gl-session", "call", &params],
+        262_144,
+        deadline,
+    )?)?;
     response
         .get("result")
         .cloned()
@@ -66,6 +82,7 @@ fn number(value: &str) -> Option<u32> {
 
 fn path(
     section: &str,
+    key: &str,
     name: &str,
     interface: &Value,
     network: &Value,
@@ -91,10 +108,10 @@ fn path(
         number(mark_text)?
     };
     let profile = interface["config"].as_str().unwrap_or_default();
-    let identity =
-        digest(format!("{section}|{name}|{device}|{source}|{mark}|{profile}").as_bytes());
+    let identity = digest(format!("{key}|{name}|{device}|{source}|{mark}|{profile}").as_bytes());
     Some(PathInfo {
         id: section.into(),
+        key: key.into(),
         name: section.into(),
         interface: device.into(),
         source: source.into(),
@@ -115,34 +132,136 @@ pub fn inventory() -> Result<Inventory> {
         .collect();
     rules.sort_by_key(|(_, value)| value[".index"].as_u64().unwrap_or(u64::MAX));
     let mut paths = Vec::new();
+    let mut tunnels = Vec::new();
     for (id, rule) in &rules {
-        if rule["enabled"] != "1" || !settings::id(id) {
+        if !settings::id(id) || ![Some("0"), Some("1")].contains(&rule["enabled"].as_str()) {
             continue;
         }
-        let Some(name) = rule["via"].as_str() else {
+        let name = rule["via"].as_str().unwrap_or_default();
+        let interface = &network[name];
+        let Some(number) = rule["tunnel_id"]
+            .as_str()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+        else {
             continue;
         };
-        let interface = &network[name];
-        if ![Some("wgclient"), Some("ovpnclient")].contains(&interface["proto"].as_str())
-            || interface["disabled"] == "1"
+        let key = format!("vpn:{number}");
+        ensure!(
+            !tunnels.iter().any(|tunnel: &TunnelInfo| tunnel.key == key),
+            "Duplicate native tunnel number."
+        );
+        if ![Some("wireguard"), Some("openvpn")].contains(&rule["via_type"].as_str())
+            && ![Some("wgclient"), Some("ovpnclient")].contains(&interface["proto"].as_str())
         {
             continue;
         }
-        if let Some(mut item) = path(id, name, interface, &network, false) {
-            if let Some(label) = rule["name"].as_str().filter(|text| {
+        let label = rule["name"]
+            .as_str()
+            .filter(|text| {
                 !text.is_empty() && text.len() <= 80 && !text.chars().any(char::is_control)
-            }) {
-                item.name = label.into();
-            }
+            })
+            .unwrap_or(id);
+        tunnels.push(TunnelInfo {
+            id: id.clone(),
+            key: key.clone(),
+            name: label.into(),
+            enabled: rule["enabled"] == "1",
+        });
+        if rule["enabled"] != "1" || interface["disabled"] == "1" {
+            continue;
+        }
+        if let Some(mut item) = path(id, &key, name, interface, &network, false) {
+            item.name = label.into();
             paths.push(item);
         }
     }
     ensure!(
-        paths.len() <= 8,
-        "More than eight active tunnels are unsupported."
+        tunnels.len() <= 8,
+        "More than eight VPN tunnels are unsupported."
     );
-    let wan = path("wan", "wan", &network["wan"], &network, true);
-    Ok(Inventory { paths, wan, rules })
+    let wan = path("wan", "wan", "wan", &network["wan"], &network, true);
+    Ok(Inventory {
+        tunnels,
+        paths,
+        wan,
+        rules,
+    })
+}
+
+pub fn normalize(settings: &mut Settings, inventory: &Inventory) {
+    for id in &mut settings.tunnels {
+        if let Some(tunnel) = inventory.tunnels.iter().find(|item| item.id == *id) {
+            id.clone_from(&tunnel.key);
+        }
+    }
+}
+
+pub fn native_tunnel<'a>(
+    native: &'a Value,
+    inventory: &Inventory,
+    selected: &str,
+) -> Result<&'a Value> {
+    let tunnels = native["tunnels"]
+        .as_array()
+        .context("Unknown native tunnel schema.")?;
+    ensure!(
+        tunnels.len() <= 8,
+        "More than eight VPN tunnels are unsupported."
+    );
+    let mut ids = std::collections::BTreeSet::new();
+    let mut numbers = std::collections::BTreeSet::new();
+    for tunnel in tunnels {
+        let id = tunnel["id"]
+            .as_str()
+            .context("Unknown native tunnel identity.")?;
+        let number = tunnel["tunnel_id"]
+            .as_u64()
+            .context("Unknown native tunnel number.")?;
+        ensure!(
+            settings::id(id)
+                && number > 0
+                && u32::try_from(number).is_ok()
+                && ids.insert(id)
+                && numbers.insert(number),
+            "Ambiguous native tunnel identity."
+        );
+    }
+    let tunnel = tunnels
+        .iter()
+        .find(|item| item["id"] == selected)
+        .context("The tunnel is unavailable.")?;
+    let configured = inventory
+        .tunnels
+        .iter()
+        .find(|item| item.id == selected)
+        .context("The VPN tunnel is unavailable.")?;
+    let rule = &inventory
+        .rules
+        .iter()
+        .find(|(id, _)| id == selected)
+        .context("The tunnel rule is unavailable.")?
+        .1;
+    ensure!(
+        [Some("wireguard"), Some("openvpn")].contains(&tunnel["via"]["type"].as_str())
+            && tunnel["enabled"].as_bool() == Some(configured.enabled)
+            && rule["tunnel_id"]
+                .as_str()
+                .and_then(|id| id.parse::<u64>().ok())
+                == tunnel["tunnel_id"].as_u64(),
+        "The native tunnel state differs from its configuration."
+    );
+    Ok(tunnel)
+}
+
+pub fn startable(tunnel: &Value) -> bool {
+    tunnel["via"]["configs"].as_array().is_some_and(|groups| {
+        groups.iter().any(|group| {
+            group["id_list"]
+                .as_array()
+                .is_some_and(|ids| !ids.is_empty())
+        })
+    })
 }
 
 impl PathInfo {
@@ -162,7 +281,7 @@ pub fn monitor(settings: &Settings, inventory: &Inventory) -> Value {
     }
     let mut series = Vec::new();
     for item in &inventory.paths {
-        if settings.tunnels.contains(&item.id) {
+        if settings.tunnels.contains(&item.key) || settings.tunnels.contains(&item.id) {
             for target in &targets {
                 series.push(measurement(item, &target.to_string()));
             }
@@ -215,8 +334,10 @@ pub fn safe_order(
         "peer_id",
         "group_id",
         "client_id",
+        "profiles",
         "name",
         "options_in_used",
+        "enabled",
     ];
     let mut signature = None;
     let mut ids = Vec::new();
@@ -224,10 +345,12 @@ pub fn safe_order(
         let id = tunnel["id"]
             .as_str()
             .context("Unknown native tunnel identity.")?;
+        native_tunnel(native, inventory, id)?;
         ensure!(
             settings::id(id)
                 && !ids.iter().any(|other| other == id)
-                && inventory.paths.iter().any(|item| item.id == id),
+                && inventory.tunnels.iter().any(|item| item.id == id
+                    && (!item.enabled || inventory.paths.iter().any(|path| path.id == id))),
             "The tunnel group is not eligible."
         );
         let rule = &inventory
@@ -259,6 +382,10 @@ pub fn safe_order(
         }
         ids.push(id.to_owned());
     }
+    ensure!(
+        inventory.paths.iter().any(|item| item.id == selected),
+        "The selected tunnel is not connected."
+    );
     let index = ids
         .iter()
         .position(|id| id == selected)

@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "waylined"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "futures-util",
  "monoio",
@@ -834,6 +834,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flate2",
+ "rustix",
  "semver",
  "serde_json",
  "tar",

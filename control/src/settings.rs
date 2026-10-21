@@ -115,7 +115,11 @@ impl Settings {
             "Use one to four unicast IPv4 targets."
         );
         ensure!(
-            self.tunnels.iter().all(|value| id(value)),
+            self.tunnels.iter().all(|value| id(value)
+                || value
+                    .strip_prefix("vpn:")
+                    .and_then(|number| number.parse::<u32>().ok())
+                    .is_some_and(|number| number > 0)),
             "Invalid tunnel identity."
         );
         for (index, value) in self.tunnels.iter().enumerate() {

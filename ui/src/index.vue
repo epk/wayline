@@ -48,7 +48,7 @@
       <fieldset>
         <legend>Tunnels to monitor</legend>
         <label v-for="t in state.tunnels" :key="t.id" class="vph-check"
-          ><input type="checkbox" :value="t.id" v-model="draft.tunnels" />{{ t.name }}</label
+          ><input type="checkbox" :value="t.monitorId" v-model="draft.tunnels" />{{ t.name }}</label
         >
       </fieldset>
       <hr />
@@ -170,7 +170,9 @@
                 >
                   {{ t.name }}</button
                 ><span v-if="t.preferred" class="vph-badge">Preferred</span>
-                <div class="vph-muted vph-status">{{ t.stateLabel }} · {{ t.age }} ago</div>
+                <div class="vph-muted vph-status">
+                  {{ t.stateLabel }}<span v-if="t.age !== 'unknown'"> · {{ t.age }} ago</span>
+                </div>
               </td>
               <td class="vph-number">
                 {{ latency(t.median) }}<small v-if="t.median !== null"> ms</small>
@@ -187,7 +189,7 @@
                 </svg>
               </td>
               <td class="vph-action">
-                <span v-if="t.preferred" class="vph-muted">In use</span
+                <span v-if="t.preferred" class="vph-muted">Highest priority</span
                 ><button
                   v-else
                   class="vph-button"
@@ -195,19 +197,33 @@
                   :title="t.reason || ''"
                   @click="selectExit(t)"
                 >
-                  {{ busyTunnel === t.id ? 'Applying…' : 'Use exit' }}</button
-                ><small v-if="!t.eligible">{{ t.reason }}</small>
+                  {{ busyTunnel === t.id ? 'Applying…' : 'Use exit' }}
+                </button>
+                <button
+                  class="vph-button"
+                  :disabled="busy || !t.controllable || !state.capabilities.control"
+                  :aria-label="(t.enabled ? 'Stop ' : 'Start ') + t.name"
+                  @click="setTunnelEnabled(t)"
+                >
+                  {{ t.enabled ? 'Stop' : 'Start' }}
+                </button>
+                <small v-if="!t.eligible && t.connected">{{ t.reason }}</small>
+                <small v-if="!t.controllable">Native tunnel control is unavailable.</small>
               </td>
             </tr>
           </tbody>
         </table>
         <div v-if="!state.tunnels.length" class="vph-empty">
-          {{ loading ? 'Reading tunnel state…' : 'No connected tunnels available.' }}
+          {{ loading ? 'Reading tunnel state…' : 'No configured VPN tunnels available.' }}
         </div>
       </div>
       <p class="vph-muted">
         Preference changes apply to this traffic scope. Applications with existing connections may
         need to reconnect.
+      </p>
+      <p class="vph-muted">
+        Start and Stop use GL.iNet's VPN manager. Starting preserves priority. Stopping can permit
+        WAN traffic under your GL.iNet policy.
       </p>
     </template>
     <template v-else>
@@ -404,7 +420,7 @@ export default {
       state: {
         config: defaults(),
         tunnels: [],
-        capabilities: { configure: false, select: false },
+        capabilities: { configure: false, select: false, control: false },
         scope: '',
         revision: '',
       },
@@ -486,11 +502,13 @@ export default {
     call(method, params) {
       const request = this.api
         ? this.api[method](params || {})
-        : this.$rpcRequest('call', ['sid', 'wayline', method, params || {}]);
+        : this.$rpcRequest('call', ['sid', 'wayline', method, params || {}], {
+            timeout: method === 'set_tunnel_enabled' ? 45000 : 12000,
+          });
       return new Promise((resolve, reject) => {
         const timer = setTimeout(
           () => reject(Error('The request timed out. Refresh its status before another change.')),
-          12000,
+          method === 'set_tunnel_enabled' ? 45000 : 12000,
         );
         Promise.resolve(request).then(
           (value) => {
@@ -589,6 +607,29 @@ export default {
         this.busyTunnel = '';
       }
     },
+    async setTunnelEnabled(t) {
+      if (this.busy || !t.controllable || !this.state.capabilities.control) return;
+      this.busy = true;
+      this.error = '';
+      this.notice = t.enabled ? 'Stopping tunnel…' : 'Starting tunnel…';
+      try {
+        const result = await this.call('set_tunnel_enabled', {
+          section_id: t.id,
+          enabled: !t.enabled,
+          expected_revision: this.state.revision,
+        });
+        this.notice = result.enabled
+          ? 'Tunnel enabled. Connection and measurements can take time.'
+          : 'Tunnel stopped. GL.iNet traffic policy applies.';
+        if (result.monitor_pending) this.notice += ' Monitoring will reconcile within one minute.';
+      } catch (e) {
+        this.error =
+          'Tunnel outcome needs checking. ' + (e.message || 'Refresh before trying again.');
+      } finally {
+        await this.refresh();
+        this.busy = false;
+      }
+    },
     async installUpdate() {
       this.busy = true;
       try {
@@ -612,9 +653,16 @@ export default {
       }
     },
     async loadHistory() {
+      const request = ++this.historyRequest;
+      const selected = this.state.tunnels.find((tunnel) => tunnel.id === this.selectedTunnel);
+      if (selected && !selected.connected) {
+        this.history = [];
+        this.historyError = 'History is unavailable until this tunnel has a connected path.';
+        this.hover = null;
+        return;
+      }
       if (!this.selectedTunnel || (this.tab === 'diagnostics' && !this.state.config.diagnostics))
         return;
-      const request = ++this.historyRequest;
       try {
         const r = await this.call('get_history', {
           tunnel: this.selectedTunnel,
@@ -761,6 +809,8 @@ export default {
     'Segoe UI',
     sans-serif;
   width: 100%;
+  box-sizing: border-box;
+  min-width: 0;
   max-width: 1120px;
   margin: auto;
 }
@@ -931,7 +981,11 @@ export default {
 }
 .vph-action {
   text-align: right;
-  min-width: 108px;
+  min-width: 195px;
+}
+.vph-action > button + button,
+.vph-action > span + button {
+  margin-left: 8px;
 }
 .vph-action small {
   display: block;

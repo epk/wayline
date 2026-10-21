@@ -4,14 +4,15 @@
     home: 'Home · Amsterdam',
     backup: 'Backup · Frankfurt',
     tokyo: 'Tokyo',
+    zurich: 'Zurich',
     wan: 'Direct WAN',
   };
   let revision = 1;
   const state = {
-    version: '0.1.0-alpha.1',
+    version: '0.1.0-alpha.2',
     revision: '1',
     scope: 'All clients',
-    capabilities: { configure: true, select: true },
+    capabilities: { configure: true, select: true, control: true },
     config: {
       enabled: true,
       target: '1.1.1.1',
@@ -28,6 +29,9 @@
         id: 'home',
         name: names.home,
         preferred: true,
+        enabled: true,
+        connected: true,
+        controllable: true,
         stateLabel: 'Connected',
         age: '4s',
         median: 32,
@@ -40,6 +44,9 @@
         id: 'backup',
         name: names.backup,
         preferred: false,
+        enabled: true,
+        connected: true,
+        controllable: true,
         stateLabel: 'Connected',
         age: '7s',
         median: 48,
@@ -54,6 +61,9 @@
         id: 'tokyo',
         name: names.tokyo,
         preferred: false,
+        enabled: true,
+        connected: true,
+        controllable: true,
         stateLabel: 'Connected',
         age: '10s',
         median: 131,
@@ -65,6 +75,21 @@
           i > 37 && i < 42 ? null : 130 + Math.sin(i) * 17,
         ),
       },
+      {
+        id: 'zurich',
+        name: names.zurich,
+        preferred: false,
+        enabled: false,
+        connected: false,
+        controllable: true,
+        stateLabel: 'Stopped',
+        age: 'unknown',
+        median: null,
+        lost: 0,
+        samples: 0,
+        eligible: false,
+        recent: [],
+      },
     ],
     diagnostics: {
       '1.1.1.1': { home: 32, backup: 48, tokyo: 131, wan: 14 },
@@ -72,6 +97,7 @@
       '9.9.9.9': { home: 35, backup: 49, tokyo: 136, wan: 16 },
     },
   };
+  state.tunnels.forEach((tunnel) => (tunnel.monitorId = tunnel.id));
   const copy = (o) => JSON.parse(JSON.stringify(o));
   const delay = (o) => new Promise((resolve) => setTimeout(() => resolve(copy(o)), 180));
   function series(id, target, start, end, step) {
@@ -116,6 +142,28 @@
         state.revision = String(++revision);
       }
       return delay({ applied: true });
+    },
+    set_tunnel_enabled: async ({ section_id, enabled, expected_revision }) => {
+      if (expected_revision !== state.revision) throw Error('State changed. Refresh first.');
+      const tunnel = state.tunnels.find((item) => item.id === section_id);
+      if (!tunnel || !tunnel.controllable || typeof enabled !== 'boolean')
+        throw Error('The tunnel state is invalid.');
+      if (tunnel.enabled !== enabled) {
+        Object.assign(tunnel, {
+          enabled,
+          connected: false,
+          eligible: false,
+          stateLabel: enabled ? 'Enabled, offline' : 'Stopped',
+          age: 'unknown',
+          median: null,
+          recent: [],
+          samples: 0,
+          lost: 0,
+        });
+        state.revision = String(++revision);
+        Object.values(state.diagnostics).forEach((values) => (values[section_id] = null));
+      }
+      return delay({ applied: true, enabled });
     },
     get_history: ({ tunnel, target, start, end, step, include_wan }) =>
       Promise.resolve({

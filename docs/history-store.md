@@ -35,3 +35,7 @@ The store does not promise forensic completeness.
 
 Settings and profile identity form part of the series identity through discovered paths and targets.
 A changed interface, source, mark, or profile starts a separate history series.
+The series identity uses the stable native tunnel number.
+Native section replacement alone does not change this identity.
+The alpha.2 package starts a new history series for data that alpha.1 identified by section name.
+Current path history requires a connected path.

@@ -33,7 +33,7 @@ Resource measurements covered approximately 80 seconds after warmup.
 | RSS, from smaps_rollup | 528 KiB |
 | Threads | 1 |
 | File descriptors | 99 |
-| CPU, as a share of one core | 0.35% |
+| CPU, as a share of one core | 0.27% |
 | Monitor binary | 458,408 bytes |
 
 These values describe the VM workload.
@@ -52,7 +52,7 @@ Screenshots contain sample data.
 
 ## Native package sandbox
 
-The optional firmware sandbox runs the extracted image's opkg, ubusd, rpcd, and UCI services.
+The optional firmware sandbox runs the extracted image's opkg, ubusd, rpcd, UCI, native session service, and HTTP dispatcher.
 It uses an isolated Linux temporary filesystem and a minimal first-boot network configuration.
 Vendor files remain outside Git.
 
@@ -61,7 +61,18 @@ Settings reads and writes, stale-write rejection, unchanged-write avoidance, and
 Lua's empty-list input passed the Rust settings boundary.
 An offline update request reported failure through the UI state.
 The [native record](../artifacts/validation/native-package.json) lists these results.
-The sandbox does not run the native browser authentication flow or change a real tunnel's priority.
+Native Start and Stop requests passed with persisted enabled-state checks.
+Repeated requests, rejected stale inputs, invalid booleans, unknown tunnels, and missing profiles left policy unchanged.
+The checks confirmed unchanged priority, other groups, and the separate default group.
+Monitoring choices survived native section replacement.
+
+An isolated administrator login passed the native challenge flow.
+Authenticated bridge reads and tunnel control passed with one HTTP worker.
+Missing sessions, revoked sessions, and local requests without an administrator session failed.
+The bridge uses GL.iNet's asynchronous process interface.
+These checks do not establish physical VPN connectivity or client egress.
+The native record identifies the local package.
+Actions builds a separate release package.
 
 To repeat this check with a verified extracted image:
 
