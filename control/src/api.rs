@@ -215,7 +215,7 @@ fn tunnels(
     let mut tunnels = Vec::new();
     for tunnel in &inventory.tunnels {
         let path = inventory.paths.iter().find(|path| path.id == tunnel.id);
-        let item = path.and_then(|path| measurement(snapshot, path, &config.target));
+        let item = path.and_then(|path| measurement(snapshot, path, config.primary()));
         let eligible = compatible
             && item.is_some_and(|item| {
                 item.state.live()
@@ -300,7 +300,7 @@ fn uplink_views(
                 .as_ref()
                 .is_some_and(|wan| wan.name == uplink.name);
             let path = inventory.wan.as_ref().filter(|_| active).unwrap_or(uplink);
-            let item = measurement(snapshot, path, &config.target);
+            let item = measurement(snapshot, path, config.primary());
             UplinkView {
                 id: uplink.id.clone(),
                 interface: uplink.name.clone(),

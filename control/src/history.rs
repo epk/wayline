@@ -43,7 +43,8 @@ pub struct Query {
     start: u64,
     end: u64,
     step: usize,
-    target: Target,
+    #[serde(default)]
+    target: Option<Target>,
     tunnel: String,
     #[serde(default)]
     include_wan: bool,
@@ -519,6 +520,7 @@ pub fn query(
         "History range exceeds its limit."
     );
     let known = known_prefixes();
+    let target = query.target.as_ref().unwrap_or_else(|| config.primary());
     let mut subjects: Vec<Subject> = Vec::new();
     for tunnel in &inventory.tunnels {
         let prefix = tunnel_prefix(&tunnel.key);
@@ -528,7 +530,7 @@ pub fn query(
             subjects.push(Subject {
                 id: tunnel.id.clone(),
                 name: tunnel.name.clone(),
-                identity: series_id(&prefix, &query.target),
+                identity: series_id(&prefix, target),
             });
         }
     }
@@ -549,22 +551,21 @@ pub fn query(
             .collect();
         subjects.extend(servers);
     }
-    if query.uplinks && config.diagnostics && config.direct_wan {
+    if query.uplinks && config.direct_wan {
         subjects.extend(inventory.standby_uplinks().map(|uplink| Subject {
             id: uplink.id.clone(),
             name: format!("{} uplink", uplink.name),
-            identity: series_id(uplink.prefix(), &query.target),
+            identity: series_id(uplink.prefix(), target),
         }));
     }
     if query.include_wan
-        && config.diagnostics
         && config.direct_wan
         && let Some(wan) = &inventory.wan
     {
         subjects.push(Subject {
             id: wan.id.clone(),
             name: wan.name.clone(),
-            identity: series_id(wan.prefix(), &query.target),
+            identity: series_id(wan.prefix(), target),
         });
     }
     let identities: Vec<String> = subjects

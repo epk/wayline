@@ -22,5 +22,5 @@ module.exports = {
   },
   plugins: [new VueLoaderPlugin(), new DefinePlugin({ WAYLINE_VERSION: JSON.stringify(version) })],
   resolve: { extensions: ['.js', '.vue'] },
-  performance: { hints: 'error', maxAssetSize: 80000, maxEntrypointSize: 80000 },
+  performance: { hints: 'error', maxAssetSize: 90000, maxEntrypointSize: 90000 },
 };

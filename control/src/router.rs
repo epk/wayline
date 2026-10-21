@@ -517,7 +517,7 @@ pub fn monitored<'a>(
 }
 
 pub const fn endpoints_enabled(settings: &Settings) -> bool {
-    settings.diagnostics && settings.direct_wan && settings.endpoint_diagnostics
+    settings.endpoint_diagnostics
 }
 
 pub fn endpoints(settings: &Settings, inventory: &Inventory) -> Vec<Endpoint> {
@@ -536,14 +536,11 @@ pub fn endpoints(settings: &Settings, inventory: &Inventory) -> Vec<Endpoint> {
 
 pub fn hosts(settings: &Settings, inventory: &Inventory) -> Vec<String> {
     let mut hosts = BTreeSet::new();
-    for target in std::iter::once(&settings.target)
-        .chain(&settings.targets)
-        .chain(
-            endpoints(settings, inventory)
-                .iter()
-                .map(|endpoint| &endpoint.target),
-        )
-    {
+    for target in settings.targets.iter().chain(
+        endpoints(settings, inventory)
+            .iter()
+            .map(|endpoint| &endpoint.target),
+    ) {
         if let Target::Host(host) = target {
             hosts.insert(host.clone());
         }
@@ -552,31 +549,30 @@ pub fn hosts(settings: &Settings, inventory: &Inventory) -> Vec<String> {
 }
 
 pub fn monitor(settings: &Settings, inventory: &Inventory, resolved: &Resolved) -> Config {
-    let mut targets = vec![settings.target.clone()];
-    if settings.diagnostics {
-        for target in &settings.targets {
-            if !targets.contains(target) {
-                targets.push(target.clone());
-            }
-        }
-    }
     let mut wanted = Vec::new();
     for item in monitored(settings, inventory) {
-        wanted.extend(targets.iter().map(|target| (item, target.clone(), None)));
+        wanted.extend(
+            settings
+                .targets
+                .iter()
+                .map(|target| (item, target.clone(), None)),
+        );
     }
-    if settings.diagnostics && settings.direct_wan {
-        if let Some(wan) = &inventory.wan {
+    if let Some(wan) = &inventory.wan {
+        if settings.direct_wan {
             wanted.extend(
                 settings
                     .targets
                     .iter()
                     .map(|target| (wan, target.clone(), None)),
             );
-            wanted.extend(endpoints(settings, inventory).into_iter().map(|endpoint| {
-                let id = endpoint_series(&endpoint.key);
-                (wan, endpoint.target, Some(id))
-            }));
         }
+        wanted.extend(endpoints(settings, inventory).into_iter().map(|endpoint| {
+            let id = endpoint_series(&endpoint.key);
+            (wan, endpoint.target, Some(id))
+        }));
+    }
+    if settings.direct_wan {
         for uplink in inventory.standby_uplinks() {
             wanted.extend(
                 settings
@@ -599,7 +595,7 @@ pub fn monitor(settings: &Settings, inventory: &Inventory, resolved: &Resolved) 
         .take(MAX_SERIES)
         .collect();
     let target = resolved
-        .address(&settings.target)
+        .address(settings.primary())
         .or_else(|| tunnels.first().and_then(|tunnel| tunnel.target))
         .unwrap_or(Ipv4Addr::new(1, 1, 1, 1));
     Config {
@@ -741,7 +737,6 @@ mod tests {
     fn monitor_skips_duplicates_and_unresolved_names() -> Result<()> {
         let mut settings = Settings {
             enabled: true,
-            diagnostics: true,
             direct_wan: true,
             endpoint_diagnostics: true,
             tunnels: vec!["vpn:a".into()],

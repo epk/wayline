@@ -3,33 +3,54 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{fmt, net::Ipv4Addr, path::Path, str::FromStr};
 
+const MAX_TARGETS: usize = 5;
+static FALLBACK: Target = Target::Address(Ipv4Addr::new(1, 1, 1, 1));
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Target {
     Address(Ipv4Addr),
     Host(String),
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[derive(Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "Each field represents an independent UI switch."
 )]
 pub struct Settings {
     pub enabled: bool,
-    pub target: Target,
     pub interval: u32,
-    #[serde(deserialize_with = "tunnel_list")]
     pub tunnels: Vec<String>,
-    pub diagnostics: bool,
     pub targets: Vec<Target>,
     pub direct_wan: bool,
     pub history_hours: u32,
     pub auto_updates: bool,
-    #[serde(default)]
     pub auto_exit: bool,
-    #[serde(default)]
     pub endpoint_diagnostics: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Stored files mirror the independent UI switches."
+)]
+struct Stored {
+    enabled: bool,
+    interval: u32,
+    #[serde(deserialize_with = "tunnel_list")]
+    tunnels: Vec<String>,
+    targets: Vec<Target>,
+    target: Option<Target>,
+    diagnostics: Option<bool>,
+    direct_wan: bool,
+    history_hours: u32,
+    auto_updates: bool,
+    #[serde(default)]
+    auto_exit: bool,
+    #[serde(default)]
+    endpoint_diagnostics: bool,
 }
 
 fn tunnel_list<'de, D: serde::Deserializer<'de>>(
@@ -42,14 +63,53 @@ fn tunnel_list<'de, D: serde::Deserializer<'de>>(
     serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
+impl TryFrom<Stored> for Settings {
+    type Error = anyhow::Error;
+
+    fn try_from(stored: Stored) -> Result<Self> {
+        let targets = if let Some(primary) = stored.target {
+            let mut targets = vec![primary];
+            if stored.diagnostics.unwrap_or(false) {
+                for target in stored.targets {
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                    }
+                }
+            }
+            targets.truncate(MAX_TARGETS);
+            targets
+        } else {
+            ensure!(stored.diagnostics.is_none(), "Unknown field diagnostics.");
+            stored.targets
+        };
+        Ok(Self {
+            enabled: stored.enabled,
+            interval: stored.interval,
+            tunnels: stored.tunnels,
+            targets,
+            direct_wan: stored.direct_wan,
+            history_hours: stored.history_hours,
+            auto_updates: stored.auto_updates,
+            auto_exit: stored.auto_exit,
+            endpoint_diagnostics: stored.endpoint_diagnostics,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Settings {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Self::try_from(Stored::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
-            target: Target::Address(Ipv4Addr::new(1, 1, 1, 1)),
             interval: 15,
             tunnels: Vec::new(),
-            diagnostics: false,
             targets: vec![
                 Target::Address(Ipv4Addr::new(1, 1, 1, 1)),
                 Target::Address(Ipv4Addr::new(8, 8, 8, 8)),
@@ -147,6 +207,10 @@ impl Settings {
         Ok(value)
     }
 
+    pub fn primary(&self) -> &Target {
+        self.targets.first().unwrap_or(&FALLBACK)
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!([15, 30, 60].contains(&self.interval), "Invalid interval.");
         ensure!(
@@ -158,8 +222,8 @@ impl Settings {
             "Choose one to eight tunnels."
         );
         ensure!(
-            (1..=4).contains(&self.targets.len()),
-            "Use one to four targets."
+            (1..=MAX_TARGETS).contains(&self.targets.len()),
+            "Use one to five targets."
         );
         ensure!(
             self.tunnels.iter().all(|value| id(value)
@@ -185,10 +249,18 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::{Settings, Target};
-    use anyhow::Result;
+    use anyhow::{Result, ensure};
+
+    fn targets(values: &[&str]) -> Result<Vec<Target>> {
+        values.iter().map(|value| value.parse::<Target>()).collect()
+    }
+
+    fn listed(settings: &Settings) -> Vec<String> {
+        settings.targets.iter().map(ToString::to_string).collect()
+    }
 
     #[test]
-    fn targets() -> Result<()> {
+    fn targets_parse() -> Result<()> {
         assert!(matches!("1.1.1.1".parse::<Target>()?, Target::Address(_)));
         assert_eq!("Example.COM.".parse::<Target>()?.to_string(), "example.com");
         for bad in [
@@ -201,17 +273,78 @@ mod tests {
             "1.2.3",
             "::1",
         ] {
-            assert!(bad.parse::<Target>().is_err(), "{bad}");
+            ensure!(bad.parse::<Target>().is_err(), "{bad}");
         }
         Ok(())
     }
 
     #[test]
-    fn legacy_settings_load() -> Result<()> {
+    fn legacy_with_diagnostics_merges_targets() -> Result<()> {
+        let old = r#"{"enabled":false,"target":"1.1.1.1","interval":15,"tunnels":{},"diagnostics":true,"targets":["8.8.8.8","1.1.1.1","9.9.9.9"],"directWan":false,"historyHours":24,"autoUpdates":false}"#;
+        let settings: Settings = serde_json::from_str(old)?;
+        settings.validate()?;
+        assert_eq!(listed(&settings), ["1.1.1.1", "8.8.8.8", "9.9.9.9"]);
+        assert!(!settings.auto_exit && !settings.endpoint_diagnostics);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_without_diagnostics_keeps_only_target() -> Result<()> {
         let old = r#"{"enabled":false,"target":"1.1.1.1","interval":15,"tunnels":{},"diagnostics":false,"targets":["8.8.8.8"],"directWan":false,"historyHours":24,"autoUpdates":false}"#;
         let settings: Settings = serde_json::from_str(old)?;
         settings.validate()?;
-        assert!(!settings.auto_exit && !settings.endpoint_diagnostics);
+        assert_eq!(listed(&settings), ["1.1.1.1"]);
+        assert_eq!(settings.primary().to_string(), "1.1.1.1");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_merge_is_capped_at_five() -> Result<()> {
+        let old = r#"{"enabled":false,"target":"9.9.9.9","interval":15,"tunnels":{},"diagnostics":true,"targets":["1.1.1.1","8.8.8.8","4.4.4.4","5.5.5.5","6.6.6.6"],"directWan":false,"historyHours":24,"autoUpdates":false}"#;
+        let settings: Settings = serde_json::from_str(old)?;
+        settings.validate()?;
+        assert_eq!(
+            listed(&settings),
+            ["9.9.9.9", "1.1.1.1", "8.8.8.8", "4.4.4.4", "5.5.5.5"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn new_format_round_trips() -> Result<()> {
+        let settings = Settings::default();
+        let json = serde_json::to_string(&settings)?;
+        ensure!(!json.contains("\"target\"") && !json.contains("diagnostics"));
+        let loaded: Settings = serde_json::from_str(&json)?;
+        ensure!(loaded == settings, "The round trip changed settings.");
+        loaded.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn validation_rejects_bad_target_lists() -> Result<()> {
+        let with = |values: &[&str]| -> Result<Settings> {
+            Ok(Settings {
+                targets: targets(values)?,
+                ..Settings::default()
+            })
+        };
+        ensure!(with(&[])?.validate().is_err(), "Zero targets accepted.");
+        ensure!(
+            with(&[
+                "1.1.1.1", "8.8.8.8", "9.9.9.9", "4.4.4.4", "5.5.5.5", "6.6.6.6",
+            ])?
+            .validate()
+            .is_err(),
+            "Six targets accepted."
+        );
+        with(&["1.1.1.1", "8.8.8.8", "9.9.9.9", "4.4.4.4", "5.5.5.5"])?.validate()?;
+        ensure!(
+            with(&["1.1.1.1", "8.8.8.8", "1.1.1.1"])?
+                .validate()
+                .is_err(),
+            "Duplicate targets accepted."
+        );
         Ok(())
     }
 }

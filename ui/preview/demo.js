@@ -43,10 +43,8 @@
     capabilities: { configure: true, select: true, control: true },
     config: {
       enabled: true,
-      target: '1.1.1.1',
       interval: 15,
       tunnels: ['home', 'backup', 'tokyo'],
-      diagnostics: true,
       targets: ['1.1.1.1', '9.9.9.9', 'example.com', 'missing.invalid'],
       directWan: true,
       historyHours: 24,
@@ -63,7 +61,6 @@
           interface: 'wg-home',
           ip: '203.0.113.5',
           location: 'CA',
-          colo: 'YYZ',
           error: null,
         },
         {
@@ -72,7 +69,6 @@
           interface: 'wg-backup',
           ip: '198.51.100.7',
           location: 'DE',
-          colo: 'FRA',
           error: null,
         },
         {
@@ -81,7 +77,6 @@
           interface: 'wg-tokyo',
           ip: null,
           location: null,
-          colo: null,
           error: 'The IP check timed out after 6 seconds.',
         },
         {
@@ -90,7 +85,6 @@
           interface: wanDown ? null : 'eth1',
           ip: wanDown ? null : '203.0.113.80',
           location: wanDown ? null : 'US',
-          colo: wanDown ? null : 'LAX',
           error: wanDown ? 'Direct WAN is unavailable.' : null,
         },
       ],
@@ -349,6 +343,9 @@
           ),
     set_config: async ({ config, expected_revision }) => {
       if (expected_revision !== state.revision) throw Error('State changed. Refresh first.');
+      const known = Object.keys(state.config);
+      if (Object.keys(config).some((key) => !known.includes(key)))
+        throw Error('The settings contain an unknown field.');
       state.config = copy(config);
       state.revision = String(++revision);
       return delay({ applied: true });
