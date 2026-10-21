@@ -603,112 +603,22 @@
           </div>
         </div>
       </header>
-      <div class="vph-chart" ref="chart" @mouseleave="hover = null">
-        <svg
-          :viewBox="'0 0 ' + chartWidth + ' 236'"
-          role="img"
-          tabindex="0"
-          :aria-label="
-            'Latency to ' +
-            selectedTarget +
-            ' through each tunnel. Arrow keys pan, Escape returns to now.'
-          "
-          @pointerdown="pointerDown"
-          @pointermove="pointerMove"
-          @pointerup="pointerUp"
-          @pointercancel="drag = null"
-          @dblclick="choosePreset(preset)"
-          @keydown="keyNav"
-          @blur="hover = null"
-        >
-          <title>Latency in milliseconds over time</title>
-          <desc>
-            Each line shows one tunnel's median latency. The highlighted tunnel also shows its
-            minimum to maximum band. Missing measurements appear as gaps.
-          </desc>
-          <g v-for="tick in [0, 1, 2, 3, 4]" :key="tick">
-            <line
-              x1="45"
-              :x2="chartWidth - 18"
-              :y1="chartY((tick * yMax) / 4)"
-              :y2="chartY((tick * yMax) / 4)"
-              class="vph-grid"
-            />
-            <text x="35" :y="chartY((tick * yMax) / 4) + 4" text-anchor="end">
-              {{ Math.round((tick * yMax) / 4) }}
-            </text>
-          </g>
-          <text x="12" y="14">ms</text>
-          <g
-            v-for="series in drawOrder"
-            :key="series.id"
-            :class="{
-              'vph-wan-series': series.id === 'wan',
-              'vph-uplink-series': isUplink(series),
-              'vph-endpoint-series': isServer(series),
-              'vph-series-selected': isSelected(series),
-              'vph-series-dim': isDimmed(series),
-            }"
-            :style="{ '--series': seriesColor(series) }"
-          >
-            <path v-if="hasBand(series)" :d="band(series.points)" class="vph-band" />
-            <path :d="line(series.points)" class="vph-line" />
-            <circle
-              v-for="dot in dots(series.points)"
-              :key="dot.key"
-              :cx="dot.x"
-              :cy="dot.y"
-              r="2.5"
-              class="vph-dot"
-            />
-          </g>
-          <g
-            v-for="(m, i) in markerList"
-            :key="i + ':' + m.at"
-            class="vph-marker"
-            role="img"
-            tabindex="0"
-            :aria-label="m.text"
-            @mouseenter="showMarker(m)"
-            @focus="showMarker(m)"
-            @blur="hover = null"
-          >
-            <line :x1="chartX(m.at)" :x2="chartX(m.at)" y1="24" y2="200" class="vph-marker-line" />
-            <circle :cx="chartX(m.at)" cy="24" r="3" class="vph-marker-dot" />
-          </g>
-          <text
-            v-for="fraction in [0, 0.5, 1]"
-            :key="fraction"
-            :x="45 + fraction * (chartWidth - 63)"
-            y="224"
-            :text-anchor="fraction === 0 ? 'start' : fraction === 1 ? 'end' : 'middle'"
-          >
-            {{ clock(windowStart + fraction * range * 60000) }}
-          </text>
-          <rect
-            v-if="selection"
-            class="vph-select"
-            :x="selection.x"
-            y="24"
-            :width="selection.width"
-            height="176"
-          />
-          <line v-if="hover" :x1="hover.x" :x2="hover.x" y1="24" y2="200" class="vph-guide" />
-        </svg>
+      <div
+        class="vph-chart"
+        ref="chart"
+        tabindex="0"
+        role="img"
+        :aria-label="
+          'Latency to ' +
+          selectedTarget +
+          ' through each tunnel. Arrow keys pan, Escape returns to now.'
+        "
+        @keydown="keyNav"
+        @blur="hideTip"
+      >
+        <div ref="plot" class="vph-plot"></div>
         <div v-if="chartNote" class="vph-chart-note" role="status">{{ chartNote }}</div>
-        <div v-if="hover" role="status" class="vph-tooltip" :style="tipStyle">
-          <strong>{{ clock(hover.at) }}</strong>
-          <div v-if="hover.marker" class="vph-tip-event">{{ hover.marker }}</div>
-          <div v-for="row in hoverRows" :key="row.id" :class="{ 'vph-tip-selected': row.selected }">
-            <span
-              class="vph-swatch vph-tip-swatch"
-              :class="{ 'vph-swatch-wan': row.wan }"
-              :style="{ '--series': row.color }"
-              aria-hidden="true"
-            ></span
-            >{{ row.name }}: {{ row.text }}
-          </div>
-        </div>
+        <div ref="tip" class="vph-tooltip" role="status" hidden></div>
       </div>
       <div class="vph-chart-footer">
         <div v-if="legendItems.length" class="vph-legend-block">
@@ -786,6 +696,8 @@
 </template>
 
 <script>
+import 'uplot/dist/uPlot.min.css';
+
 const defaults = () => ({
   enabled: false,
   interval: 15,
@@ -804,6 +716,28 @@ const validTarget = (value) =>
   value.length <= 253 &&
   /^[A-Za-z0-9.-]+$/.test(value);
 const isNumber = (value) => typeof value === 'number' && Number.isFinite(value);
+const chartHeight = 230;
+const frozenSeries = (items) =>
+  Object.freeze(
+    items.map((item) => Object.freeze({ ...item, points: Object.freeze(item.points) })),
+  );
+const soloIndexes = (values) => {
+  const found = [];
+  values.forEach((value, i) => {
+    if (isNumber(value) && !isNumber(values[i - 1]) && !isNumber(values[i + 1])) found.push(i);
+  });
+  return found;
+};
+const withAlpha = (color, alpha) => {
+  const context = document.createElement('canvas').getContext('2d');
+  context.fillStyle = color;
+  const value = context.fillStyle;
+  const hex = /^#([0-9a-f]{6})$/i.exec(value);
+  const rgb = hex
+    ? [0, 2, 4].map((i) => parseInt(hex[1].slice(i, i + 2), 16))
+    : (value.match(/[\d.]+/g) || [0, 0, 0]).slice(0, 3).map(Number);
+  return 'rgba(' + rgb.join(', ') + ', ' + alpha + ')';
+};
 const settingsFrom = (source) => {
   const settings = defaults();
   Object.keys(settings).forEach((key) => {
@@ -895,10 +829,7 @@ export default {
       range: 60,
       preset: 60,
       offset: 0,
-      drag: null,
       anchor: Math.floor(Date.now() / 60000) * 60000,
-      chartWidth: 720,
-      hover: null,
       timer: null,
       stopped: false,
       historyRequest: 0,
@@ -912,12 +843,6 @@ export default {
     };
   },
   computed: {
-    tipStyle() {
-      const x = this.hover ? this.hover.x : 0;
-      return x > this.chartWidth / 2
-        ? { left: x - 12 + 'px', transform: 'translateX(-100%)' }
-        : { left: x + 12 + 'px' };
-    },
     compat() {
       const c = this.state.compat || {};
       const level = ['monitoring', 'unsupported'].includes(c.level) ? c.level : 'full';
@@ -992,13 +917,6 @@ export default {
     },
     primarySelected() {
       return this.selectedTarget === this.primary;
-    },
-    selection() {
-      if (!this.drag) return null;
-      return {
-        x: Math.min(this.drag.from, this.drag.to),
-        width: Math.abs(this.drag.to - this.drag.from),
-      };
     },
     exitLatency() {
       const t = this.exitTunnel;
@@ -1148,30 +1066,8 @@ export default {
     windowStart() {
       return this.anchor - (this.offset + this.range) * 60000;
     },
-    yMax() {
-      let n = 25;
-      this.visibleHistory.forEach((s) =>
-        s.points.forEach((p) => {
-          if (isNumber(p.max)) n = Math.max(n, p.max);
-          if (isNumber(p.median)) n = Math.max(n, p.median);
-        }),
-      );
-      return Math.ceil((n * 1.15) / 25) * 25;
-    },
     endpointHistory() {
       return !!this.state.config.endpointDiagnostics;
-    },
-    visibleHistory() {
-      if (!this.isolated.length) return this.history;
-      return this.history.filter((s) => this.isolated.includes(this.ownerOf(s)));
-    },
-    drawOrder() {
-      const rank = (s) => {
-        if (this.isServer(s)) return 0;
-        if (s.id === 'wan' || this.isUplink(s)) return 1;
-        return this.isSelected(s) ? 3 : 2;
-      };
-      return this.visibleHistory.slice().sort((a, b) => rank(a) - rank(b));
     },
     wanGraph() {
       return !!(this.state.config.directWan && this.wanAvailable);
@@ -1204,59 +1100,14 @@ export default {
           };
         });
     },
-    hoverRows() {
-      if (!this.hover) return [];
-      const valueAt = (s) => {
-        let nearest = null;
-        for (const p of s.points)
-          if (!nearest || Math.abs(p.at - this.hover.at) < Math.abs(nearest.at - this.hover.at))
-            nearest = p;
-        return nearest && isNumber(nearest.median) ? nearest.median : null;
-      };
-      const tunnels = this.visibleHistory
-        .filter((s) => !this.isServer(s) && !this.isUplink(s) && s.id !== 'wan')
-        .map((s) => {
-          const server = this.visibleHistory.find(
-            (v) => this.isServer(v) && this.ownerOf(v) === s.id,
-          );
-          const through = valueAt(s);
-          const toServer = server ? valueAt(server) : null;
-          let text =
-            through === null
-              ? 'No measurement through the tunnel'
-              : this.ms(through) + ' through the tunnel';
-          if (toServer !== null) text += ', ' + this.ms(toServer) + ' to its server';
-          return {
-            id: s.id,
-            name: this.seriesName(s),
-            color: this.seriesColor(s),
-            selected: this.isSelected(s),
-            wan: false,
-            value: through,
-            text,
-          };
-        });
-      const others = this.visibleHistory
-        .filter((s) => s.id === 'wan' || this.isUplink(s))
-        .map((s) => {
-          const value = valueAt(s);
-          return {
-            id: s.id,
-            name: this.seriesName(s),
-            color: this.seriesColor(s),
-            selected: false,
-            wan: true,
-            value,
-            text: value === null ? 'No measurement' : this.ms(value),
-          };
-        });
-      return tunnels.concat(others).sort((a, b) => {
-        if (a.value === null || b.value === null) return (a.value === null) - (b.value === null);
-        return b.value - a.value || a.name.localeCompare(b.name);
-      });
-    },
   },
   watch: {
+    isolated() {
+      this.applyVisibility();
+    },
+    selectedTunnel() {
+      this.applyVisibility();
+    },
     error(value) {
       if (value) this.$nextTick(() => this.reveal());
     },
@@ -1266,6 +1117,12 @@ export default {
         this.noticeTimer = setTimeout(() => (this.notice = ''), 10000);
     },
   },
+  created() {
+    this.theme = {};
+    this.plot = null;
+    this.plotLines = [];
+    this.plotKey = '';
+  },
   mounted() {
     this.refresh();
     document.addEventListener('visibilitychange', this.visibility);
@@ -1273,7 +1130,11 @@ export default {
       typeof ResizeObserver === 'undefined'
         ? null
         : new ResizeObserver((entries) => {
-            if (entries[0]) this.chartWidth = Math.max(280, entries[0].contentRect.width);
+            if (entries[0] && this.plot)
+              this.plot.setSize({
+                width: Math.max(280, entries[0].contentRect.width),
+                height: chartHeight,
+              });
           });
     this.$nextTick(() => {
       if (this.$refs.chart && this.resize) this.resize.observe(this.$refs.chart);
@@ -1284,6 +1145,7 @@ export default {
     clearTimeout(this.timer);
     clearTimeout(this.noticeTimer);
     document.removeEventListener('visibilitychange', this.visibility);
+    this.destroyPlot();
     if (this.resize) this.resize.disconnect();
   },
   methods: {
@@ -1685,17 +1547,21 @@ export default {
           series.forEach((item) => {
             item.points = Array.isArray(item.points) ? item.points : [];
           });
-          this.history = series.filter(
-            (item) =>
-              !this.isServer(item) ||
-              (endpoints &&
-                series.some((owner) => !this.isServer(owner) && owner.id === this.ownerOf(item)) &&
-                item.points.some((p) => isNumber(p.median))),
+          this.history = frozenSeries(
+            series.filter(
+              (item) =>
+                !this.isServer(item) ||
+                (endpoints &&
+                  series.some(
+                    (owner) => !this.isServer(owner) && owner.id === this.ownerOf(item),
+                  ) &&
+                  item.points.some((p) => isNumber(p.median))),
+            ),
           );
           this.historyMarkers = Array.isArray(r.events) ? r.events : [];
           this.historyError = '';
           this.historyLoaded = true;
-          this.hover = null;
+          this.syncPlot();
           this.$nextTick(() => {
             if (this.$refs.chart && this.resize) this.resize.observe(this.$refs.chart);
           });
@@ -1705,6 +1571,7 @@ export default {
           this.history = [];
           this.historyMarkers = [];
           this.historyError = e.message || 'History unavailable.';
+          this.syncPlot();
         }
       }
     },
@@ -1724,66 +1591,298 @@ export default {
         hour12: false,
       });
     },
-    chartX(at) {
-      const x = 45 + ((at - this.windowStart) / (this.range * 60000)) * (this.chartWidth - 63);
-      return Math.min(this.chartWidth - 18, Math.max(45, x));
-    },
-    chartY(v) {
-      return 200 - (v / this.yMax) * 176;
-    },
-    line(points) {
-      let d = '',
-        move = true;
-      points.forEach((p) => {
-        if (!isNumber(p.median)) {
-          move = true;
-          return;
-        }
-        d +=
-          (move ? 'M' : 'L') +
-          this.chartX(p.at).toFixed(1) +
-          ',' +
-          this.chartY(p.median).toFixed(1);
-        move = false;
-      });
-      return d;
-    },
-    dots(points) {
-      return points
-        .filter(
-          (p, i) =>
-            isNumber(p.median) &&
-            !isNumber((points[i - 1] || {}).median) &&
-            !isNumber((points[i + 1] || {}).median),
-        )
-        .map((p) => ({ key: p.at, x: this.chartX(p.at), y: this.chartY(p.median) }));
-    },
-    band(points) {
-      let d = '',
-        group = [];
-      const flush = () => {
-        if (group.length) {
-          d +=
-            'M' +
-            group
-              .map((p) => this.chartX(p.at).toFixed(1) + ',' + this.chartY(p.min).toFixed(1))
-              .join('L') +
-            'L' +
-            group
-              .slice()
-              .reverse()
-              .map((p) => this.chartX(p.at).toFixed(1) + ',' + this.chartY(p.max).toFixed(1))
-              .join('L') +
-            'Z';
-          group = [];
-        }
+    readTheme() {
+      const style = window.getComputedStyle(this.$el);
+      const read = (name, fallback) => style.getPropertyValue('--vph-' + name).trim() || fallback;
+      const brand = read('brand', '#159b9b');
+      this.theme = {
+        brand,
+        text: read('text', '#253644'),
+        muted: read('muted', '#667984'),
+        border: read('border', '#e3e9ed'),
+        card: read('card', '#ffffff'),
+        event: withAlpha(brand, 0.6),
+        eventDot: withAlpha(brand, 0.85),
       };
-      points.forEach((p) => {
-        if (isNumber(p.median) && isNumber(p.min) && isNumber(p.max)) group.push(p);
-        else flush();
+    },
+    canvasColor(color) {
+      const match = /^var\(--vph-(\w+)\)$/.exec(color);
+      return match ? this.theme[match[1]] : color;
+    },
+    axisOptions(extra) {
+      const font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+      return Object.assign(
+        {
+          stroke: this.theme.muted,
+          font,
+          labelFont: font,
+          grid: { stroke: this.theme.border, width: 1 },
+          ticks: { stroke: this.theme.border, width: 1 },
+        },
+        extra,
+      );
+    },
+    plotRange() {
+      return [this.windowStart / 1000, (this.windowStart + this.range * 60000) / 1000];
+    },
+    buildChart() {
+      const stamps = new Set();
+      this.history.forEach((s) => s.points.forEach((p) => stamps.add(p.at)));
+      const at = Array.from(stamps).sort((a, b) => a - b);
+      const index = new Map(at.map((t, i) => [t, i]));
+      const column = (points, key) => {
+        const values = at.map(() => null);
+        points.forEach((p) => {
+          if (isNumber(p[key])) values[index.get(p.at)] = p[key];
+        });
+        return values;
+      };
+      const order = (s) => (this.isServer(s) ? 0 : s.id === 'wan' || this.isUplink(s) ? 1 : 2);
+      const data = [at.map((t) => t / 1000)];
+      const series = [{}];
+      const bands = [];
+      const lines = [];
+      this.history
+        .slice()
+        .sort((a, b) => order(a) - order(b))
+        .forEach((s) => {
+          const server = this.isServer(s);
+          const muted = s.id === 'wan' || this.isUplink(s);
+          const owner = this.ownerOf(s);
+          const tunnel = this.state.tunnels.find((t) => t.id === owner);
+          const preferred = !muted && !server && !!(tunnel && tunnel.preferred);
+          const color = this.canvasColor(this.seriesColor(s));
+          const median = column(s.points, 'median');
+          const line = {
+            id: s.id,
+            name: this.seriesName(s),
+            owner,
+            color,
+            muted,
+            median,
+            min: column(s.points, 'min'),
+            max: column(s.points, 'max'),
+            index: data.length,
+          };
+          const solo = soloIndexes(median);
+          data.push(median);
+          series.push({
+            label: line.name,
+            stroke: color,
+            width: server ? 1 : this.isUplink(s) ? 1.2 : preferred ? 2 : 1.5,
+            spanGaps: false,
+            ...(server ? { dash: [6, 4] } : {}),
+            points: {
+              show: true,
+              size: 4,
+              space: 0,
+              stroke: color,
+              fill: color,
+              filter: () => solo,
+            },
+          });
+          if (!muted && !server) {
+            line.low = data.length;
+            data.push(line.min);
+            series.push({
+              label: '',
+              show: false,
+              stroke: 'transparent',
+              width: 1,
+              points: { show: false },
+            });
+            line.high = data.length;
+            data.push(line.max);
+            series.push({
+              label: '',
+              show: false,
+              stroke: 'transparent',
+              width: 1,
+              points: { show: false },
+            });
+            const fill = withAlpha(color, 0.15);
+            bands.push({ series: [line.high, line.low], fill: () => fill });
+          }
+          lines.push(line);
+        });
+      return {
+        key: JSON.stringify(series.map((o) => [o.label, o.stroke, o.width])),
+        data,
+        series,
+        bands,
+        lines,
+      };
+    },
+    createPlot(built) {
+      this.readTheme();
+      this.plotLines = built.lines;
+      this.plotKey = built.key;
+      const UPlot = require('uplot').default;
+      this.plot = new UPlot(
+        {
+          width: Math.max(280, this.$refs.chart.clientWidth),
+          height: chartHeight,
+          legend: { show: false },
+          cursor: { drag: { x: true, y: false, setScale: false } },
+          scales: {
+            x: { time: true, range: () => this.plotRange() },
+            y: { range: (u, low, high) => [0, high > 0 ? high * 1.15 : 25] },
+          },
+          axes: [
+            this.axisOptions({
+              grid: { show: false },
+              values: (u, values) => values.map((v) => this.clock(v * 1000)),
+            }),
+            this.axisOptions({
+              label: 'ms',
+              values: (u, values) => values.map((v) => String(Math.round(v))),
+            }),
+          ],
+          series: built.series,
+          bands: built.bands,
+          hooks: {
+            setCursor: [(u) => this.updateTip(u)],
+            setSelect: [(u) => this.zoomSelection(u)],
+            draw: [(u) => this.drawMarkers(u)],
+          },
+        },
+        built.data,
+        this.$refs.plot,
+      );
+      this.plot.over.addEventListener('dblclick', () => this.choosePreset(this.preset));
+    },
+    syncPlot() {
+      if (!this.history.length) {
+        this.destroyPlot();
+        return;
+      }
+      const built = this.buildChart();
+      if (this.plot && this.plotKey === built.key) {
+        this.plotLines = built.lines;
+        this.plot.setData(built.data);
+      } else {
+        this.destroyPlot();
+        this.createPlot(built);
+      }
+      this.applyVisibility();
+    },
+    destroyPlot() {
+      if (this.plot) this.plot.destroy();
+      this.plot = null;
+      this.plotLines = [];
+      this.plotKey = '';
+      this.hideTip();
+    },
+    hideTip() {
+      if (this.$refs.tip) this.$refs.tip.hidden = true;
+    },
+    shownLine(line) {
+      return !this.isolated.length || this.isolated.includes(line.owner);
+    },
+    applyVisibility() {
+      const u = this.plot;
+      if (!u) return;
+      const band = this.isolated.length === 1 ? this.isolated[0] : this.selectedTunnel;
+      const show = (index, value) => {
+        if (u.series[index].show !== value) u.setSeries(index, { show: value });
+      };
+      this.plotLines.forEach((line) => {
+        const shown = this.shownLine(line);
+        show(line.index, shown);
+        if (line.low !== undefined) {
+          show(line.low, shown && line.owner === band);
+          show(line.high, shown && line.owner === band);
+        }
       });
-      flush();
-      return d;
+    },
+    updateTip(u) {
+      const tip = this.$refs.tip;
+      if (!tip) return;
+      const idx = u.cursor.idx;
+      if (idx == null) {
+        tip.hidden = true;
+        return;
+      }
+      const at = u.data[0][idx] * 1000;
+      const rows = this.plotLines
+        .filter((line) => u.series[line.index].show)
+        .map((line) => ({
+          line,
+          median: line.median[idx],
+          low: line.min[idx],
+          high: line.max[idx],
+        }))
+        .sort((a, b) => {
+          if (a.median === null || b.median === null)
+            return (a.median === null) - (b.median === null);
+          return b.median - a.median;
+        });
+      const marker = this.markerList.find((m) => Math.abs(m.at - at) <= 60000);
+      const title = document.createElement('strong');
+      title.textContent = this.clock(at);
+      const children = [title];
+      if (marker) {
+        const event = document.createElement('div');
+        event.className = 'vph-tip-event';
+        event.textContent = marker.text;
+        children.push(event);
+      }
+      rows.forEach(({ line, median, low, high }) => {
+        const row = document.createElement('div');
+        if (line.owner === this.selectedTunnel && !line.muted) row.className = 'vph-tip-selected';
+        const swatch = document.createElement('span');
+        swatch.className = 'vph-swatch vph-tip-swatch' + (line.muted ? ' vph-swatch-wan' : '');
+        swatch.style.setProperty('--series', line.color);
+        swatch.setAttribute('aria-hidden', 'true');
+        const range =
+          low === null || high === null
+            ? ''
+            : ' (min ' + low.toFixed(2) + ', max ' + high.toFixed(2) + ')';
+        const text = median === null ? 'no measurement' : 'median ' + this.ms(median) + range;
+        row.append(swatch, document.createTextNode(line.name + ': ' + text));
+        children.push(row);
+      });
+      tip.replaceChildren(...children);
+      tip.hidden = false;
+      const box = this.$refs.chart.getBoundingClientRect();
+      const over = u.over.getBoundingClientRect();
+      const x = over.left - box.left + u.cursor.left;
+      const width = tip.offsetWidth;
+      tip.style.left = (x + 14 + width > box.width ? Math.max(0, x - 14 - width) : x + 14) + 'px';
+    },
+    drawMarkers(u) {
+      const markers = this.markerList;
+      if (!markers.length) return;
+      const { ctx, bbox } = u;
+      const ratio = window.devicePixelRatio || 1;
+      const right = bbox.left + bbox.width;
+      ctx.save();
+      ctx.lineWidth = ratio;
+      ctx.setLineDash([3 * ratio, 3 * ratio]);
+      ctx.strokeStyle = this.theme.event;
+      ctx.fillStyle = this.theme.eventDot;
+      markers.forEach((m) => {
+        const x = u.valToPos(m.at / 1000, 'x', true);
+        if (x < bbox.left || x > right) return;
+        ctx.beginPath();
+        ctx.moveTo(x, bbox.top);
+        ctx.lineTo(x, bbox.top + bbox.height);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(x, bbox.top + 4 * ratio, 3 * ratio, 0, Math.PI * 2);
+        ctx.fill();
+      });
+      ctx.restore();
+    },
+    zoomSelection(u) {
+      if (!u.select.width) return;
+      const from = u.posToVal(u.select.left, 'x') * 1000;
+      const to = u.posToVal(u.select.left + u.select.width, 'x') * 1000;
+      u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
+      const minutes = Math.round((to - from) / 60000);
+      if (minutes < 5) return;
+      this.range = Math.min(1440, minutes);
+      this.setOffset(Math.round((this.anchor - to) / 60000));
     },
     keyNav(e) {
       if (e.key === 'Escape') {
@@ -1799,7 +1898,6 @@ export default {
     },
     setOffset(minutes) {
       this.offset = Math.round(Math.min(1440 - this.range, Math.max(0, minutes)));
-      this.hover = null;
       this.loadHistory();
     },
     goNow() {
@@ -1809,51 +1907,6 @@ export default {
       this.preset = minutes;
       this.range = minutes;
       this.setOffset(0);
-    },
-    svgX(e) {
-      const rect = e.currentTarget.getBoundingClientRect();
-      const x = ((e.clientX - rect.left) * this.chartWidth) / rect.width;
-      return Math.max(45, Math.min(this.chartWidth - 18, x));
-    },
-    timeAt(x) {
-      return this.windowStart + ((x - 45) / (this.chartWidth - 63)) * this.range * 60000;
-    },
-    hoverX(x) {
-      const marker = this.markerList.find((m) => Math.abs(this.chartX(m.at) - x) < 5);
-      this.hover = { x, at: this.timeAt(x), marker: marker ? marker.text : '' };
-    },
-    pointerDown(e) {
-      if (e.button !== 0) return;
-      const x = this.svgX(e);
-      e.currentTarget.setPointerCapture(e.pointerId);
-      this.drag = { from: x, to: x };
-      this.hoverX(x);
-    },
-    pointerMove(e) {
-      const x = this.svgX(e);
-      if (!this.drag) {
-        this.hoverX(x);
-        return;
-      }
-      this.drag.to = x;
-      this.hover = null;
-    },
-    pointerUp() {
-      if (!this.drag) return;
-      const { from, to } = this.drag;
-      this.drag = null;
-      const start = this.timeAt(Math.min(from, to));
-      const end = this.timeAt(Math.max(from, to));
-      const minutes = Math.round((end - start) / 60000);
-      if (minutes < 5) {
-        this.hoverX(to);
-        return;
-      }
-      this.range = Math.min(1440, minutes);
-      this.setOffset(Math.round((this.anchor - end) / 60000));
-    },
-    showMarker(m) {
-      this.hover = { x: this.chartX(m.at), at: m.at, marker: m.text };
     },
     highlight(id) {
       this.selectedTunnel = id;
@@ -1885,17 +1938,6 @@ export default {
     },
     isSelected(series) {
       return series.id !== 'wan' && this.ownerOf(series) === this.selectedTunnel;
-    },
-    isDimmed(series) {
-      return (
-        series.id !== 'wan' &&
-        !this.isUplink(series) &&
-        !this.isSelected(series) &&
-        this.history.some((s) => this.isSelected(s))
-      );
-    },
-    hasBand(series) {
-      return !this.isServer(series) && this.isSelected(series);
     },
     seriesColor(series) {
       const owner = this.ownerOf(series);
@@ -2486,83 +2528,15 @@ export default {
 .vph-chart {
   position: relative;
 }
-.vph-chart svg {
-  width: 100%;
-  display: block;
-  overflow: visible;
+.vph-chart:focus-visible {
+  outline: 2px solid var(--vph-brand);
+  outline-offset: 2px;
+}
+.vph-chart .u-select {
+  background: color-mix(in srgb, var(--vph-brand) 14%, transparent);
+}
+.vph-chart .u-over {
   touch-action: pan-y;
-}
-.vph-chart svg text {
-  font:
-    12px -apple-system,
-    BlinkMacSystemFont,
-    'Segoe UI',
-    sans-serif;
-  fill: var(--vph-muted);
-}
-.vph-grid {
-  stroke: var(--vph-border);
-  stroke-width: 1;
-}
-.vph-line {
-  stroke: var(--series, var(--vph-brand));
-  stroke-width: 1.8;
-  fill: none;
-  stroke-linejoin: round;
-}
-.vph-series-selected .vph-line {
-  stroke-width: 2.8;
-}
-.vph-series-dim {
-  opacity: 0.55;
-}
-.vph-band {
-  fill: var(--series, var(--vph-brand));
-  opacity: 0.14;
-}
-.vph-wan-series .vph-line {
-  stroke: var(--vph-muted);
-  stroke-width: 1.5;
-}
-.vph-wan-series .vph-band {
-  fill: var(--vph-muted);
-  opacity: 0.05;
-}
-.vph-uplink-series .vph-line {
-  stroke-width: 1.2;
-  opacity: 0.8;
-}
-.vph-endpoint-series .vph-line {
-  stroke-width: 1.2;
-  stroke-dasharray: 4 3;
-}
-.vph-endpoint-series.vph-series-selected .vph-line {
-  stroke-width: 1.8;
-}
-.vph-marker-line {
-  stroke: var(--vph-muted);
-  stroke-width: 1;
-  stroke-dasharray: 2 3;
-}
-.vph-marker-dot {
-  fill: var(--vph-muted);
-}
-.vph-marker {
-  outline: none;
-}
-.vph-marker:focus-visible .vph-marker-dot {
-  stroke: var(--vph-brand);
-  stroke-width: 2;
-}
-.vph-select {
-  fill: var(--vph-brand);
-  opacity: 0.14;
-  pointer-events: none;
-}
-.vph-guide {
-  stroke: var(--vph-muted);
-  stroke-width: 1;
-  stroke-dasharray: 3 3;
 }
 .vph-tooltip {
   position: absolute;
