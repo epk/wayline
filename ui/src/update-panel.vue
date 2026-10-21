@@ -65,6 +65,7 @@ export default {
     compact: Boolean,
     disabled: Boolean,
     waiting: Boolean,
+    pageVersion: { type: String, default: '' },
   },
   data() {
     return { now: Date.now() };
@@ -91,8 +92,11 @@ export default {
     working() {
       return this.disabled || (this.active && !this.failed);
     },
+    stale() {
+      return !!this.pageVersion && this.pageVersion !== this.update.current;
+    },
     showReload() {
-      return !this.failed && this.update.phase === 'done';
+      return !this.failed && this.update.phase === 'done' && this.stale;
     },
     latestText() {
       return this.update.latest || 'Not checked yet';
@@ -123,7 +127,7 @@ export default {
         return (
           'Updated to ' +
           (this.update.latest || this.update.current) +
-          '. Reload this page to use it.'
+          (this.stale ? '. Reload this page to use it.' : '.')
         );
       return phaseLines[this.update.phase] || '';
     },

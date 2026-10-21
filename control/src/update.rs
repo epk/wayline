@@ -15,6 +15,7 @@ use wayline_support::{atomic, digest, read, text};
 
 const RELEASES: &str = "https://api.github.com/repos/epk/wayline/releases?per_page=30";
 const STALE_AFTER: u64 = 240;
+const DONE_VISIBLE: u64 = 600;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,13 +159,13 @@ impl Status {
         }
     }
 
-    fn finished(message: String, latest: String, available: bool) -> Self {
+    fn finished(message: String, latest: String, available: bool, phase: Phase) -> Self {
         let at = now();
         Self {
             current: version(),
             latest: Some(latest),
             available,
-            phase: Phase::Done,
+            phase,
             message,
             failed: false,
             needs_attention: false,
@@ -199,6 +200,10 @@ fn effective(mut status: Status, at: u64) -> Status {
         status.failed = true;
         status.message =
             "The update did not finish. Run wayline-ctl update on the router for details.".into();
+    }
+    if status.phase == Phase::Done && at.saturating_sub(status.updated_at) > DONE_VISIBLE {
+        status.phase = Phase::Idle;
+        status.message.clear();
     }
     status
 }
@@ -377,6 +382,7 @@ fn execute(install: bool, report: &dyn Fn(Phase, &str) -> Result<()>) -> Result<
             "Wayline is up to date.".into(),
             version(),
             false,
+            Phase::Idle,
         ));
     };
     if install {
@@ -385,7 +391,12 @@ fn execute(install: bool, report: &dyn Fn(Phase, &str) -> Result<()>) -> Result<
     let (manifest, artifact, prefix) = metadata(folder.path(), &latest)?;
     if !install {
         let message = format!("Version {} is available.", manifest.version);
-        return Ok(Status::finished(message, manifest.version, true));
+        return Ok(Status::finished(
+            message,
+            manifest.version,
+            true,
+            Phase::Idle,
+        ));
     }
     space(folder.path(), artifact.bytes.saturating_mul(2) + 1_048_576)?;
     space(Path::new("/etc/wayline"), 4_194_304)?;
@@ -411,7 +422,12 @@ fn execute(install: bool, report: &dyn Fn(Phase, &str) -> Result<()>) -> Result<
         "The installed version needs checking. Do not retry automatically."
     );
     let message = format!("Updated to {}.", manifest.version);
-    Ok(Status::finished(message, manifest.version, false))
+    Ok(Status::finished(
+        message,
+        manifest.version,
+        false,
+        Phase::Done,
+    ))
 }
 
 fn attempt(install: bool) -> Result<Status> {
@@ -648,7 +664,9 @@ mod tests {
 
     #[test]
     fn finished_status_is_not_stale() -> Result<()> {
-        ensure!(effective(at(Phase::Done, 0), 10_000).phase == Phase::Done);
+        ensure!(effective(at(Phase::Done, 0), 100).phase == Phase::Done);
+        ensure!(effective(at(Phase::Done, 0), 10_000).phase == Phase::Idle);
+        ensure!(effective(at(Phase::Idle, 0), 10_000).phase == Phase::Idle);
         Ok(())
     }
 }

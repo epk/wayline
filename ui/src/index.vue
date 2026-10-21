@@ -21,6 +21,7 @@
       <p>Update Wayline below. A newer release may support this firmware.</p>
       <p class="vph-muted">Run wayline-ctl doctor on the router and send the output.</p>
       <update-panel
+        :page-version="bundleVersion"
         compact
         :info="updateState"
         :disabled="updatesDisabled"
@@ -45,6 +46,7 @@
         </li>
       </ul>
       <update-panel
+        :page-version="bundleVersion"
         compact
         :info="updateState"
         :disabled="updatesDisabled"
@@ -127,6 +129,7 @@
         <p class="vph-muted">Run wayline-ctl doctor on the router and send the output.</p>
         <button type="button" class="vph-button" :disabled="loading" @click="retry">Retry</button>
         <update-panel
+          :page-version="bundleVersion"
           compact
           :info="updateState"
           :disabled="updatesDisabled"
@@ -305,6 +308,7 @@
           releases.
         </p>
         <update-panel
+          :page-version="bundleVersion"
           :info="updateState"
           :disabled="updatesDisabled"
           :waiting="updateWaiting"
