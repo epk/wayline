@@ -1,26 +1,23 @@
 use crate::{
     auto, changes, egress, history, native,
     resolve::Resolved,
-    router,
+    router::{self, Inventory, PathInfo, TunnelInfo},
     runtime::{SETTINGS, locked, milliseconds, snapshot, version},
     service::reconcile,
     settings::{self, Settings, Target},
     update,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    net::Ipv4Addr,
-    path::Path,
-};
+use std::{collections::BTreeMap, net::Ipv4Addr, path::Path};
 use wayline_protocol::{Series, State as Measurement};
 use wayline_support::atomic;
 
 const RECENT: usize = 8;
 const MAX_RECENT_LOSS: usize = 2;
 const STALE: &str = "State changed. Refresh first.";
+const SCOPE: &str = "Equivalent native traffic rules";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,7 +25,7 @@ pub struct State {
     version: String,
     config: Settings,
     history: history::Availability,
-    pub tunnels: Vec<Tunnel>,
+    tunnels: Vec<Tunnel>,
     diagnostics: BTreeMap<String, BTreeMap<String, Option<f64>>>,
     endpoints: Vec<EndpointView>,
     wan: WanView,
@@ -119,7 +116,11 @@ pub struct Tunnel {
     pub median: Option<f64>,
     samples: usize,
     lost: usize,
-    recent: Vec<Option<f64>>,
+}
+
+pub struct Exits {
+    pub revision: String,
+    pub tunnels: Vec<Tunnel>,
 }
 
 #[derive(Deserialize)]
@@ -141,19 +142,170 @@ pub struct SetEnabled {
     expected_revision: String,
 }
 
-fn measurement<'a>(
-    snapshot: &'a [Series],
-    path: &router::PathInfo,
-    target: &Target,
-) -> Option<&'a Series> {
+struct Discovery {
+    revision: String,
+    config: Settings,
+    inventory: Inventory,
+    snapshot: Vec<Series>,
+    native: Result<native::List>,
+    compat: native::Compat,
+}
+
+impl Discovery {
+    fn read(mut compat: native::Compat, endpoints: bool) -> Result<Self> {
+        let revision = router::revision()?;
+        let mut config = Settings::read()?;
+        let inventory = router::inventory_with(endpoints && config.endpoint_diagnostics)?;
+        router::normalize(&mut config, &inventory);
+        let snapshot = snapshot();
+        let native = native::List::read();
+        if compat.level == native::Level::Full && native.is_err() {
+            compat.monitoring_only();
+        }
+        Ok(Self {
+            revision,
+            config,
+            inventory,
+            snapshot,
+            native,
+            compat,
+        })
+    }
+
+    fn compatible(&self) -> bool {
+        self.compat.level == native::Level::Full
+    }
+
+    fn confirm(&self) -> Result<()> {
+        ensure!(
+            router::revision()? == self.revision,
+            "State changed during discovery. Refresh again."
+        );
+        Ok(())
+    }
+
+    fn tunnels(&self) -> Vec<Tunnel> {
+        let Self {
+            config,
+            inventory,
+            snapshot,
+            native,
+            ..
+        } = self;
+        let compatible = self.compatible();
+        let preferred = native
+            .as_ref()
+            .ok()
+            .and_then(|list| list.tunnels.first())
+            .map(|tunnel| tunnel.id.as_str());
+        let order = native
+            .as_ref()
+            .map_err(|error| anyhow!("Cannot read native tunnel state: {error}"))
+            .and_then(|list| router::native_order(list, inventory));
+        inventory
+            .tunnels
+            .iter()
+            .map(|tunnel| {
+                let path = inventory.paths.iter().find(|path| path.id == tunnel.id);
+                let item = path.and_then(|path| measurement(snapshot, path, config.primary()));
+                let selection = selection(tunnel, path.is_some(), compatible, &order, inventory);
+                let health = health(config, tunnel, item);
+                Tunnel {
+                    id: tunnel.id.clone(),
+                    monitor_id: tunnel.key.clone(),
+                    name: tunnel.name.clone(),
+                    enabled: tunnel.enabled,
+                    connected: path.is_some(),
+                    history_available: path.is_some(),
+                    controllable: compatible
+                        && native.as_ref().is_ok_and(|list| {
+                            router::native_tunnel(list, inventory, &tunnel.id)
+                                .is_ok_and(|native| tunnel.enabled || native.startable())
+                        }),
+                    preferred: preferred == Some(tunnel.id.as_str()),
+                    select_reason: selection
+                        .as_ref()
+                        .err()
+                        .map_or_else(String::new, ToString::to_string),
+                    selectable: selection.is_ok(),
+                    eligible: selection.is_ok() && health.is_ok(),
+                    reason: selection
+                        .and(health)
+                        .err()
+                        .map_or_else(String::new, |error| error.to_string()),
+                    state_label: if !tunnel.enabled {
+                        "Stopped"
+                    } else if path.is_none() {
+                        "Enabled, offline"
+                    } else {
+                        "Connected"
+                    },
+                    measurement_state: item.map(|item| item.state),
+                    age: item
+                        .and_then(|item| item.success_age_ms)
+                        .map_or_else(|| "unknown".into(), |age| format!("{}s", age / 1000)),
+                    median: item.and_then(|item| item.median_us).map(milliseconds),
+                    samples: item.map_or(0, |item| item.history.len()),
+                    lost: item.map_or(0, Series::lost),
+                }
+            })
+            .collect()
+    }
+}
+
+fn selection(
+    tunnel: &TunnelInfo,
+    connected: bool,
+    compatible: bool,
+    order: &Result<Vec<&str>>,
+    inventory: &Inventory,
+) -> Result<()> {
+    ensure!(compatible, "Firmware support prevents exit changes.");
+    ensure!(tunnel.enabled, "The tunnel is stopped.");
+    ensure!(connected, "The tunnel is enabled but not connected.");
+    let order = order.as_ref().map_err(|error| anyhow!("{error}"))?;
+    router::position(order, inventory, &tunnel.id)?;
+    Ok(())
+}
+
+fn health(config: &Settings, tunnel: &TunnelInfo, item: Option<&Series>) -> Result<()> {
+    ensure!(
+        config.tunnels.contains(&tunnel.key),
+        "Not monitored, so automatic switching ignores it."
+    );
+    let item = item.context("No measurement to the primary destination yet.")?;
+    ensure!(
+        item.state.live(),
+        "The primary destination is not reachable through this tunnel."
+    );
+    let limit = u64::from(config.interval).saturating_mul(3).max(15) * 1000;
+    ensure!(
+        item.success_age_ms.is_some_and(|age| age <= limit),
+        "The last successful probe is too old."
+    );
+    let (probes, lost) = item
+        .history
+        .iter()
+        .rev()
+        .take(RECENT)
+        .fold((0, 0), |(probes, lost), sample| {
+            (probes + 1, lost + usize::from(sample.us.is_none()))
+        });
+    ensure!(
+        lost <= MAX_RECENT_LOSS,
+        "{lost} of the last {probes} probes were lost."
+    );
+    Ok(())
+}
+
+fn measurement<'a>(snapshot: &'a [Series], path: &PathInfo, target: &Target) -> Option<&'a Series> {
     let id = path.series(target);
     snapshot.iter().find(|series| series.id == id)
 }
 
 fn diagnostics(
     config: &Settings,
-    inventory: &router::Inventory,
-    endpoints: &[router::Endpoint],
+    inventory: &Inventory,
     snapshot: &[Series],
 ) -> BTreeMap<String, BTreeMap<String, Option<f64>>> {
     let mut result: BTreeMap<_, _> = config
@@ -176,142 +328,38 @@ fn diagnostics(
         })
         .collect();
     if let Some(wan) = &inventory.wan {
-        for endpoint in endpoints {
-            result
-                .entry(endpoint.target.to_string())
-                .or_insert_with(|| {
-                    let id = router::endpoint_series(&endpoint.key);
-                    let latency = snapshot
-                        .iter()
-                        .find(|series| series.id == id)
-                        .or_else(|| measurement(snapshot, wan, &endpoint.target))
-                        .and_then(|item| item.median_us)
-                        .map(milliseconds);
-                    BTreeMap::from([(wan.id.clone(), latency)])
-                });
+        for (key, target) in router::endpoints(config, inventory) {
+            result.entry(target.to_string()).or_insert_with(|| {
+                let id = router::endpoint_series(key);
+                let latency = snapshot
+                    .iter()
+                    .find(|series| series.id == id)
+                    .or_else(|| measurement(snapshot, wan, target))
+                    .and_then(|item| item.median_us)
+                    .map(milliseconds);
+                BTreeMap::from([(wan.id.clone(), latency)])
+            });
         }
     }
     result
 }
 
-fn resolved(
-    config: &Settings,
-    inventory: &router::Inventory,
-) -> BTreeMap<String, Option<Ipv4Addr>> {
+fn resolved(config: &Settings, inventory: &Inventory) -> BTreeMap<String, Option<Ipv4Addr>> {
+    let hosts = router::hosts(config, inventory);
+    if hosts.is_empty() {
+        return BTreeMap::new();
+    }
     let cache = Resolved::read();
-    router::hosts(config, inventory)
+    hosts
         .into_iter()
         .map(|host| {
-            let address = cache.address(&Target::Host(host.clone()));
+            let address = cache.host(&host);
             (host, address)
         })
         .collect()
 }
 
-fn tunnels(
-    config: &Settings,
-    inventory: &router::Inventory,
-    snapshot: &[Series],
-    native: &Result<native::List>,
-    known: &BTreeSet<String>,
-    compatible: bool,
-) -> Vec<Tunnel> {
-    let preferred = native
-        .as_ref()
-        .ok()
-        .and_then(|list| list.tunnels.first())
-        .map(|tunnel| tunnel.id.as_str());
-    let mut tunnels = Vec::new();
-    for tunnel in &inventory.tunnels {
-        let path = inventory.paths.iter().find(|path| path.id == tunnel.id);
-        let item = path.and_then(|path| measurement(snapshot, path, config.primary()));
-        let selection = (|| -> Result<()> {
-            ensure!(compatible, "Firmware support prevents exit changes.");
-            ensure!(tunnel.enabled, "The tunnel is stopped.");
-            ensure!(path.is_some(), "The tunnel is enabled but not connected.");
-            let list = native
-                .as_ref()
-                .map_err(|error| anyhow::anyhow!("Cannot read native tunnel state: {error}"))?;
-            router::safe_order(list, inventory, &tunnel.id)?;
-            Ok(())
-        })();
-        let health = (|| -> Result<()> {
-            ensure!(
-                config.tunnels.contains(&tunnel.key),
-                "Not monitored, so automatic switching ignores it."
-            );
-            let item = item.context("No measurement to the primary destination yet.")?;
-            ensure!(
-                item.state.live(),
-                "The primary destination is not reachable through this tunnel."
-            );
-            ensure!(
-                item.success_age_ms.is_some_and(
-                    |age| age <= u64::from(config.interval).saturating_mul(3).max(15) * 1000
-                ),
-                "The last successful probe is too old."
-            );
-            let recent: Vec<_> = item.history.iter().rev().take(RECENT).collect();
-            let lost = recent.iter().filter(|sample| sample.us.is_none()).count();
-            ensure!(
-                lost <= MAX_RECENT_LOSS,
-                "{lost} of the last {} probes were lost.",
-                recent.len()
-            );
-            Ok(())
-        })();
-        let selectable = selection.is_ok();
-        let eligible = selectable && health.is_ok();
-        tunnels.push(Tunnel {
-            id: tunnel.id.clone(),
-            monitor_id: tunnel.key.clone(),
-            name: tunnel.name.clone(),
-            enabled: tunnel.enabled,
-            connected: path.is_some(),
-            history_available: path.is_some()
-                || known.contains(&router::tunnel_prefix(&tunnel.key)),
-            controllable: compatible
-                && native.as_ref().is_ok_and(|list| {
-                    router::native_tunnel(list, inventory, &tunnel.id)
-                        .is_ok_and(|native| tunnel.enabled || native.startable())
-                }),
-            preferred: preferred == Some(tunnel.id.as_str()),
-            selectable,
-            select_reason: selection
-                .as_ref()
-                .err()
-                .map_or_else(String::new, ToString::to_string),
-            eligible,
-            reason: selection
-                .and(health)
-                .err()
-                .map_or_else(String::new, |error| error.to_string()),
-            state_label: if !tunnel.enabled {
-                "Stopped"
-            } else if path.is_none() {
-                "Enabled, offline"
-            } else {
-                "Connected"
-            },
-            measurement_state: item.map(|item| item.state),
-            age: item
-                .and_then(|item| item.success_age_ms)
-                .map_or_else(|| "unknown".into(), |age| format!("{}s", age / 1000)),
-            median: item.and_then(|item| item.median_us).map(milliseconds),
-            samples: item.map_or(0, |item| item.history.len()),
-            lost: item.map_or(0, Series::lost),
-            recent: item.map_or_else(Vec::new, |item| {
-                item.history
-                    .iter()
-                    .map(|sample| sample.us.map(milliseconds))
-                    .collect()
-            }),
-        });
-    }
-    tunnels
-}
-
-fn endpoint_views(config: &Settings, inventory: &router::Inventory) -> Vec<EndpointView> {
+fn endpoint_views(config: &Settings, inventory: &Inventory) -> Vec<EndpointView> {
     if !router::endpoints_enabled(config) {
         return Vec::new();
     }
@@ -325,11 +373,7 @@ fn endpoint_views(config: &Settings, inventory: &router::Inventory) -> Vec<Endpo
         .collect()
 }
 
-fn uplink_views(
-    config: &Settings,
-    inventory: &router::Inventory,
-    snapshot: &[Series],
-) -> Vec<UplinkView> {
+fn uplink_views(config: &Settings, inventory: &Inventory, snapshot: &[Series]) -> Vec<UplinkView> {
     inventory
         .uplinks
         .iter()
@@ -353,7 +397,7 @@ fn uplink_views(
         .collect()
 }
 
-fn wan_view(inventory: &router::Inventory) -> WanView {
+fn wan_view(inventory: &Inventory) -> WanView {
     WanView {
         available: inventory.wan.is_some(),
         interface: inventory.wan.as_ref().map(|wan| wan.name.clone()),
@@ -362,10 +406,11 @@ fn wan_view(inventory: &router::Inventory) -> WanView {
 }
 
 fn unsupported(compat: native::Compat) -> State {
+    let config = Settings::read().unwrap_or_default();
     State {
         version: version(),
-        config: Settings::read().unwrap_or_default(),
-        history: history::availability(&Settings::read().unwrap_or_default()),
+        history: history::availability(&config),
+        config,
         tunnels: Vec::new(),
         diagnostics: BTreeMap::new(),
         endpoints: Vec::new(),
@@ -385,7 +430,7 @@ fn unsupported(compat: native::Compat) -> State {
         },
         egress: egress::Cache::default(),
         revision: String::new(),
-        scope: "Equivalent native traffic rules",
+        scope: SCOPE,
         capabilities: Capabilities {
             configure: false,
             select: false,
@@ -400,74 +445,60 @@ fn unsupported(compat: native::Compat) -> State {
 }
 
 pub fn state() -> Result<State> {
-    let mut compat = native::compat();
+    let compat = native::compat();
     if compat.level == native::Level::Unsupported {
         return Ok(unsupported(compat));
     }
-    let revision = router::revision()?;
-    let mut config = Settings::read()?;
-    let inventory = router::inventory()?;
-    router::normalize(&mut config, &inventory);
-    let snapshot = snapshot();
-    let native = native::List::read();
-    if compat.level == native::Level::Full && native.is_err() {
-        compat.level = native::Level::Monitoring;
-        compat.verified = false;
-        compat.features = native::features(compat.level);
-        compat.message = format!(
-            "Firmware {} replies in a format that Wayline does not know. Monitoring and history work. Exit selection and Start and Stop are off.",
-            compat.firmware
-        );
-    }
-    let monitoring_issue = router::check_capacity(&config, &inventory)
-        .err()
-        .map(|error| error.to_string());
-    let compatible = compat.level == native::Level::Full;
+    let discovery = Discovery::read(compat, true)?;
+    let mut tunnels = discovery.tunnels();
+    let compatible = discovery.compatible();
+    let Discovery {
+        revision,
+        config,
+        inventory,
+        snapshot,
+        compat,
+        ..
+    } = discovery;
     let known = history::known_prefixes();
-    let tunnels = tunnels(&config, &inventory, &snapshot, &native, &known, compatible);
-    let auto_enabled = config.auto_exit;
-    let auto_record = auto::Record::read();
-    let auto_paused = auto_enabled
+    for tunnel in tunnels
+        .iter_mut()
+        .filter(|tunnel| !tunnel.history_available)
+    {
+        tunnel.history_available = known.contains(&router::tunnel_prefix(&tunnel.monitor_id));
+    }
+    let auto_paused = config.auto_exit
         && !tunnels.iter().any(|tunnel| {
             tunnel.preferred && tunnel.enabled && config.auto_tunnels.contains(&tunnel.monitor_id)
         });
-    let availability = history::availability(&config);
-    let resolved = resolved(&config, &inventory);
-    let endpoints = router::endpoints(&config, &inventory);
-    let diagnostics = diagnostics(&config, &inventory, &endpoints, &snapshot);
-    let endpoint_list = endpoint_views(&config, &inventory);
-    let wan = wan_view(&inventory);
-    let egress = egress::Cache::view(&config, &inventory);
-    let uplinks = uplink_views(&config, &inventory, &snapshot);
+    let auto_record = auto::Record::read();
     let events = changes::read(&config)
         .into_iter()
         .rev()
         .take(changes::RECENT)
         .collect();
-    ensure!(
-        router::revision()? == revision,
-        "State changed during discovery. Refresh again."
-    );
-    Ok(State {
+    let state = State {
         version: version(),
-        config,
-        history: availability,
+        history: history::availability(&config),
+        diagnostics: diagnostics(&config, &inventory, &snapshot),
+        resolved: resolved(&config, &inventory),
+        endpoints: endpoint_views(&config, &inventory),
+        wan: wan_view(&inventory),
+        uplinks: uplink_views(&config, &inventory, &snapshot),
+        egress: egress::Cache::view(&config, &inventory),
+        monitoring_issue: router::check_capacity(&config, &inventory)
+            .err()
+            .map(|error| error.to_string()),
         tunnels,
-        diagnostics,
-        resolved,
-        endpoints: endpoint_list,
-        wan,
-        uplinks,
         events,
         auto: AutoView {
-            enabled: auto_enabled,
+            enabled: config.auto_exit,
             last: auto_record.last,
             needs_attention: auto_record.needs_attention,
             paused: auto_paused,
         },
-        egress,
         revision,
-        scope: "Equivalent native traffic rules",
+        scope: SCOPE,
         capabilities: Capabilities {
             configure: compat.level >= native::Level::Monitoring,
             select: compatible,
@@ -476,13 +507,28 @@ pub fn state() -> Result<State> {
             reason: compat.message.clone(),
         },
         compat,
-        monitoring_issue,
+        config,
         update: update::view(),
+    };
+    ensure!(
+        router::revision()? == state.revision,
+        "State changed during discovery. Refresh again."
+    );
+    Ok(state)
+}
+
+pub fn exits() -> Result<Exits> {
+    let discovery = Discovery::read(native::compat(), false)?;
+    let tunnels = discovery.tunnels();
+    discovery.confirm()?;
+    Ok(Exits {
+        revision: discovery.revision,
+        tunnels,
     })
 }
 
 pub fn history(query: &history::Query) -> Result<history::Response> {
-    history::query(&Settings::read()?, &router::inventory()?, query)
+    history::query(&Settings::read()?, &router::inventory_with(false)?, query)
 }
 
 pub fn set_config(request: SetConfig) -> Result<Value> {
@@ -527,7 +573,7 @@ pub fn set_tunnel_enabled(request: &SetEnabled) -> Result<Value> {
             ensure!(settings::id(&request.section_id), "Invalid tunnel section.");
             let revision = router::revision()?;
             ensure!(request.expected_revision == revision, STALE);
-            let inventory = router::inventory()?;
+            let inventory = router::inventory_with(false)?;
             let before = native::List::read()?;
             let tunnel = router::native_tunnel(&before, &inventory, &request.section_id)?;
             if tunnel.enabled == enabled {
@@ -542,9 +588,10 @@ pub fn set_tunnel_enabled(request: &SetEnabled) -> Result<Value> {
                 router::revision()? == revision,
                 "State changed before the request. Refresh first."
             );
-            let mut config = Settings::read()?;
+            let stored = Settings::read()?;
+            let mut config = stored.clone();
             router::normalize(&mut config, &inventory);
-            if config != Settings::read()? {
+            if config != stored {
                 atomic(Path::new(SETTINGS), &serde_json::to_vec(&config)?)?;
             }
             native::call::<Value>("set_tunnel", &json!({"tunnel_id":number,"enabled":enabled}))
@@ -555,7 +602,9 @@ pub fn set_tunnel_enabled(request: &SetEnabled) -> Result<Value> {
                 .iter()
                 .find(|item| item.number == number)
                 .context("Tunnel outcome is unknown. Refresh first.")?;
-            let actual = router::native_tunnel(&after, &router::inventory()?, &actual.id)?;
+            router::forget();
+            let actual =
+                router::native_tunnel(&after, &router::inventory_with(false)?, &actual.id)?;
             ensure!(
                 actual.number == number && actual.enabled == enabled,
                 "Tunnel outcome differs from the request. Refresh first."
@@ -582,16 +631,18 @@ pub fn select(request: &Select) -> Result<Value> {
 
 pub fn apply(id: &str, expected_revision: &str, require_health: bool) -> Result<Value> {
     native::require(native::Level::Full)?;
-    let inventory = router::inventory()?;
+    let inventory = router::inventory_with(false)?;
     let list = native::List::read()?;
-    let (desired, changed) = router::safe_order(&list, &inventory, id)?;
-    if !changed {
+    let mut desired = router::native_order(&list, &inventory)?;
+    let index = router::position(&desired, &inventory, id)?;
+    if index == 0 {
         return Ok(json!({"applied":true,"unchanged":true}));
     }
+    desired[..=index].rotate_right(1);
     ensure!(expected_revision == router::revision()?, STALE);
     if require_health {
         ensure!(
-            state()?
+            exits()?
                 .tunnels
                 .iter()
                 .any(|item| item.id == id && item.eligible),
@@ -603,14 +654,13 @@ pub fn apply(id: &str, expected_revision: &str, require_health: bool) -> Result<
         "State changed before selection. Refresh first."
     );
     native::call::<Value>("order_tunnel", &json!({"id_list":desired}))?;
-    let order: Vec<_> = native::List::read()
-        .context("Selection outcome is unknown. Refresh first.")?
-        .tunnels
-        .into_iter()
-        .map(|tunnel| tunnel.id)
-        .collect();
+    let after = native::List::read().context("Selection outcome is unknown. Refresh first.")?;
     ensure!(
-        order == desired,
+        after
+            .tunnels
+            .iter()
+            .map(|tunnel| tunnel.id.as_str())
+            .eq(desired.iter().copied()),
         "Selection changed concurrently. Refresh first."
     );
     Ok(json!({"applied":true}))

@@ -1,5 +1,5 @@
 use crate::{
-    api::{self, State},
+    api::{self, Exits},
     native,
     runtime::{RUNTIME, locked, now},
     settings::Settings,
@@ -157,13 +157,12 @@ pub fn step(config: &Settings) -> Result<()> {
         if Settings::read()? != *config {
             return Ok(());
         }
-        let revision = crate::router::revision()?;
-        let state = api::state()?;
         let mut record = Record::read();
         if record.needs_attention {
             return Ok(());
         }
-        let Some(current) = state.tunnels.iter().find(|tunnel| tunnel.preferred) else {
+        let Exits { revision, tunnels } = api::exits()?;
+        let Some(current) = tunnels.iter().find(|tunnel| tunnel.preferred) else {
             return Ok(());
         };
         if !current.enabled || !config.auto_tunnels.contains(&current.monitor_id) {
@@ -172,8 +171,7 @@ pub fn step(config: &Settings) -> Result<()> {
             record.write()?;
             return Ok(());
         }
-        let views: Vec<_> = state
-            .tunnels
+        let views: Vec<_> = tunnels
             .iter()
             .map(|tunnel| View {
                 id: &tunnel.id,
@@ -199,11 +197,13 @@ pub fn step(config: &Settings) -> Result<()> {
         let Some((target, reason)) = decision else {
             return Ok(());
         };
-        let name = |id: &str| state_name(&state, id);
         let switch = Switch {
             at: now() * 1000,
             from: current.name.clone(),
-            to: name(&target),
+            to: tunnels
+                .iter()
+                .find(|tunnel| tunnel.id == target)
+                .map_or_else(|| target.clone(), |tunnel| tunnel.name.clone()),
             reason: reason.text().into(),
         };
         record.at = now();
@@ -217,14 +217,6 @@ pub fn step(config: &Settings) -> Result<()> {
         }
         .write()
     })
-}
-
-fn state_name(state: &State, id: &str) -> String {
-    state
-        .tunnels
-        .iter()
-        .find(|tunnel| tunnel.id == id)
-        .map_or_else(|| id.to_owned(), |tunnel| tunnel.name.clone())
 }
 
 #[cfg(test)]

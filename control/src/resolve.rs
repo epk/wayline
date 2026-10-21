@@ -36,10 +36,14 @@ impl Resolved {
             .unwrap_or_default()
     }
 
+    pub fn host(&self, host: &str) -> Option<Ipv4Addr> {
+        self.hosts.get(host)?.first().copied()
+    }
+
     pub fn address(&self, target: &Target) -> Option<Ipv4Addr> {
         match target {
             Target::Address(address) => Some(*address),
-            Target::Host(host) => self.hosts.get(host)?.first().copied(),
+            Target::Host(host) => self.host(host),
         }
     }
 
@@ -69,16 +73,12 @@ impl Resolved {
             });
         }
         drop(sender);
+        self.hosts.retain(|host, _| hosts.contains(host));
         let started = Instant::now();
-        let mut hosts_found = BTreeMap::new();
         while let Some(left) = DEADLINE.checked_sub(started.elapsed()) {
             let Ok((host, found)) = receiver.recv_timeout(left) else {
                 break;
             };
-            hosts_found.insert(host, found);
-        }
-        self.hosts.retain(|host, _| hosts.contains(host));
-        for (host, found) in hosts_found {
             if !found.is_empty() || !self.hosts.contains_key(&host) {
                 self.hosts.insert(host, found);
             }
