@@ -96,6 +96,64 @@ pub fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+const LOADER_PREFIX: &str = "(function(){var module={exports:{}};var exports=module.exports;";
+const LOADER_SUFFIX: &str =
+    "\nreturn (module.exports && module.exports.default) || module.exports;})()";
+const LOADER_CHECK: &str = r"
+const fs = require('fs');
+const element = () => ({
+    setAttribute() {},
+    removeAttribute() {},
+    appendChild(child) { return child; },
+    insertBefore(child) { return child; },
+    removeChild(child) { return child; },
+    addEventListener() {},
+    removeEventListener() {},
+    style: {},
+    childNodes: [],
+    sheet: { cssRules: [], insertRule() { return 0; }, deleteRule() {} },
+});
+globalThis.window = globalThis;
+globalThis.document = {
+    head: element(),
+    body: element(),
+    createElement: element,
+    createElementNS: element,
+    createTextNode: () => ({}),
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    getElementsByTagName: () => [],
+    addEventListener() {},
+    removeEventListener() {},
+};
+globalThis.require = () => ({});
+let ok = false;
+try {
+    const value = (0, eval)(fs.readFileSync(process.argv[1], 'utf8'));
+    ok = value !== null && typeof value === 'object' && (typeof value.render === 'function' || value.components !== undefined || value.name !== undefined);
+} catch {
+    ok = false;
+}
+process.stdout.write(ok ? 'ok\n' : 'failed\n');
+";
+
+fn wrap_bundle(bundle: &[u8]) -> Result<Vec<u8>> {
+    let mut wrapped = Vec::with_capacity(bundle.len() + LOADER_PREFIX.len() + LOADER_SUFFIX.len());
+    wrapped.extend_from_slice(LOADER_PREFIX.as_bytes());
+    wrapped.extend_from_slice(bundle);
+    wrapped.extend_from_slice(LOADER_SUFFIX.as_bytes());
+    let mut file = tempfile::NamedTempFile::new()?;
+    file.write_all(&wrapped)?;
+    let path = file.path().to_str().context("Invalid bundle path.")?;
+    let (success, output) =
+        wayline_support::output_status("node", &["-e", LOADER_CHECK, path], 65536, 20)?;
+    ensure!(
+        success && String::from_utf8_lossy(&output).trim() == "ok",
+        "The UI bundle does not evaluate to a Wayline component, so the page would stay empty. Rebuild the UI bundle."
+    );
+    Ok(wrapped)
+}
+
 pub fn build(version: &str) -> Result<()> {
     let parsed = semver::Version::parse(version)?;
     ensure!(
@@ -117,8 +175,9 @@ pub fn build(version: &str) -> Result<()> {
     }
     let views = root.join("www/views");
     fs::create_dir_all(&views)?;
+    let bundle = wrap_bundle(&fs::read("ui/dist/gl-sdk4-ui-wayline.common.js")?)?;
     let mut gzip = GzEncoder::new(Vec::new(), Compression::best());
-    gzip.write_all(&fs::read("ui/dist/gl-sdk4-ui-wayline.common.js")?)?;
+    gzip.write_all(&bundle)?;
     fs::write(
         views.join("gl-sdk4-ui-wayline.common.js.gz"),
         gzip.finish()?,

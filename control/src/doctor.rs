@@ -5,6 +5,7 @@ use crate::{
     settings::Settings,
     update,
 };
+use anyhow::Result;
 use serde_json::{Value, json};
 use std::{fs, path::Path};
 
@@ -22,12 +23,49 @@ fn show(ok: bool, label: &str, detail: &str) -> bool {
     ok
 }
 
+fn warn(warnings: &mut usize, label: &str, detail: &str) {
+    *warnings += 1;
+    println!("[WARN] {label}: {detail}");
+}
+
 fn size(path: &str) -> String {
     fs::metadata(path).map_or_else(|_| "missing".into(), |meta| format!("{} bytes", meta.len()))
 }
 
+fn topology(
+    warnings: &mut usize,
+    settings: &Result<Settings>,
+    inventory: &Result<router::Inventory>,
+) {
+    let Ok(value) = inventory else {
+        return;
+    };
+    match &value.wan {
+        Some(wan) => {
+            show(
+                true,
+                "WAN path",
+                &format!("{} on {}", wan.name, wan.interface),
+            );
+        }
+        None => warn(warnings, "WAN path", &value.wan_reason),
+    }
+    if let Ok(config) = settings
+        && router::endpoints_enabled(config)
+    {
+        for path in router::monitored(config, value).filter(|path| path.endpoint.is_none()) {
+            warn(
+                warnings,
+                &format!("VPN endpoint {}", path.name),
+                &path.endpoint_reason,
+            );
+        }
+    }
+}
+
 pub fn run() -> bool {
     let mut healthy = true;
+    let mut warnings = 0;
     println!("Wayline doctor. Send this output when you report a problem.");
     println!("package version: {}", version());
     let compat = native::compat();
@@ -72,17 +110,13 @@ pub fn run() -> bool {
             .as_ref()
             .map_or_else(ToString::to_string, |value| {
                 format!(
-                    "{} tunnel(s), {} connected, WAN path {}",
+                    "{} tunnel(s), {} connected",
                     value.tunnels.len(),
-                    value.paths.len(),
-                    if value.wan.is_some() {
-                        "found"
-                    } else {
-                        "missing"
-                    }
+                    value.paths.len()
                 )
             }),
     );
+    topology(&mut warnings, &settings, &inventory);
     let list = native::List::read();
     let detail = list.as_ref().map_or_else(ToString::to_string, |value| {
         format!("{} tunnel(s) in priority order", value.tunnels.len())
@@ -109,18 +143,21 @@ pub fn run() -> bool {
     );
     println!("measurement series: {}", snapshot().len());
     if let Some(status) = update::Status::read() {
-        println!(
-            "last update check: {}",
-            serde_json::to_string(&status).unwrap_or_default()
-        );
-    }
-    println!(
-        "{}",
-        if healthy {
-            "Result: healthy"
-        } else {
-            "Result: problems found"
+        let value = serde_json::to_value(&status).unwrap_or_default();
+        println!("last update check: {value}");
+        if value["failed"] == true {
+            warn(
+                &mut warnings,
+                "last update check",
+                "The last update failed.",
+            );
         }
-    );
+    }
+    let result = match (healthy, warnings) {
+        (false, _) => "Result: problems found".to_owned(),
+        (true, 0) => "Result: healthy".to_owned(),
+        (true, count) => format!("Result: healthy with {count} warning(s)"),
+    };
+    println!("{result}");
     healthy
 }

@@ -197,12 +197,19 @@ pub fn supported() -> bool {
 
 pub fn bus<T: DeserializeOwned>(object: &str, method: &str, params: &Value) -> Result<T> {
     let encoded = serde_json::to_string(params)?;
-    Ok(serde_json::from_str(&text(
+    let reply = text(
         "ubus",
         &["-t", "3", "call", object, method, &encoded],
         262_144,
         4,
-    )?)?)
+    )?;
+    let reply = if reply.trim().is_empty() {
+        "null"
+    } else {
+        &reply
+    };
+    serde_json::from_str(reply)
+        .with_context(|| format!("Unknown reply from ubus {object} {method}."))
 }
 
 pub fn call<T: DeserializeOwned>(method: &str, params: &Value) -> Result<T> {

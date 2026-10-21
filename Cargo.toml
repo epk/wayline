@@ -4,7 +4,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.99.1"
 publish = false
 
 [workspace.dependencies]
@@ -12,10 +12,12 @@ wayline-protocol = { path = "protocol" }
 wayline-support = { path = "support" }
 anyhow = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+netlink-packet-core = "=0.9.0"
 rustix = { version = "=1.1.5", default-features = false, features = ["std"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "=1.0.154"
+socket2 = { version = "=0.6.5", features = ["all"] }
 tar = "0.4"
 tempfile = "3"
 

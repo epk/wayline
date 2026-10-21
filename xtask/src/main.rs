@@ -114,7 +114,7 @@ fn main() -> Result<()> {
 fn release_version(argument: Option<String>) -> Result<String> {
     let version = argument
         .or_else(|| std::env::var("GITHUB_REF_NAME").ok())
-        .unwrap_or_else(|| "0.1.0-alpha.3".into());
+        .unwrap_or_else(|| "0.1.0-alpha.4".into());
     let version = version.strip_prefix('v').unwrap_or(&version).to_owned();
     semver::Version::parse(&version)?;
     Ok(version)

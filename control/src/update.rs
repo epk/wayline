@@ -12,6 +12,8 @@ use std::{
 };
 use wayline_support::{atomic, digest, read, text};
 
+const RELEASES: &str = "https://api.github.com/repos/epk/wayline/releases?per_page=30";
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Artifact {
@@ -40,7 +42,6 @@ struct Manifest {
 struct Release {
     tag_name: String,
     draft: bool,
-    prerelease: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -65,6 +66,10 @@ impl Status {
         serde_json::from_slice(&fs::read(Self::path()).ok()?).ok()
     }
 
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
     fn path() -> PathBuf {
         PathBuf::from(format!("{RUNTIME}/update.json"))
     }
@@ -86,8 +91,7 @@ impl Status {
 
 fn download(url: &str, path: &Path, limit: u64) -> Result<()> {
     ensure!(
-        url.starts_with("https://api.github.com/repos/epk/wayline/")
-            || url.starts_with("https://github.com/epk/wayline/releases/download/v"),
+        url == RELEASES || url.starts_with("https://github.com/epk/wayline/releases/download/v"),
         "Invalid release URL."
     );
     let status = text(
@@ -114,9 +118,6 @@ fn download(url: &str, path: &Path, limit: u64) -> Result<()> {
         1024,
         35,
     )?;
-    if status.trim() == "404" && url.ends_with("/releases/latest") {
-        anyhow::bail!("No stable release is available.");
-    }
     ensure!(
         status.trim() == "200",
         "The release server rejected the request."
@@ -128,23 +129,25 @@ fn download(url: &str, path: &Path, limit: u64) -> Result<()> {
     Ok(())
 }
 
-fn metadata(folder: &Path) -> Result<(Manifest, Artifact, String)> {
-    let release_path = folder.join("release.json");
-    download(
-        "https://api.github.com/repos/epk/wayline/releases/latest",
-        &release_path,
-        65_536,
-    )?;
-    let release: Release = serde_json::from_slice(&read(&release_path, 65_536)?)?;
-    let tag = release
-        .tag_name
-        .strip_prefix('v')
-        .context("Invalid release tag.")?;
-    let parsed = Version::parse(tag)?;
-    ensure!(
-        !release.draft && !release.prerelease && parsed.pre.is_empty() && parsed.build.is_empty(),
-        "The release is not a stable version."
-    );
+fn newest(releases: &[Release]) -> Option<Version> {
+    releases
+        .iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| release.tag_name.strip_prefix('v')?.parse::<Version>().ok())
+        .filter(|version| version.build.is_empty())
+        .max()
+}
+
+fn newer(folder: &Path) -> Result<Option<Version>> {
+    let path = folder.join("releases.json");
+    download(RELEASES, &path, 262_144)?;
+    let releases: Vec<Release> = serde_json::from_slice(&read(&path, 262_144)?)?;
+    let installed = Version::parse(&version())?;
+    Ok(newest(&releases).filter(|latest| *latest > installed))
+}
+
+fn metadata(folder: &Path, latest: &Version) -> Result<(Manifest, Artifact, String)> {
+    let tag = latest.to_string();
     let prefix = format!("https://github.com/epk/wayline/releases/download/v{tag}/");
     let manifest = folder.join("manifest.json");
     let signature = folder.join("manifest.json.sig");
@@ -244,10 +247,10 @@ fn package_identity(path: &Path, expected: &str) -> Result<()> {
 
 fn execute(install: bool) -> Result<Status> {
     let folder = tempfile::tempdir_in(RUNTIME)?;
-    let (manifest, artifact, prefix) = metadata(folder.path())?;
-    if Version::parse(&manifest.version)? <= Version::parse(&version())? {
+    let Some(latest) = newer(folder.path())? else {
         return Ok(Status::checked("Wayline is current.", false, version()));
-    }
+    };
+    let (manifest, artifact, prefix) = metadata(folder.path(), &latest)?;
     if !install {
         return Ok(Status::checked(
             "A signed update is available.",
@@ -286,6 +289,20 @@ fn execute(install: bool) -> Result<Status> {
     Ok(Status::checked("Wayline updated.", false, manifest.version))
 }
 
+fn attempt(install: bool) -> Status {
+    execute(install).unwrap_or_else(|error| Status {
+        message: format!("Update stopped. {error}"),
+        failed: true,
+        needs_attention: Status::read().is_some_and(|status| status.installing),
+        checked_at: now(),
+        ..Status::default()
+    })
+}
+
+fn settled(previous: Option<&Status>) -> bool {
+    previous.is_none_or(|status| !status.installing && !status.needs_attention)
+}
+
 fn space(path: &Path, minimum: u64) -> Result<()> {
     let capacity = rustix::fs::statvfs(path)?;
     ensure!(
@@ -295,15 +312,26 @@ fn space(path: &Path, minimum: u64) -> Result<()> {
     Ok(())
 }
 
+pub fn run_now(install: bool) -> Result<Status> {
+    locked("update", || {
+        let previous = Status::read();
+        ensure!(
+            settled(previous.as_ref()),
+            "A previous installation needs checking."
+        );
+        let status = attempt(install);
+        status.write()?;
+        Ok(status)
+    })
+}
+
 pub fn scheduled(config: &Settings) -> Result<()> {
     locked("update", || {
         let request = PathBuf::from(format!("{RUNTIME}/update-request"));
         let requested = fs::read_to_string(&request).unwrap_or_default();
         let previous = Status::read();
         ensure!(
-            previous
-                .as_ref()
-                .is_none_or(|status| !status.installing && !status.needs_attention),
+            settled(previous.as_ref()),
             "A previous installation needs checking."
         );
         if requested.is_empty()
@@ -313,18 +341,71 @@ pub fn scheduled(config: &Settings) -> Result<()> {
             return Ok(());
         }
         let status =
-            execute(requested == "install_update" || (requested.is_empty() && config.auto_updates))
-                .unwrap_or_else(|error| Status {
-                    message: format!("Update stopped. {error}"),
-                    failed: true,
-                    needs_attention: Status::read().is_some_and(|status| status.installing),
-                    checked_at: now(),
-                    ..Status::default()
-                });
+            attempt(requested == "install_update" || (requested.is_empty() && config.auto_updates));
         status.write()?;
         if request.exists() {
             fs::remove_file(request)?;
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Release, newest};
+    use anyhow::{Result, ensure};
+    use semver::Version;
+
+    fn release(tag_name: &str, draft: bool) -> Release {
+        Release {
+            tag_name: tag_name.into(),
+            draft,
+        }
+    }
+
+    #[test]
+    fn skips_drafts() -> Result<()> {
+        let releases = [release("v0.2.0", true), release("v0.1.0-alpha.4", false)];
+        ensure!(newest(&releases) == Some(Version::parse("0.1.0-alpha.4")?));
+        Ok(())
+    }
+
+    #[test]
+    fn chooses_prereleases() -> Result<()> {
+        let releases = [
+            release("v0.1.0-alpha.3", false),
+            release("v0.1.0-beta.1", false),
+        ];
+        ensure!(newest(&releases) == Some(Version::parse("0.1.0-beta.1")?));
+        Ok(())
+    }
+
+    #[test]
+    fn stable_beats_prereleases() -> Result<()> {
+        let releases = [
+            release("v0.1.0-rc.1", false),
+            release("v0.1.0", false),
+            release("v0.1.0-beta.1", false),
+        ];
+        ensure!(newest(&releases) == Some(Version::parse("0.1.0")?));
+        Ok(())
+    }
+
+    #[test]
+    fn skips_unparsable_tags() -> Result<()> {
+        let releases = [
+            release("vnext", false),
+            release("0.3.0", false),
+            release("v0.3.0+build.1", false),
+            release("v0.1.0-alpha.4", false),
+        ];
+        ensure!(newest(&releases) == Some(Version::parse("0.1.0-alpha.4")?));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_list_has_no_release() -> Result<()> {
+        ensure!(newest(&[]).is_none());
+        Ok(())
+    }
 }

@@ -3,6 +3,13 @@ use anyhow::{Result, ensure};
 use std::{fs, path::Path};
 use walkdir::WalkDir;
 
+const SHELL_SCRIPTS: [&str; 4] = [
+    "package/postinst",
+    "package/prerm",
+    "package/files/etc/hotplug.d/iface/95-wayline",
+    "install.sh",
+];
+
 fn sources(root: &str, extension: &str) -> Vec<String> {
     WalkDir::new(root)
         .into_iter()
@@ -76,24 +83,10 @@ pub fn check() -> Result<()> {
             "package/files/usr/share/gl-validator.d/wayline.lua",
         ],
     )?;
-    run(
-        "shellcheck",
-        &[
-            "package/postinst",
-            "package/prerm",
-            "package/files/etc/hotplug.d/iface/95-wayline",
-        ],
-    )?;
+    run("shellcheck", &SHELL_SCRIPTS)?;
     run(
         "shfmt",
-        &[
-            "-d",
-            "-i",
-            "4",
-            "package/postinst",
-            "package/prerm",
-            "package/files/etc/hotplug.d/iface/95-wayline",
-        ],
+        &[&["-d", "-i", "4"][..], &SHELL_SCRIPTS[..]].concat(),
     )?;
     run(
         "nixfmt",
@@ -157,14 +150,7 @@ pub fn format() -> Result<()> {
     )?;
     run(
         "shfmt",
-        &[
-            "-w",
-            "-i",
-            "4",
-            "package/postinst",
-            "package/prerm",
-            "package/files/etc/hotplug.d/iface/95-wayline",
-        ],
+        &[&["-w", "-i", "4"][..], &SHELL_SCRIPTS[..]].concat(),
     )?;
     run(
         "nixfmt",

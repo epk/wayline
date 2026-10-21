@@ -7,21 +7,27 @@
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{
+    fmt::Write as _,
     fs,
     io::{Read, Write},
     path::Path,
-    process::{Command, Stdio},
-    time::Duration,
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 use tempfile::NamedTempFile;
-use wait_timeout::ChildExt;
 
 pub const FIRMWARE_CONTRACT: &str =
     "9c8a9102c046ff12ba95e4c9a03b4e5392c461584c5d4d8ab9c5591ab6ec9237";
 
 #[must_use]
 pub fn digest(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
+    Sha256::digest(data)
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 pub fn read(path: &Path, limit: usize) -> Result<Vec<u8>> {
@@ -107,7 +113,7 @@ fn run(
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("Cannot start {program}."))?;
-    let status = child.wait_timeout(Duration::from_secs(seconds))?;
+    let status = wait(&mut child, Duration::from_secs(seconds))?;
     let Some(status) = status else {
         child.kill()?;
         child.wait()?;
@@ -120,4 +126,17 @@ fn run(
     let mut bytes = Vec::new();
     data.read_to_end(&mut bytes)?;
     Ok((status.success(), bytes))
+}
+
+fn wait(child: &mut Child, limit: Duration) -> Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }

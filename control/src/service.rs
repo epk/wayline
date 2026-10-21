@@ -1,5 +1,5 @@
 use crate::{
-    auto, history, native,
+    auto, egress, history, native,
     resolve::Resolved,
     router,
     runtime::{DAEMON, MONITOR_CONFIG, RUNTIME, STATUS_SOCKET, locked, now, snapshot},
@@ -22,6 +22,23 @@ fn halt() {
 
 pub fn stop() -> Result<()> {
     delete().map(drop)
+}
+
+pub fn running() -> Result<()> {
+    let list = native::bus::<Value>("service", "list", &json!({"name":"wayline"}))?;
+    anyhow::ensure!(
+        list["wayline"]["instances"]["monitor"]["running"] == true,
+        "The monitor is not running."
+    );
+    Ok(())
+}
+
+pub fn enabled() -> Result<()> {
+    anyhow::ensure!(
+        Path::new("/etc/rc.d/S95wayline").exists(),
+        "Wayline is not enabled at boot."
+    );
+    Ok(())
 }
 
 pub fn reconcile() -> Result<()> {
@@ -64,7 +81,7 @@ fn reconcile_inner() -> Result<()> {
             "set",
             &json!({"name":"wayline","instances":{"monitor":{
             "command":[DAEMON,"monitor","--config",path,"--socket",STATUS_SOCKET],
-            "respawn":[3600,5,3],"limits":{"core":"0","nofile":"128 128"},"stderr":true,"file":[path]}}}),
+            "respawn":["3600","5","3"],"limits":{"core":"0","nofile":"128 128"},"stderr":true,"file":[path]}}}),
         )?;
     }
     Ok(())
@@ -117,6 +134,9 @@ fn routine() -> Result<()> {
         }
     }
     reconcile()?;
+    if config.enabled && native::supported() {
+        egress::Cache::refresh(&router::inventory()?)?;
+    }
     let collected = format!("{RUNTIME}/last-collect");
     let last = fs::read_to_string(&collected)
         .ok()

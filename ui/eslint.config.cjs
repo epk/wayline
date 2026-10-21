@@ -6,7 +6,7 @@ module.exports = [
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: 'module',
-      globals: { window: 'readonly', document: 'readonly', setTimeout: 'readonly', clearTimeout: 'readonly', ResizeObserver: 'readonly', module: 'readonly', require: 'readonly', __dirname: 'readonly' },
+      globals: { window: 'readonly', document: 'readonly', setTimeout: 'readonly', clearTimeout: 'readonly', ResizeObserver: 'readonly', module: 'readonly', require: 'readonly', __dirname: 'readonly', fetch: 'readonly', WAYLINE_VERSION: 'readonly' },
     },
     rules: {
       'no-unused-vars': 'error',

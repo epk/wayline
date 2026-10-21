@@ -1,5 +1,10 @@
 const path = require('path');
 const { VueLoaderPlugin } = require('vue-loader');
+const { DefinePlugin } = require('webpack');
+const fs = require('fs');
+const version = fs
+  .readFileSync(path.resolve(__dirname, '../monitor/Cargo.toml'), 'utf8')
+  .match(/^version = "([^"]+)"/m)[1];
 module.exports = {
   entry: './src/boundary.js',
   output: {
@@ -15,7 +20,7 @@ module.exports = {
       { test: /\.css$/, use: ['vue-style-loader', 'css-loader'] },
     ],
   },
-  plugins: [new VueLoaderPlugin()],
+  plugins: [new VueLoaderPlugin(), new DefinePlugin({ WAYLINE_VERSION: JSON.stringify(version) })],
   resolve: { extensions: ['.js', '.vue'] },
   performance: { hints: 'error', maxAssetSize: 80000, maxEntrypointSize: 80000 },
 };

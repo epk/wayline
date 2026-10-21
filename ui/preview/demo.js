@@ -1,8 +1,8 @@
 (() => {
   const anchor = Math.floor(Date.now() / 60000) * 60000;
   const names = {
-    home: 'Home · Amsterdam',
-    backup: 'Backup · Frankfurt',
+    home: 'Home (Amsterdam)',
+    backup: 'Backup (Frankfurt)',
     tokyo: 'Tokyo',
     zurich: 'Zurich',
     wan: 'Direct WAN',
@@ -11,6 +11,7 @@
   const level = ['monitoring', 'unsupported', 'newer'].includes(query.get('compat'))
     ? query.get('compat')
     : 'full';
+  const wanDown = query.get('wan') === 'unavailable';
   const compatMessages = {
     full: '',
     monitoring: 'This firmware is newer than the tested range. Monitoring works.',
@@ -27,7 +28,7 @@
   const features = { full: 4, newer: 4, monitoring: 2, unsupported: 0 };
   let revision = 1;
   const state = {
-    version: '0.1.0-alpha.3',
+    version: '0.1.0-alpha.4',
     revision: '1',
     scope: 'All clients',
     compat: {
@@ -51,6 +52,49 @@
       autoExit: true,
       endpointDiagnostics: true,
     },
+    egress: Object.assign(
+      { checkedAt: Math.floor(Date.now() / 1000) - 90 },
+      {
+        paths: [
+          {
+            id: 'home',
+            name: names.home,
+            interface: 'wg-home',
+            ip: '203.0.113.5',
+            location: 'CA',
+            colo: 'YYZ',
+            error: null,
+          },
+          {
+            id: 'backup',
+            name: names.backup,
+            interface: 'wg-backup',
+            ip: '198.51.100.7',
+            location: 'DE',
+            colo: 'FRA',
+            error: null,
+          },
+          {
+            id: 'tokyo',
+            name: names.tokyo,
+            interface: 'wg-tokyo',
+            ip: null,
+            location: null,
+            colo: null,
+            error: 'The IP check timed out after 6 seconds.',
+          },
+          {
+            id: 'wan',
+            name: names.wan,
+            interface: wanDown ? null : 'wwan',
+            ip: wanDown ? null : '203.0.113.80',
+            location: wanDown ? null : 'US',
+            colo: wanDown ? null : 'LAX',
+            error: wanDown ? 'Direct WAN is unavailable.' : null,
+          },
+        ],
+      },
+    ),
     auto: {
       enabled: true,
       last: {
@@ -60,9 +104,22 @@
         reason: 'Home is 38% faster and healthy.',
       },
     },
+    wan: wanDown
+      ? {
+          available: false,
+          interface: null,
+          reason: 'The WAN probe cannot bypass the VPN on this firmware.',
+        }
+      : { available: true, interface: 'wwan', reason: '' },
     endpoints: [
-      { tunnel: 'home', name: names.home, address: '203.0.113.10' },
-      { tunnel: 'backup', name: names.backup, address: '198.51.100.24' },
+      { tunnel: 'home', name: names.home, address: '203.0.113.10', reason: '' },
+      { tunnel: 'backup', name: names.backup, address: '198.51.100.24', reason: '' },
+      {
+        tunnel: 'zurich',
+        name: names.zurich,
+        address: null,
+        reason: 'The server address is not known until the tunnel connects once.',
+      },
     ],
     resolved: { 'example.com': '93.184.216.34', 'missing.invalid': null },
     tunnels: [
@@ -147,7 +204,7 @@
   const delay = (o) => new Promise((resolve) => setTimeout(() => resolve(copy(o)), 180));
   function series(id, target, start, end, step) {
     const targetBias = target === 'example.com' ? 7 : target === '9.9.9.9' ? 4 : 0;
-    const base = { home: 32, backup: 48, tokyo: 130, wan: 14 }[id] || 32;
+    const base = { home: 32, backup: 48, tokyo: 130, zurich: 62, wan: 14 }[id] || 32;
     const points = [];
     for (let at = start; at <= end; at += step * 60000) {
       const n = Math.round((at - anchor) / 60000) + 1440;
@@ -225,13 +282,17 @@
       }
       return delay({ applied: true, enabled });
     },
-    get_history: ({ tunnel, target, start, end, step, include_wan }) =>
-      Promise.resolve({
+    get_history: ({ tunnel, target, start, end, step, include_wan, all }) => {
+      const ids = all
+        ? state.tunnels.filter((t) => t.connected || t.historyAvailable).map((t) => t.id)
+        : [tunnel];
+      return Promise.resolve({
         series: [
-          series(tunnel, target, start, end, step),
-          ...(include_wan ? [series('wan', target, start, end, step)] : []),
+          ...ids.map((id) => series(id, target, start, end, step)),
+          ...(include_wan && !wanDown ? [series('wan', target, start, end, step)] : []),
         ],
-      }),
+      });
+    },
     check_update: () =>
       delay({
         available: level === 'unsupported',

@@ -1,7 +1,7 @@
 <template>
   <main class="vph">
     <div v-if="preview" class="vph-preview">
-      Interactive preview · sample data · no router changes
+      Interactive preview with sample data. No router changes.
     </div>
     <section
       v-if="level === 'unsupported'"
@@ -68,7 +68,6 @@
     </div>
     <header class="vph-heading">
       <div>
-        <div class="vph-eyebrow">VPN</div>
         <h1>Wayline</h1>
         <p>Compare your tunnels and choose an exit.</p>
       </div>
@@ -83,6 +82,10 @@
         Settings
       </button>
     </header>
+    <div v-if="staleBundle" class="vph-notice" role="status">
+      This page is from Wayline {{ bundleVersion }}, but the router runs {{ state.version }}.
+      <button type="button" class="vph-button" @click="reloadPage">Reload page</button>
+    </div>
     <p class="vph-statusline" role="status">{{ statusLine }}</p>
     <p v-if="!can.configure && ready" class="vph-muted vph-hint">{{ configureReason }}</p>
     <div role="alert">
@@ -300,12 +303,12 @@
       <div class="vph-scope">
         <span
           >Exit preference for <strong>{{ state.scope || 'Scope unavailable' }}</strong></span
-        ><span class="vph-muted"
-          >Target {{ state.config.target }}
-          <span v-if="resolvedText(state.config.target)"
-            >({{ resolvedText(state.config.target) }})</span
-          >
-          · every {{ state.config.interval }}s</span
+        >
+        <span class="vph-muted"
+          >Target {{ state.config.target
+          }}<template v-if="resolvedText(state.config.target)"
+            >. {{ resolvedText(state.config.target) }}</template
+          >. Checked every {{ state.config.interval }} seconds.</span
         >
       </div>
       <p v-if="!can.select && selectReason" class="vph-muted vph-hint">{{ selectReason }}</p>
@@ -316,7 +319,7 @@
           <time :title="new Date(state.auto.last.at).toLocaleString()">{{
             ago(state.auto.last.at)
           }}</time
-          >: {{ tunnelName(state.auto.last.from) }} → {{ tunnelName(state.auto.last.to) }}.
+          >: from {{ tunnelName(state.auto.last.from) }} to {{ tunnelName(state.auto.last.to) }}.
           {{ state.auto.last.reason }}</span
         >
         <span v-else class="vph-muted"> No switch yet.</span>
@@ -332,86 +335,127 @@
             <tr>
               <th scope="col">Tunnel</th>
               <th scope="col">Latency</th>
-              <th scope="col">Loss</th>
-              <th scope="col" class="vph-spark-column">Recent latency</th>
-              <th scope="col"><span class="vph-sr">Actions</span></th>
+              <th scope="col" class="vph-spark-column">Recent</th>
+              <th scope="col" class="vph-action-head"><span class="vph-sr">Actions</span></th>
             </tr>
           </thead>
           <tbody>
             <tr
               v-for="t in state.tunnels"
               :key="t.id"
-              :class="{ selected: selectedTunnel === t.id }"
+              :class="{ selected: selectedTunnel === t.id, 'vph-active': t.preferred }"
             >
-              <td>
-                <button
-                  class="vph-name"
-                  :aria-pressed="selectedTunnel === t.id ? 'true' : 'false'"
-                  :aria-label="'Show history for ' + t.name"
-                  @click="
-                    selectedTunnel = t.id;
-                    loadHistory();
-                  "
-                >
-                  {{ t.name }}</button
-                ><span v-if="t.preferred" class="vph-badge">Preferred</span>
-                <div class="vph-muted vph-status">
-                  {{ t.stateLabel }}<span v-if="t.age !== 'unknown'"> · {{ t.age }} ago</span>
+              <td class="vph-tunnel">
+                <div class="vph-name-line">
+                  <span
+                    class="vph-state-dot"
+                    :class="'vph-state-' + tunnelTone(t)"
+                    aria-hidden="true"
+                  ></span>
+                  <button
+                    class="vph-name"
+                    :aria-pressed="selectedTunnel === t.id ? 'true' : 'false'"
+                    :aria-label="'Highlight ' + t.name + ' in the latency graph'"
+                    @click="highlight(t.id)"
+                  >
+                    {{ t.name }}</button
+                  ><span v-if="t.preferred" class="vph-badge">Active exit</span>
+                </div>
+                <div class="vph-muted vph-status">{{ t.stateLabel }}{{ tunnelEgress(t) }}</div>
+                <div v-if="notEligible(t)" class="vph-muted vph-status">
+                  Not eligible: {{ t.reason || 'not ready yet' }}
                 </div>
               </td>
-              <td class="vph-number">
-                {{ latency(t.median) }}<small v-if="t.median !== null"> ms</small>
+              <td class="vph-metric" data-label="Latency">
+                <span class="vph-number"
+                  >{{ latency(t.median) }}<small v-if="t.median !== null"> ms</small></span
+                >
+                <span v-if="lossShown(t)" class="vph-loss" :title="lossTitle(t)"
+                  >{{ lossText(t) }} loss</span
+                >
+                <span class="vph-bar" aria-hidden="true"
+                  ><span
+                    class="vph-bar-fill"
+                    :class="{ 'vph-bar-best': t.id === fastestId }"
+                    :style="{ width: barWidth(t) + '%' }"
+                  ></span
+                ></span>
               </td>
-              <td class="vph-number">{{ t.lost }} / {{ t.samples }}</td>
               <td class="vph-spark-column">
                 <svg
+                  v-if="sparkStats(t.recent)"
                   class="vph-spark"
-                  viewBox="0 0 150 32"
+                  viewBox="0 0 128 24"
+                  preserveAspectRatio="none"
                   role="img"
-                  :aria-label="'Recent latency for ' + t.name"
+                  :aria-label="sparkLabel(t)"
                 >
-                  <path :d="spark(t.recent)" />
+                  <title>{{ sparkLabel(t) }}</title>
+                  <rect
+                    v-for="b in sparkBars(t.recent)"
+                    :key="b.i"
+                    :x="b.x"
+                    :y="b.y"
+                    :width="b.w"
+                    :height="b.h"
+                    :class="{ 'vph-spark-lost': b.lost }"
+                  />
                 </svg>
+                <span v-else class="vph-muted">Waiting for samples</span>
               </td>
-              <td class="vph-action">
-                <div v-if="pendingStop === t.id" class="vph-actions">
-                  <button
-                    ref="confirm"
-                    class="vph-button vph-danger"
-                    :disabled="busy"
-                    :aria-label="'Confirm stop ' + t.name"
-                    @click="setTunnelEnabled(t)"
-                  >
-                    Stop tunnel
-                  </button>
-                  <button class="vph-button" @click="pendingStop = ''">Keep running</button>
+              <td class="vph-action" :class="{ 'vph-confirming': pendingStop === t.id }">
+                <div v-if="pendingStop === t.id" class="vph-confirm">
+                  <span class="vph-confirm-text">Stop {{ t.name }}? Traffic may use WAN.</span>
+                  <div class="vph-actions">
+                    <button
+                      ref="confirm"
+                      type="button"
+                      class="vph-control vph-danger"
+                      :disabled="busy"
+                      :aria-label="'Confirm stop ' + t.name"
+                      @click="setTunnelEnabled(t)"
+                    >
+                      Stop
+                    </button>
+                    <button type="button" class="vph-control" @click="pendingStop = ''">
+                      Cancel
+                    </button>
+                  </div>
                 </div>
                 <div v-else class="vph-actions">
-                  <span v-if="t.preferred" class="vph-muted">Highest priority</span
-                  ><button
-                    v-else
-                    class="vph-button"
-                    :disabled="busy || !t.eligible || !can.select"
+                  <button
+                    v-if="!t.preferred && t.enabled"
+                    type="button"
+                    class="vph-control"
+                    :disabled="useDisabled(t)"
+                    :title="useReason(t)"
                     :aria-label="'Use ' + t.name + ' as exit'"
                     @click="selectExit(t)"
                   >
-                    {{ busyTunnel === t.id && busyAction === 'select' ? 'Applying…' : 'Use exit' }}
+                    {{
+                      busyTunnel === t.id && busyAction === 'select' ? 'Applying…' : 'Use as exit'
+                    }}
                   </button>
+                  <span
+                    v-if="busyTunnel === t.id && busyAction === 'toggle'"
+                    class="vph-muted vph-busy"
+                    role="status"
+                    >{{ t.enabled ? 'Stopping…' : 'Starting…' }}</span
+                  >
                   <button
-                    class="vph-button"
-                    :disabled="busy || !t.controllable || !can.control"
-                    :aria-label="(t.enabled ? 'Stop ' : 'Start ') + t.name"
+                    v-else
+                    type="button"
+                    role="switch"
+                    class="vph-switch"
+                    :aria-checked="t.enabled ? 'true' : 'false'"
+                    :disabled="toggleDisabled(t)"
+                    :title="toggleReason(t)"
                     @click="askToggle(t)"
                   >
-                    {{ toggleLabel(t) }}
+                    <span class="vph-sr">{{ (t.enabled ? 'Stop ' : 'Start ') + t.name }}</span>
+                    <span class="vph-track" aria-hidden="true"></span>
                   </button>
                 </div>
-                <small v-if="pendingStop === t.id"
-                  >Stop {{ t.name }}? Traffic can use WAN under your GL.iNet policy.</small
-                >
-                <small v-if="exitHint(t)">{{ exitHint(t) }}</small>
-                <small v-if="!t.controllable">Native tunnel control is unavailable.</small>
-                <small v-else-if="!can.control">{{ controlReason }}</small>
               </td>
             </tr>
           </tbody>
@@ -420,13 +464,13 @@
           {{ emptyText }}
         </div>
       </div>
-      <p class="vph-muted">
-        Preference changes apply to this traffic scope. Applications with existing connections may
-        need to reconnect.
+      <p v-if="wanEgress" class="vph-muted vph-note">
+        {{ egressText(wanEgress, 'Direct WAN exit IP') }}
+        <span v-if="wanEgress.error" class="vph-egress-error">{{ wanEgress.error }}</span>
       </p>
-      <p class="vph-muted">
-        Start and Stop use GL.iNet's VPN manager. Starting preserves priority. Stopping can permit
-        WAN traffic under your GL.iNet policy.
+      <p class="vph-muted vph-note">
+        Changing the active exit applies to new connections. Stopping a tunnel can send traffic over
+        WAN under your GL.iNet policy.
       </p>
     </template>
     <template v-else>
@@ -448,7 +492,7 @@
           <thead>
             <tr>
               <th scope="col">Destination</th>
-              <th scope="col" v-if="state.config.directWan">Direct WAN</th>
+              <th scope="col" v-if="state.config.directWan">{{ wanHeader }}</th>
               <th scope="col" v-for="t in state.tunnels" :key="t.id">{{ t.name }}</th>
             </tr>
           </thead>
@@ -475,22 +519,22 @@
                 </div>
               </td>
               <td v-if="state.config.directWan" class="vph-number">
-                {{ diagnostic(target, 'wan') }}
+                {{ wanCell(target) }}
               </td>
               <td v-for="t in state.tunnels" :key="t.id" class="vph-number">
                 {{ diagnostic(target, t.id) }}
               </td>
             </tr>
-            <tr
-              v-for="e in endpoints"
-              :key="'endpoint-' + e.tunnel + e.address"
-              class="vph-endpoint"
-            >
+            <tr v-for="e in endpoints" :key="'endpoint-' + e.tunnel" class="vph-endpoint">
               <td>
                 Endpoint of {{ e.name }}
-                <div class="vph-muted vph-status">{{ e.address }}</div>
+                <div class="vph-muted vph-status">
+                  {{ e.address || e.reason || 'No address yet' }}
+                </div>
               </td>
-              <td class="vph-number">{{ diagnostic(e.address, 'wan') }}</td>
+              <td v-if="state.config.directWan" class="vph-number">
+                {{ e.address ? wanCell(e.address) : '—' }}
+              </td>
               <td v-for="t in state.tunnels" :key="t.id" class="vph-number vph-muted">
                 <span aria-hidden="true">—</span><span class="vph-sr">Not measured</span>
               </td>
@@ -498,6 +542,9 @@
           </tbody>
         </table>
       </div>
+      <p v-if="state.config.directWan && !wanAvailable" class="vph-muted" role="note">
+        {{ wanNote }}
+      </p>
       <p v-if="state.config.endpointDiagnostics" class="vph-muted">
         {{
           endpoints.length
@@ -510,12 +557,15 @@
     <section v-if="tab === 'tunnels' || state.config.diagnostics" class="vph-panel vph-history">
       <header class="vph-chart-heading">
         <div>
-          <h2>{{ selectedName }} <span class="vph-muted">latency</span></h2>
-          <p v-if="storedHistory" class="vph-stored">Stored history (tunnel stopped)</p>
-          <p class="vph-muted">
-            {{ graphTarget }} ·
-            {{ range === 1440 ? '5-minute aggregates' : '1-minute aggregates' }} · gaps indicate
-            missing measurements
+          <h2 v-if="allMode">Latency to {{ graphTarget }} through each tunnel</h2>
+          <h2 v-else>{{ selectedName }} <span class="vph-muted">latency</span></h2>
+          <p v-if="!allMode && storedHistory" class="vph-stored">Stored history (tunnel stopped)</p>
+          <p v-if="allMode" class="vph-muted">
+            {{ range === 1440 ? 'Five-minute' : 'One-minute' }} medians. Gaps mean no measurement.
+          </p>
+          <p v-else class="vph-muted">
+            Showing {{ graphTarget }}. {{ range === 1440 ? 'Five-minute' : 'One-minute' }}
+            averages. Gaps mean no measurement.
           </p>
         </div>
         <div class="vph-ranges" role="group" aria-label="History range">
@@ -540,11 +590,15 @@
           role="img"
           tabindex="0"
           :aria-label="
-            'Latency history for ' +
-            selectedName +
-            ' to ' +
-            graphTarget +
-            '. Use the arrow keys to read values.'
+            allMode
+              ? 'Latency to ' +
+                graphTarget +
+                ' through each tunnel. Use the arrow keys to read values.'
+              : 'Latency history for ' +
+                selectedName +
+                ' to ' +
+                graphTarget +
+                '. Use the arrow keys to read values.'
           "
           @mousemove="hoverAt"
           @click="hoverAt"
@@ -553,8 +607,8 @@
         >
           <title>Latency in milliseconds over time</title>
           <desc>
-            Line shows median latency, band shows minimum to maximum. Missing measurements appear as
-            gaps.
+            Each line shows one tunnel's median latency. The highlighted tunnel also shows its
+            minimum to maximum band. Missing measurements appear as gaps.
           </desc>
           <g v-for="tick in [0, 1, 2, 3, 4]" :key="tick">
             <line
@@ -570,12 +624,25 @@
           </g>
           <text x="12" y="14">ms</text>
           <g
-            v-for="series in history"
+            v-for="series in drawOrder"
             :key="series.id"
-            :class="{ 'vph-wan-series': series.id === 'wan' }"
+            :class="{
+              'vph-wan-series': series.id === 'wan',
+              'vph-series-selected': isSelected(series),
+              'vph-series-dim': isDimmed(series),
+            }"
+            :style="{ '--series': seriesColor(series) }"
           >
-            <path :d="band(series.points)" class="vph-band" />
+            <path v-if="hasBand(series)" :d="band(series.points)" class="vph-band" />
             <path :d="line(series.points)" class="vph-line" />
+            <circle
+              v-for="dot in dots(series.points)"
+              :key="dot.key"
+              :cx="dot.x"
+              :cy="dot.y"
+              r="2.5"
+              class="vph-dot"
+            />
           </g>
           <text
             v-for="fraction in [0, 0.5, 1]"
@@ -593,21 +660,42 @@
           v-if="hover"
           role="status"
           class="vph-tooltip"
-          :style="{ left: Math.min(Math.max(hover.x, 0), chartWidth - 190) + 'px' }"
+          :style="{ left: Math.min(Math.max(hover.x, 0), chartWidth - 268) + 'px' }"
         >
           <strong>{{ clock(hover.at) }}</strong>
-          <div v-for="item in hover.values" :key="item.name">
-            {{ item.name }}: {{ item.value === null ? 'No measurement' : item.value + ' ms' }}
+          <div v-for="row in hoverRows" :key="row.id" :class="{ 'vph-tip-selected': row.selected }">
+            <span
+              class="vph-swatch vph-tip-swatch"
+              :class="{ 'vph-swatch-wan': row.id === 'wan' }"
+              :style="{ '--series': row.color }"
+              aria-hidden="true"
+            ></span
+            >{{ row.name }}{{ row.selected ? ' (selected)' : '' }}:
+            {{ row.value === null ? 'No measurement' : row.value + ' ms' }}
           </div>
         </div>
       </div>
       <div class="vph-chart-footer">
-        <span
-          ><span class="vph-swatch"></span>{{ selectedName }}
-          <span v-if="history.some((s) => s.id === 'wan')" class="vph-muted">
-            · dashed: direct WAN</span
-          ></span
-        ><span class="vph-muted">{{
+        <ul v-if="legendItems.length" class="vph-legend" aria-label="Tunnels in the graph">
+          <li v-for="item in legendItems" :key="item.id">
+            <button
+              v-if="item.tunnel"
+              type="button"
+              class="vph-legend-item"
+              :class="{ active: item.selected }"
+              :aria-pressed="item.selected ? 'true' : 'false'"
+              @click="highlight(item.id)"
+            >
+              <span class="vph-swatch" :style="{ '--series': item.color }" aria-hidden="true"></span
+              >{{ item.name }}<span v-if="item.preferred" class="vph-muted"> Active exit</span
+              ><span v-if="item.stored" class="vph-muted"> Stored</span>
+            </button>
+            <span v-else class="vph-legend-item vph-muted">
+              <span class="vph-swatch vph-swatch-wan" aria-hidden="true"></span>{{ item.name }}
+            </span>
+          </li>
+        </ul>
+        <span class="vph-muted vph-range-label">{{
           range === 1440
             ? 'Last 24 hours'
             : clock(windowStart) + ' – ' + clock(windowStart + range * 60000)
@@ -629,7 +717,7 @@
       /></label>
     </section>
     <footer class="vph-footnote">
-      {{ preview ? 'Design preview' : 'Wayline' }} · {{ state.version || '0.1.0' }}
+      {{ preview ? 'Design preview' : 'Wayline' }}, version {{ state.version || '0.1.0' }}
     </footer>
   </main>
 </template>
@@ -653,6 +741,18 @@ const validTarget = (value) =>
   value.length > 0 &&
   value.length <= 253 &&
   /^[A-Za-z0-9.-]+$/.test(value);
+const isNumber = (value) => typeof value === 'number' && Number.isFinite(value);
+const palette = [
+  '#e69f00',
+  '#0072b2',
+  '#d55e00',
+  '#cc79a7',
+  '#56b4e9',
+  '#b8860b',
+  '#5b4bb7',
+  '#a6761d',
+];
+const historyInterval = 30000;
 export default {
   name: 'WaylineDashboard',
   props: { api: Object, preview: Boolean },
@@ -668,6 +768,7 @@ export default {
         auto: { enabled: false, last: null },
         endpoints: [],
         resolved: {},
+        wan: { available: true, interface: null, reason: '' },
       },
       loaded: false,
       ready: false,
@@ -688,6 +789,7 @@ export default {
       error: '',
       notice: '',
       history: [],
+      historyAt: 0,
       range: 60,
       offset: 0,
       anchor: Math.floor(Date.now() / 60000) * 60000,
@@ -772,6 +874,15 @@ export default {
       const t = this.state.tunnels.find((t) => t.id === this.selectedTunnel);
       return t ? t.name : 'Tunnel';
     },
+    latencyMax() {
+      const values = this.state.tunnels.map((t) => t.median).filter((n) => typeof n === 'number');
+      return values.length ? Math.max(...values) : 0;
+    },
+    fastestId() {
+      const measured = this.state.tunnels.filter((t) => typeof t.median === 'number');
+      if (!measured.length) return '';
+      return measured.reduce((a, b) => (b.median < a.median ? b : a)).id;
+    },
     endpoints() {
       return this.state.config.endpointDiagnostics && Array.isArray(this.state.endpoints)
         ? this.state.endpoints
@@ -779,6 +890,28 @@ export default {
     },
     endpointAllowed() {
       return this.draft.diagnostics && this.draft.directWan;
+    },
+    wanAvailable() {
+      return !!(this.state.wan && this.state.wan.available);
+    },
+    wanHeader() {
+      const wan = this.state.wan || {};
+      return this.wanAvailable && wan.interface
+        ? 'Direct WAN (' + wan.interface + ')'
+        : 'Direct WAN';
+    },
+    wanNote() {
+      const reason = (this.state.wan || {}).reason;
+      return 'Direct WAN is unavailable. ' + (reason || 'The router did not give a reason.');
+    },
+    bundleVersion() {
+      return WAYLINE_VERSION;
+    },
+    staleBundle() {
+      return Boolean(this.state.version) && this.state.version !== WAYLINE_VERSION;
+    },
+    wanEgress() {
+      return this.egressFor('wan');
     },
     selectedTunnelState() {
       return this.state.tunnels.find((t) => t.id === this.selectedTunnel);
@@ -797,7 +930,7 @@ export default {
       if (!this.selectedTunnel) return 'Choose a tunnel to see its history.';
       if (
         !this.history.length ||
-        this.history.every((s) => s.points.every((p) => p.median === null))
+        this.history.every((s) => s.points.every((p) => !isNumber(p.median)))
       )
         return this.historyLoaded ? 'No measurements in this range.' : 'Loading history…';
       return '';
@@ -812,10 +945,52 @@ export default {
       let n = 25;
       this.history.forEach((s) =>
         s.points.forEach((p) => {
-          if (p.max !== null) n = Math.max(n, p.max);
+          if (isNumber(p.max)) n = Math.max(n, p.max);
+          if (isNumber(p.median)) n = Math.max(n, p.median);
         }),
       );
       return Math.ceil((n * 1.15) / 25) * 25;
+    },
+    allMode() {
+      return this.tab === 'tunnels';
+    },
+    drawOrder() {
+      const others = this.history.filter((s) => !this.isSelected(s));
+      return others.concat(this.history.filter((s) => this.isSelected(s)));
+    },
+    legendItems() {
+      return this.history.map((s) => {
+        const t = this.state.tunnels.find((tunnel) => tunnel.id === s.id);
+        return {
+          id: s.id,
+          name: s.name,
+          tunnel: s.id !== 'wan',
+          selected: this.isSelected(s),
+          color: this.seriesColor(s),
+          preferred: !!t && !!t.preferred,
+          stored: !!t && !t.connected,
+        };
+      });
+    },
+    hoverRows() {
+      if (!this.hover) return [];
+      const rows = this.history.map((s) => {
+        let nearest = null;
+        for (const p of s.points)
+          if (!nearest || Math.abs(p.at - this.hover.at) < Math.abs(nearest.at - this.hover.at))
+            nearest = p;
+        return {
+          id: s.id,
+          name: s.name,
+          color: this.seriesColor(s),
+          selected: this.isSelected(s),
+          value: nearest && isNumber(nearest.median) ? nearest.median : null,
+        };
+      });
+      return rows.sort((a, b) => {
+        if (a.value === null || b.value === null) return (a.value === null) - (b.value === null);
+        return a.value - b.value || a.name.localeCompare(b.name);
+      });
     },
   },
   watch: {
@@ -905,16 +1080,16 @@ export default {
         next.auto = next.auto || { enabled: false, last: null };
         next.endpoints = Array.isArray(next.endpoints) ? next.endpoints : [];
         next.resolved = next.resolved || {};
+        next.wan = Object.assign({ available: true, interface: null, reason: '' }, next.wan);
         this.state = next;
         this.ready = true;
         if (!next.config.targets.includes(this.selectedTarget))
           this.selectedTarget = next.config.targets[0] || next.config.target;
-        if (this.offset === 0) this.anchor = Math.floor(Date.now() / 60000) * 60000;
         if (!next.tunnels.some((t) => t.id === this.selectedTunnel))
           this.selectedTunnel =
             (next.tunnels.find((t) => t.preferred) || next.tunnels[0] || {}).id || '';
         this.readError = '';
-        await this.loadHistory();
+        if (Date.now() - this.historyAt >= historyInterval) await this.loadHistory();
       } catch (e) {
         this.readError = 'Wayline is unavailable. ' + this.describe(e, 'Try again shortly.');
       } finally {
@@ -953,7 +1128,7 @@ export default {
     resolvedText(target) {
       const map = this.state.resolved || {};
       if (!target || !Object.prototype.hasOwnProperty.call(map, target)) return '';
-      return map[target] ? '→ ' + map[target] : 'cannot resolve';
+      return map[target] ? 'Resolves to ' + map[target] : 'Cannot resolve';
     },
     tunnelName(id) {
       const t = this.state.tunnels.find((t) => t.id === id || t.monitorId === id || t.name === id);
@@ -966,16 +1141,48 @@ export default {
       if (s < 86400) return Math.round(s / 3600) + ' h ago';
       return Math.round(s / 86400) + ' d ago';
     },
-    exitHint(t) {
-      if (t.preferred || !this.can.select) return '';
-      if (!t.enabled) return 'Start this tunnel to use it as an exit.';
+    tunnelTone(t) {
+      if (!t.enabled) return 'stopped';
+      return t.connected ? 'connected' : 'offline';
+    },
+    notEligible(t) {
+      return !t.preferred && t.enabled && !t.eligible && this.can.select;
+    },
+    tunnelEgress(t) {
+      const e = this.egressFor(t.id);
+      if (!e || !e.ip || e.error) return '';
+      return ', exit IP ' + e.ip + (e.location ? ' in ' + e.location : '');
+    },
+    lossShown(t) {
+      return !!t.samples && t.lost > 0;
+    },
+    lossText(t) {
+      const pct = (t.lost / t.samples) * 100;
+      if (pct < 1) return '<1%';
+      return Math.round(pct) + '%';
+    },
+    lossTitle(t) {
+      return t.lost + ' of ' + t.samples + ' samples lost';
+    },
+    barWidth(t) {
+      if (typeof t.median !== 'number' || !this.latencyMax) return 0;
+      return Math.max(2, (t.median / this.latencyMax) * 100);
+    },
+    useDisabled(t) {
+      return this.busy || !t.eligible || !this.can.select;
+    },
+    useReason(t) {
+      if (!this.can.select) return this.selectReason;
       if (!t.eligible) return t.reason || 'This tunnel is not ready.';
       return '';
     },
-    toggleLabel(t) {
-      if (this.busyTunnel === t.id && this.busyAction === 'toggle')
-        return t.enabled ? 'Stopping…' : 'Starting…';
-      return t.enabled ? 'Stop' : 'Start';
+    toggleDisabled(t) {
+      return this.busy || !t.controllable || !this.can.control;
+    },
+    toggleReason(t) {
+      if (!t.controllable) return 'Native tunnel control is unavailable.';
+      if (!this.can.control) return this.controlReason;
+      return '';
     },
     askToggle(t) {
       if (!t.enabled) return this.setTunnelEnabled(t);
@@ -1004,6 +1211,7 @@ export default {
         return;
       }
       this.busy = true;
+      let saved = false;
       try {
         await this.call('set_config', {
           config: Object.assign({}, this.draft, {
@@ -1011,14 +1219,38 @@ export default {
           }),
           expected_revision: this.state.revision,
         });
-        this.closeSettings();
-        this.notice = 'Settings saved.';
-        await this.refresh();
+        saved = true;
       } catch (e) {
-        this.error = e.message || 'Settings could not be saved.';
+        this.error = this.describe(e, 'Settings could not be saved.');
       } finally {
         this.busy = false;
       }
+      if (saved) {
+        this.closeSettings();
+        this.notice = 'Settings saved.';
+      }
+      await this.refresh();
+      if (!saved && this.settingsOpen)
+        this.draft = Object.assign(defaults(), JSON.parse(JSON.stringify(this.state.config)));
+    },
+    reloadPage() {
+      fetch('/views/gl-sdk4-ui-wayline.common.js', { cache: 'reload' }).finally(() =>
+        window.location.reload(),
+      );
+    },
+    egressFor(id) {
+      const paths = (this.state.egress && this.state.egress.paths) || [];
+      return paths.find((p) => p.id === id) || null;
+    },
+    egressText(p, label) {
+      if (!p.ip) return label + ' unavailable.';
+      let text = label + ' ' + p.ip;
+      if (p.location) text += ' in ' + p.location;
+      if (p.colo) text += ' (' + p.colo + ')';
+      return text;
+    },
+    wanCell(target) {
+      return this.wanAvailable ? this.diagnostic(target, 'wan') : 'Unavailable';
     },
     async selectExit(t) {
       if (this.busy || t.preferred || !t.eligible || !this.can.select) return;
@@ -1026,18 +1258,18 @@ export default {
       this.busyTunnel = t.id;
       this.busyAction = 'select';
       this.error = '';
-      this.notice = 'Applying exit preference…';
+      this.notice = 'Changing the exit to ' + t.name + '…';
       try {
         await this.call('select_tunnel', {
           section_id: t.id,
           expected_revision: this.state.revision,
         });
-        this.notice = t.name + ' now has the highest priority. Existing connections do not move.';
+        this.notice = 'Now using ' + t.name + ' as the exit.';
         await this.refresh();
-      } catch (e) {
+      } catch {
         this.notice = '';
         this.error =
-          'Selection outcome needs checking. ' + (e.message || 'Refresh before trying again.');
+          'Could not confirm the exit change. Refresh, then check the active exit before trying again.';
         await this.refresh();
       } finally {
         this.busy = false;
@@ -1063,10 +1295,12 @@ export default {
           ? t.name + ' is enabled. Connection and measurements can take time.'
           : t.name + ' is stopped. GL.iNet traffic policy applies.';
         if (result.monitor_pending) this.notice += ' Monitoring will reconcile within one minute.';
-      } catch (e) {
+      } catch {
         this.notice = '';
         this.error =
-          'Tunnel outcome needs checking. ' + (e.message || 'Refresh before trying again.');
+          'Could not confirm the change to ' +
+          t.name +
+          '. Refresh, then check its state before trying again.';
       } finally {
         await this.refresh();
         this.busy = false;
@@ -1101,9 +1335,11 @@ export default {
       }
     },
     async loadHistory() {
+      if (this.offset === 0) this.anchor = Math.floor(Date.now() / 60000) * 60000;
       const request = ++this.historyRequest;
+      this.historyAt = Date.now();
       const selected = this.state.tunnels.find((tunnel) => tunnel.id === this.selectedTunnel);
-      if (selected && !selected.connected && !selected.historyAvailable) {
+      if (!this.allMode && selected && !selected.connected && !selected.historyAvailable) {
         this.history = [];
         this.historyError = 'No history is stored for this tunnel. Start it to collect history.';
         this.historyLoaded = true;
@@ -1116,10 +1352,11 @@ export default {
         const r = await this.call('get_history', {
           tunnel: this.selectedTunnel,
           target: this.graphTarget,
+          all: this.allMode,
           start: this.windowStart,
           end: this.windowStart + this.range * 60000,
           step: this.range === 1440 ? 5 : 1,
-          include_wan: this.tab === 'diagnostics' && this.state.config.directWan,
+          include_wan: !this.allMode && this.state.config.directWan,
         });
         if (request === this.historyRequest) {
           this.history = Array.isArray(r.series) ? r.series : [];
@@ -1155,7 +1392,8 @@ export default {
       return d[id] === undefined || d[id] === null ? 'Unavailable' : Math.round(d[id]) + ' ms';
     },
     chartX(at) {
-      return 45 + ((at - this.windowStart) / (this.range * 60000)) * (this.chartWidth - 63);
+      const x = 45 + ((at - this.windowStart) / (this.range * 60000)) * (this.chartWidth - 63);
+      return Math.min(this.chartWidth - 18, Math.max(45, x));
     },
     chartY(v) {
       return 200 - (v / this.yMax) * 176;
@@ -1164,7 +1402,7 @@ export default {
       let d = '',
         move = true;
       points.forEach((p) => {
-        if (p.median === null) {
+        if (!isNumber(p.median)) {
           move = true;
           return;
         }
@@ -1176,6 +1414,16 @@ export default {
         move = false;
       });
       return d;
+    },
+    dots(points) {
+      return points
+        .filter(
+          (p, i) =>
+            isNumber(p.median) &&
+            !isNumber((points[i - 1] || {}).median) &&
+            !isNumber((points[i + 1] || {}).median),
+        )
+        .map((p) => ({ key: p.at, x: this.chartX(p.at), y: this.chartY(p.median) }));
     },
     band(points) {
       let d = '',
@@ -1198,29 +1446,54 @@ export default {
         }
       };
       points.forEach((p) => {
-        if (p.median === null) flush();
-        else group.push(p);
+        if (isNumber(p.median) && isNumber(p.min) && isNumber(p.max)) group.push(p);
+        else flush();
       });
       flush();
       return d;
     },
-    spark(values) {
-      let d = '',
-        move = true;
-      const max = Math.max(25, ...values.filter((n) => n !== null)) * 1.1;
-      values.forEach((n, i) => {
-        if (n === null) {
-          move = true;
-          return;
-        }
-        d +=
-          (move ? 'M' : 'L') +
-          ((i / Math.max(1, values.length - 1)) * 150).toFixed(1) +
-          ',' +
-          (30 - (n / max) * 28).toFixed(1);
-        move = false;
+    sparkStats(values) {
+      const valid = values.filter(isNumber);
+      if (valid.length < 2) return null;
+      const sorted = valid.slice().sort((a, b) => a - b);
+      const half = Math.floor(sorted.length / 2);
+      const median = sorted.length % 2 ? sorted[half] : (sorted[half - 1] + sorted[half]) / 2;
+      return {
+        min: sorted[0],
+        max: sorted[sorted.length - 1],
+        median,
+        lost: values.length - valid.length,
+      };
+    },
+    sparkLabel(t) {
+      const s = this.sparkStats(t.recent);
+      const head = 'Recent latency for ' + t.name + ': ';
+      if (!s) return head + 'waiting for samples.';
+      const lost = s.lost === 1 ? '1 lost sample' : s.lost + ' lost samples';
+      return (
+        head +
+        'min ' +
+        Math.round(s.min) +
+        ' ms, median ' +
+        Math.round(s.median) +
+        ' ms, max ' +
+        Math.round(s.max) +
+        ' ms, ' +
+        lost +
+        '.'
+      );
+    },
+    sparkBars(values) {
+      const s = this.sparkStats(values);
+      if (!s) return [];
+      const span = s.max - s.min || 1;
+      const recent = values.slice(-64);
+      return recent.map((n, i) => {
+        const x = 128 - (recent.length - i) * 2;
+        if (!isNumber(n)) return { i, x, y: 0, w: 1.4, h: 24, lost: true };
+        const h = 5 + (19 * (n - s.min)) / span;
+        return { i, x, y: 24 - h, w: 1.4, h, lost: false };
       });
-      return d;
     },
     keyHover(e) {
       if (e.key === 'Escape') {
@@ -1244,16 +1517,31 @@ export default {
     hoverX(raw) {
       const x = Math.max(45, Math.min(this.chartWidth - 18, raw));
       const at = this.windowStart + ((x - 45) / (this.chartWidth - 63)) * this.range * 60000;
-      this.hover = {
-        x,
-        at,
-        values: this.history.map((s) => {
-          let nearest = null;
-          for (const p of s.points)
-            if (!nearest || Math.abs(p.at - at) < Math.abs(nearest.at - at)) nearest = p;
-          return { name: s.name, value: nearest ? nearest.median : null };
-        }),
-      };
+      this.hover = { x, at };
+    },
+    highlight(id) {
+      if (this.selectedTunnel === id) return;
+      this.selectedTunnel = id;
+      if (!this.allMode) this.loadHistory();
+    },
+    isSelected(series) {
+      return series.id === this.selectedTunnel;
+    },
+    isDimmed(series) {
+      return (
+        series.id !== 'wan' &&
+        !this.isSelected(series) &&
+        this.history.some((s) => this.isSelected(s))
+      );
+    },
+    hasBand(series) {
+      return this.isSelected(series) || series.id === 'wan';
+    },
+    seriesColor(series) {
+      if (series.id === 'wan') return 'var(--vph-muted)';
+      if (this.isSelected(series)) return 'var(--vph-brand)';
+      const index = this.state.tunnels.findIndex((t) => t.id === series.id);
+      return palette[(index < 0 ? 0 : index) % palette.length];
     },
   },
 };
@@ -1345,18 +1633,16 @@ export default {
   gap: 20px;
   flex-wrap: wrap;
 }
+.vph-chart-footer .vph-muted {
+  margin-left: 12px;
+}
 .vph-heading {
   margin: 22px 0 28px;
 }
 .vph-heading p,
-.vph-eyebrow,
 .vph-muted,
 .vph small {
   color: var(--vph-muted);
-}
-.vph-eyebrow {
-  font-size: 12px;
-  letter-spacing: 0.08em;
 }
 .vph-preview {
   background: color-mix(in srgb, #e0a800 20%, var(--vph-card));
@@ -1392,7 +1678,7 @@ export default {
 }
 .vph-name {
   color: var(--vph-text);
-  font-weight: 600;
+  font-weight: 500;
 }
 .vph-link {
   padding: 6px 0;
@@ -1455,21 +1741,27 @@ export default {
   font-size: 12px;
   font-weight: 500;
   color: var(--vph-muted);
-  padding: 13px 18px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--vph-border);
+  text-align: left;
 }
 .vph td {
-  padding: 17px 18px;
+  font-size: 13px;
+  height: 56px;
+  padding: 8px 16px;
   border-bottom: 1px solid var(--vph-border);
   vertical-align: middle;
 }
 .vph tr:last-child td {
   border-bottom: 0;
 }
-.vph tr.selected {
-  background: color-mix(in srgb, var(--vph-brand) 5%, var(--vph-card));
+.vph tbody tr:hover {
+  background: color-mix(in srgb, var(--vph-muted) 4%, var(--vph-card));
 }
-.vph tr.selected td:first-child {
+.vph tr.selected {
+  background: color-mix(in srgb, var(--vph-brand) 6%, var(--vph-card));
+}
+.vph tr.vph-active td:first-child {
   box-shadow: inset 3px 0 var(--vph-brand);
 }
 .vph-number {
@@ -1481,22 +1773,74 @@ export default {
   margin: 0;
   font-size: 12px;
 }
+.vph-name-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.vph-state-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--vph-muted);
+}
+.vph-state-connected {
+  background: var(--vph-brand);
+}
+.vph-state-offline {
+  background: #d69e2e;
+}
 .vph-badge {
+  flex: none;
   display: inline-block;
   border-radius: 4px;
   font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
   color: var(--vph-brand-text);
-  background: color-mix(in srgb, var(--vph-brand) 9%, var(--vph-card));
-  padding: 2px 7px;
-  margin-left: 9px;
+  background: color-mix(in srgb, var(--vph-brand) 12%, var(--vph-card));
+  padding: 1px 8px;
 }
 .vph-status {
   font-size: 12px;
-  margin-top: 5px;
+  margin-top: 4px;
+}
+.vph-metric {
+  min-width: 128px;
+}
+.vph-metric .vph-number {
+  display: block;
+}
+.vph-loss {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--vph-danger-text);
+}
+.vph-bar {
+  display: block;
+  width: 96px;
+  height: 4px;
+  margin-top: 6px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--vph-muted) 14%, var(--vph-card));
+  overflow: hidden;
+}
+.vph-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--vph-muted) 45%, var(--vph-card));
+}
+.vph-bar-best {
+  background: var(--vph-brand);
 }
 .vph-action {
+  min-width: 232px;
   text-align: right;
-  min-width: 195px;
 }
 .vph-actions {
   display: flex;
@@ -1505,21 +1849,106 @@ export default {
   align-items: center;
   gap: 8px;
 }
-.vph-action small {
+.vph-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px 12px;
+}
+.vph-confirm-text {
+  flex-basis: 100%;
+  font-size: 12px;
+  color: var(--vph-muted);
+}
+.vph .vph-control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0 12px;
+  font-size: 13px;
+  border: 1px solid var(--vph-border);
+  border-radius: 5px;
+  background: var(--vph-card);
+  color: var(--vph-text);
+  white-space: nowrap;
+}
+.vph .vph-switch {
+  position: relative;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+.vph-track {
+  position: relative;
   display: block;
-  max-width: 175px;
-  margin: 4px 0 0 auto;
-  font-size: 11px;
+  width: 36px;
+  height: 20px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--vph-muted) 35%, var(--vph-card));
+  transition: background-color 0.18s ease;
+}
+.vph-track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--vph-card);
+  transition: transform 0.18s ease;
+}
+.vph-switch[aria-checked='true'] .vph-track {
+  background: var(--vph-brand);
+}
+.vph-switch[aria-checked='true'] .vph-track::after {
+  transform: translateX(16px);
+}
+.vph-busy {
+  font-size: 12px;
+  white-space: nowrap;
+  line-height: 32px;
+}
+.vph .vph-note {
+  font-size: 12px;
+  margin: 12px 0 16px;
 }
 .vph-spark {
-  width: 150px;
-  height: 32px;
+  width: 128px;
+  height: 24px;
   display: block;
 }
-.vph-spark path {
-  fill: none;
-  stroke: var(--vph-brand);
-  stroke-width: 1.5;
+.vph-spark rect {
+  fill: var(--vph-muted);
+  opacity: 0.55;
+}
+.vph-spark .vph-spark-lost {
+  fill: var(--vph-danger);
+  opacity: 0.35;
+}
+.vph-dot {
+  fill: var(--series, var(--vph-brand));
+}
+.vph-wan-series .vph-dot {
+  fill: var(--vph-muted);
+}
+.vph-egress {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin: 16px 0 0;
+}
+.vph-egress-error {
+  color: var(--vph-danger-text);
 }
 .vph-history {
   padding: 22px;
@@ -1575,14 +2004,20 @@ export default {
   stroke-width: 1;
 }
 .vph-line {
-  stroke: var(--vph-brand);
+  stroke: var(--series, var(--vph-brand));
   stroke-width: 1.8;
   fill: none;
   stroke-linejoin: round;
 }
+.vph-series-selected .vph-line {
+  stroke-width: 2.8;
+}
+.vph-series-dim {
+  opacity: 0.55;
+}
 .vph-band {
-  fill: var(--vph-brand);
-  opacity: 0.09;
+  fill: var(--series, var(--vph-brand));
+  opacity: 0.14;
 }
 .vph-wan-series .vph-line {
   stroke: var(--vph-muted);
@@ -1600,7 +2035,8 @@ export default {
 .vph-tooltip {
   position: absolute;
   top: 25px;
-  width: 180px;
+  width: 268px;
+  white-space: nowrap;
   padding: 10px 12px;
   background: var(--vph-card);
   border: 1px solid var(--vph-border);
@@ -1608,17 +2044,78 @@ export default {
   font-size: 12px;
   pointer-events: none;
 }
+.vph-tip-selected {
+  color: var(--vph-text);
+  font-weight: 600;
+}
 .vph-chart-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 16px;
   font-size: 12px;
   margin-top: 5px;
+}
+.vph-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.vph-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 32px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  padding: 4px 8px;
+  color: var(--vph-text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+}
+button.vph-legend-item {
+  cursor: pointer;
+}
+.vph-legend-item.active {
+  background: color-mix(in srgb, var(--vph-brand) 10%, var(--vph-card));
+  color: var(--vph-brand-text);
+}
+.vph-legend-item .vph-muted {
+  margin-left: 6px;
 }
 .vph-swatch {
   display: inline-block;
   width: 15px;
-  height: 2px;
+  height: 3px;
   vertical-align: middle;
-  background: var(--vph-brand);
+  background: var(--series, var(--vph-brand));
   margin-right: 6px;
+  border-radius: 2px;
+}
+.vph-legend-item .vph-swatch {
+  margin-right: 4px;
+}
+.vph-swatch-wan {
+  height: 0;
+  background: none;
+  border-top: 2px dashed var(--vph-muted);
+}
+.vph-tip-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+.vph-tip-swatch.vph-swatch-wan {
+  height: 0;
+  width: 12px;
+  border-radius: 0;
 }
 .vph-scroll {
   display: block;
@@ -1824,12 +2321,6 @@ export default {
   .vph h1 {
     font-size: 23px;
   }
-  .vph-spark-column {
-    display: none;
-  }
-  .vph-action {
-    min-width: 0;
-  }
   .vph-button,
   .vph-tabs button,
   .vph-ranges button {
@@ -1838,20 +2329,8 @@ export default {
   .vph-link {
     min-height: 44px;
   }
-  .vph-action small {
-    max-width: none;
-  }
   .vph-info {
     padding: 12px;
-  }
-  .vph td,
-  .vph th {
-    padding: 14px 11px;
-  }
-  .vph-badge {
-    display: block;
-    width: max-content;
-    margin: 4px 0 0;
   }
   .vph-fields {
     grid-template-columns: 1fr;
@@ -1868,6 +2347,10 @@ export default {
   .vph-chart-heading {
     gap: 4px;
   }
+  .vph-chart-footer {
+    flex-direction: column;
+    align-items: flex-start;
+  }
   .vph input,
   .vph select {
     font-size: 16px !important;
@@ -1880,6 +2363,76 @@ export default {
   }
   .vph-tabs {
     gap: 22px;
+  }
+}
+@media (max-width: 639px) {
+  .vph thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+  .vph-spark-column {
+    display: none;
+  }
+  .vph tbody tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--vph-border);
+  }
+  .vph tbody tr:last-child {
+    border-bottom: 0;
+  }
+  .vph td {
+    height: auto;
+    padding: 0;
+    border-bottom: 0;
+  }
+  .vph .vph-tunnel {
+    flex: 1 0 100%;
+    min-width: 0;
+  }
+  .vph td[data-label]::before {
+    content: attr(data-label);
+    margin-right: 6px;
+    font-size: 12px;
+    color: var(--vph-muted);
+  }
+  .vph-metric {
+    min-width: 0;
+  }
+  .vph-metric .vph-bar {
+    width: 72px;
+  }
+  .vph-loss {
+    margin-left: 0;
+  }
+  .vph .vph-action {
+    min-width: 0;
+    margin-left: auto;
+  }
+  .vph .vph-action.vph-confirming {
+    flex: 1 0 100%;
+  }
+}
+@media (pointer: coarse) {
+  .vph .vph-control,
+  .vph .vph-legend-item {
+    min-height: 44px;
+  }
+  .vph .vph-switch {
+    width: 44px;
+    height: 44px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vph-track,
+  .vph-track::after {
+    transition: none;
   }
 }
 </style>

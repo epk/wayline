@@ -11,11 +11,39 @@ jobs:
   check:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: devenv shell -- bash -e {0}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
-      - run: nix run -f nix/bootstrap.nix devenv -- shell -- cargo fetch --locked
-      - run: nix run -f nix/bootstrap.nix devenv -- shell -- cargo xtask deps
-      - run: nix run -f nix/bootstrap.nix devenv -- shell -- cargo xtask check
-      - run: nix run -f nix/bootstrap.nix devenv -- shell -- cargo xtask build
-      - run: nix run -f nix/bootstrap.nix devenv -- shell -- cargo xtask lab
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: devenv
+      - name: Install the pinned devenv
+        shell: bash
+        run: nix profile install -f nix/bootstrap.nix devenv
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ui/node_modules
+            ~/.local/share/pnpm/store
+          key: pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-${{ runner.os }}-${{ runner.arch }}-
+      - name: Check, build, and lab inside one devenv shell
+        run: |
+          cargo fetch --locked
+          cargo xtask deps
+          cargo xtask check
+          cargo xtask build
+          cargo xtask lab

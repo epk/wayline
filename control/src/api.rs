@@ -1,5 +1,5 @@
 use crate::{
-    auto, history, native,
+    auto, egress, history, native,
     resolve::Resolved,
     router,
     runtime::{RUNTIME, SETTINGS, locked, milliseconds, snapshot, version},
@@ -24,8 +24,10 @@ pub struct State {
     pub tunnels: Vec<Tunnel>,
     diagnostics: BTreeMap<String, BTreeMap<String, Option<f64>>>,
     endpoints: Vec<EndpointView>,
+    wan: WanView,
     resolved: BTreeMap<String, Option<Ipv4Addr>>,
     auto: AutoView,
+    egress: egress::Cache,
     revision: String,
     scope: &'static str,
     capabilities: Capabilities,
@@ -37,7 +39,16 @@ pub struct State {
 struct EndpointView {
     tunnel: String,
     name: String,
-    address: String,
+    address: Option<String>,
+    reason: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WanView {
+    available: bool,
+    interface: Option<String>,
+    reason: String,
 }
 
 #[derive(Serialize)]
@@ -142,7 +153,11 @@ fn diagnostics(
             result
                 .entry(endpoint.target.to_string())
                 .or_insert_with(|| {
-                    let latency = measurement(snapshot, wan, &endpoint.target)
+                    let id = router::endpoint_series(wan, &endpoint.key);
+                    let latency = snapshot
+                        .iter()
+                        .find(|series| series.id == id)
+                        .or_else(|| measurement(snapshot, wan, &endpoint.target))
                         .and_then(|item| item.median_us)
                         .map(milliseconds);
                     BTreeMap::from([(wan.id.clone(), latency)])
@@ -238,6 +253,28 @@ fn tunnels(
     tunnels
 }
 
+fn endpoint_views(config: &Settings, inventory: &router::Inventory) -> Vec<EndpointView> {
+    if !router::endpoints_enabled(config) {
+        return Vec::new();
+    }
+    router::monitored(config, inventory)
+        .map(|item| EndpointView {
+            tunnel: item.id.clone(),
+            name: item.name.clone(),
+            address: item.endpoint.as_ref().map(ToString::to_string),
+            reason: item.endpoint_reason.clone(),
+        })
+        .collect()
+}
+
+fn wan_view(inventory: &router::Inventory) -> WanView {
+    WanView {
+        available: inventory.wan.is_some(),
+        interface: inventory.wan.as_ref().map(|wan| wan.name.clone()),
+        reason: inventory.wan_reason.clone(),
+    }
+}
+
 fn unsupported(compat: native::Compat) -> State {
     State {
         version: version(),
@@ -245,11 +282,17 @@ fn unsupported(compat: native::Compat) -> State {
         tunnels: Vec::new(),
         diagnostics: BTreeMap::new(),
         endpoints: Vec::new(),
+        wan: WanView {
+            available: false,
+            interface: None,
+            reason: compat.message.clone(),
+        },
         resolved: BTreeMap::new(),
         auto: AutoView {
             enabled: false,
             last: None,
         },
+        egress: egress::Cache::read(),
         revision: String::new(),
         scope: "Equivalent native traffic rules",
         capabilities: Capabilities {
@@ -290,6 +333,8 @@ pub fn state() -> Result<State> {
     let resolved = resolved(&config, &inventory);
     let endpoints = router::endpoints(&config, &inventory);
     let diagnostics = diagnostics(&config, &inventory, &endpoints, &snapshot);
+    let endpoint_list = endpoint_views(&config, &inventory);
+    let wan = wan_view(&inventory);
     ensure!(
         router::revision()? == revision,
         "State changed during discovery. Refresh again."
@@ -300,18 +345,13 @@ pub fn state() -> Result<State> {
         tunnels,
         diagnostics,
         resolved,
-        endpoints: endpoints
-            .into_iter()
-            .map(|endpoint| EndpointView {
-                tunnel: endpoint.tunnel,
-                name: endpoint.name,
-                address: endpoint.target.to_string(),
-            })
-            .collect(),
+        endpoints: endpoint_list,
+        wan,
         auto: AutoView {
             enabled: auto_enabled,
             last: auto::Record::read().last,
         },
+        egress: egress::Cache::read(),
         revision,
         scope: "Equivalent native traffic rules",
         capabilities: Capabilities {

@@ -5,7 +5,12 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt::Write, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fmt::Write,
+    fs,
+    path::{Path, PathBuf},
+};
 use wayline_protocol::{MAX_SERIES, Sample, Series};
 
 const MINUTE_MS: u64 = 60_000;
@@ -29,6 +34,8 @@ pub struct Query {
     tunnel: String,
     #[serde(default)]
     include_wan: bool,
+    #[serde(default)]
+    all: bool,
 }
 
 #[derive(Serialize)]
@@ -95,25 +102,24 @@ impl Known {
     }
 }
 
-fn sql(config: &Settings, statement: &str, readonly: bool) -> Result<String> {
-    let path = database(config);
-    if !readonly {
-        directory(path.parent().context("Invalid history directory.")?)?;
+fn sql(path: &Path, statement: &str, readonly: bool) -> Result<String> {
+    let mut arguments = Vec::new();
+    if readonly {
+        arguments.push("-readonly");
     }
-    let mode = if readonly { "-readonly" } else { "-readwrite" };
+    arguments.extend([
+        "-batch",
+        "-bail",
+        "-separator",
+        "|",
+        path.to_str().context("Invalid history path.")?,
+    ]);
     let input = format!(
         "PRAGMA busy_timeout=1000; PRAGMA cache_size=-128; PRAGMA mmap_size=0; {statement}"
     );
     Ok(String::from_utf8(wayline_support::input(
         "sqlite3",
-        &[
-            mode,
-            "-batch",
-            "-bail",
-            "-separator",
-            "|",
-            path.to_str().context("Invalid history path.")?,
-        ],
+        &arguments,
         input.as_bytes(),
         262_144,
         5,
@@ -154,6 +160,12 @@ fn number(value: Option<u32>) -> String {
 }
 
 pub fn collect(config: &Settings, snapshot: &[Series]) -> Result<()> {
+    let path = database(config);
+    directory(path.parent().context("Invalid history directory.")?)?;
+    collect_at(&path, snapshot)
+}
+
+fn collect_at(path: &Path, snapshot: &[Series]) -> Result<()> {
     if now() < 1_704_067_200 {
         return Ok(());
     }
@@ -184,46 +196,74 @@ pub fn collect(config: &Settings, snapshot: &[Series]) -> Result<()> {
         }
     }
     statement.push_str("DELETE FROM bins WHERE series NOT IN (SELECT series FROM bins GROUP BY series ORDER BY max(minute) DESC LIMIT 45); COMMIT;");
-    sql(config, &statement, false)?;
+    sql(path, &statement, false)?;
     Ok(())
 }
 
-fn stored(config: &Settings, identity: &str, start: u64, end: u64) -> Result<BTreeMap<u64, Bin>> {
-    let mut bins = BTreeMap::new();
-    if !database(config).exists() {
-        return Ok(bins);
+fn stored(
+    config: &Settings,
+    identities: &[String],
+    start: u64,
+    last: u64,
+) -> Result<BTreeMap<String, BTreeMap<u64, Bin>>> {
+    stored_at(&database(config), identities, start, last)
+}
+
+fn stored_at(
+    path: &Path,
+    identities: &[String],
+    start: u64,
+    last: u64,
+) -> Result<BTreeMap<String, BTreeMap<u64, Bin>>> {
+    let mut result: BTreeMap<String, BTreeMap<u64, Bin>> = BTreeMap::new();
+    if !path.exists() || identities.is_empty() {
+        return Ok(result);
     }
-    let statement = format!(
-        "SELECT minute,min_us,median_us,max_us,sent,lost FROM bins WHERE series='{identity}' AND minute>={start} AND minute<{end} ORDER BY minute LIMIT 1440;"
+    ensure!(
+        identities.iter().all(|identity| settings::id(identity)),
+        "Invalid measurement identity."
     );
-    for line in sql(config, &statement, true)?.lines() {
+    let quoted = identities
+        .iter()
+        .map(|identity| format!("'{identity}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let statement = format!(
+        "SELECT series,minute,min_us,median_us,max_us,sent,lost FROM bins WHERE series IN ({quoted}) AND minute>={start} AND minute<={last} ORDER BY series,minute LIMIT {};",
+        1441 * identities.len()
+    );
+    for line in sql(path, &statement, true)?.lines() {
         let fields: Vec<_> = line.split('|').collect();
-        if fields.len() == 6 {
-            bins.insert(
-                fields[0].parse()?,
+        if fields.len() == 7 {
+            result.entry(fields[0].to_owned()).or_default().insert(
+                fields[1].parse()?,
                 Bin {
-                    min: fields[1].parse().ok(),
-                    median: fields[2].parse().ok(),
-                    max: fields[3].parse().ok(),
-                    sent: fields[4].parse()?,
-                    lost: fields[5].parse()?,
+                    min: fields[2].parse().ok(),
+                    median: fields[3].parse().ok(),
+                    max: fields[4].parse().ok(),
+                    sent: fields[5].parse()?,
+                    lost: fields[6].parse()?,
                 },
             );
         }
     }
-    Ok(bins)
+    Ok(result)
 }
 
-struct Subject<'a> {
-    id: &'a str,
-    name: &'a str,
-    prefix: &'a str,
+struct Subject {
+    id: String,
+    name: String,
+    identity: String,
 }
 
-fn line(config: &Settings, snapshot: &[Series], subject: &Subject, query: &Query) -> Result<Line> {
-    let (start, end) = (query.start / MINUTE_MS, query.end / MINUTE_MS);
-    let identity = series_id(subject.prefix, &query.target);
-    let mut history = stored(config, &identity, start, end)?;
+fn line(
+    mut history: BTreeMap<u64, Bin>,
+    snapshot: &[Series],
+    subject: Subject,
+    query: &Query,
+) -> Result<Line> {
+    let (start, last) = (query.start / MINUTE_MS, query.end / MINUTE_MS);
+    let identity = subject.identity;
     if let Some(live) = snapshot.iter().find(|series| series.id == identity) {
         for (minute, bin) in bins(&live.history) {
             if history.get(&minute).is_none_or(|old| old.sent <= bin.sent) {
@@ -232,7 +272,7 @@ fn line(config: &Settings, snapshot: &[Series], subject: &Subject, query: &Query
         }
     }
     let width = u64::try_from(query.step)?;
-    let points = (start..end)
+    let points = (start..=last)
         .step_by(query.step)
         .map(|minute| {
             let group: Vec<_> = (minute..minute + width)
@@ -262,8 +302,8 @@ fn line(config: &Settings, snapshot: &[Series], subject: &Subject, query: &Query
         })
         .collect();
     Ok(Line {
-        id: subject.id.to_owned(),
-        name: subject.name.to_owned(),
+        id: subject.id,
+        name: subject.name,
         points,
     })
 }
@@ -283,51 +323,145 @@ pub fn query(
             && [1, 5].contains(&query.step),
         "History range exceeds its limit."
     );
-    let tunnel = inventory
-        .tunnels
-        .iter()
-        .find(|tunnel| tunnel.id == query.tunnel)
-        .context("The selected tunnel is unavailable.")?;
-    let live = inventory.paths.iter().find(|path| path.id == tunnel.id);
-    let stored_prefix = Known::read(config).0.get(&tunnel.key).cloned();
-    let prefix = live
-        .map(|path| path.prefix().to_owned())
-        .or(stored_prefix)
-        .context("No history exists for this tunnel.")?;
-    let mut series = vec![line(
-        config,
-        snapshot,
-        &Subject {
-            id: &tunnel.id,
-            name: &tunnel.name,
-            prefix: &prefix,
-        },
-        query,
-    )?];
+    let known = Known::read(config);
+    let prefix = |tunnel: &crate::router::TunnelInfo| {
+        inventory
+            .paths
+            .iter()
+            .find(|path| path.id == tunnel.id)
+            .map(|path| path.prefix().to_owned())
+            .or_else(|| known.0.get(&tunnel.key).cloned())
+    };
+    let mut subjects: Vec<Subject> = Vec::new();
+    for tunnel in &inventory.tunnels {
+        if !query.all && tunnel.id != query.tunnel {
+            continue;
+        }
+        if let Some(prefix) = prefix(tunnel) {
+            subjects.push(Subject {
+                id: tunnel.id.clone(),
+                name: tunnel.name.clone(),
+                identity: series_id(&prefix, &query.target),
+            });
+        }
+    }
+    ensure!(
+        query.all || !subjects.is_empty(),
+        "No history exists for this tunnel."
+    );
     if query.include_wan
         && config.diagnostics
         && config.direct_wan
         && let Some(wan) = &inventory.wan
     {
-        series.push(line(
-            config,
-            snapshot,
-            &Subject {
-                id: &wan.id,
-                name: &wan.name,
-                prefix: wan.prefix(),
-            },
-            query,
-        )?);
+        subjects.push(Subject {
+            id: wan.id.clone(),
+            name: wan.name.clone(),
+            identity: series_id(wan.prefix(), &query.target),
+        });
     }
+    let identities: Vec<String> = subjects
+        .iter()
+        .map(|subject| subject.identity.clone())
+        .collect();
+    let mut stored = stored(
+        config,
+        &identities,
+        query.start / MINUTE_MS,
+        query.end / MINUTE_MS,
+    )?;
+    let series = subjects
+        .into_iter()
+        .map(|subject| {
+            let history = stored.remove(&subject.identity).unwrap_or_default();
+            line(history, snapshot, subject, query)
+        })
+        .collect::<Result<_>>()?;
     Ok(Response { series })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::bins;
+    use super::{bins, collect_at, sql, stored_at};
     use crate::runtime::now;
-    use wayline_protocol::Sample;
+    use anyhow::{Context, Result, ensure};
+    use std::{net::Ipv4Addr, process::Command};
+    use wayline_protocol::{Sample, Series, State};
+
+    fn sqlite_available() -> bool {
+        Command::new("sqlite3")
+            .arg("-version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn series(history: Vec<Sample>) -> Series {
+        Series {
+            id: "abc_1_1_1_1".into(),
+            name: "Test".into(),
+            interface: "eth0".into(),
+            path_id: "abc".into(),
+            target: Ipv4Addr::new(1, 1, 1, 1),
+            state: State::Probing,
+            median_us: Some(20_000),
+            sent: 6,
+            received: 4,
+            success_age_ms: Some(0),
+            history,
+        }
+    }
+
+    #[test]
+    fn history_round_trips_through_sqlite() -> Result<()> {
+        if !sqlite_available() {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("latency.sqlite");
+        let current = now() / 60;
+        let (first, second) = (current - 3, current - 2);
+        let sample = |minute: u64, offset: u64, us: Option<u32>| Sample {
+            at_ms: minute * 60_000 + offset,
+            us,
+        };
+        let snapshot = [series(vec![
+            sample(first, 0, Some(30_000)),
+            sample(first, 1_000, Some(10_000)),
+            sample(first, 2_000, Some(20_000)),
+            sample(first, 3_000, None),
+            sample(second, 0, Some(40_000)),
+            sample(second, 1_000, None),
+        ])];
+        collect_at(&database, &snapshot)?;
+        collect_at(&database, &snapshot)?;
+        let rows = sql(&database, "SELECT count(*) FROM bins;", true)?;
+        ensure!(
+            rows.lines().last() == Some("2"),
+            "Unexpected row count: {rows}"
+        );
+        let mut all = stored_at(&database, &["abc_1_1_1_1".to_owned()], first, second)?;
+        let stored = all
+            .remove("abc_1_1_1_1")
+            .context("Missing stored series.")?;
+        ensure!(stored.len() == 2, "Expected two stored minutes.");
+        let check = |minute: u64, expected: (u32, u32, u32, u32, u32)| -> Result<()> {
+            let bin = stored.get(&minute).context("Missing stored minute.")?;
+            let actual = (
+                bin.sent,
+                bin.lost,
+                bin.min.unwrap_or_default(),
+                bin.median.unwrap_or_default(),
+                bin.max.unwrap_or_default(),
+            );
+            ensure!(
+                actual == expected,
+                "Unexpected bin {actual:?} for minute {minute}."
+            );
+            Ok(())
+        };
+        check(first, (4, 1, 10_000, 20_000, 30_000))?;
+        check(second, (2, 1, 40_000, 40_000, 40_000))
+    }
 
     #[test]
     fn bins_count_losses_and_take_the_median() {

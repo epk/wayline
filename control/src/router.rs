@@ -13,7 +13,12 @@ use std::{
     path::Path,
 };
 use wayline_protocol::{Config, MAX_SERIES, Tunnel};
-use wayline_support::{digest, read};
+use wayline_support::{digest, read, text};
+
+const VPN_PROTOCOLS: [&str; 4] = ["wgclient", "ovpnclient", "wireguard", "openvpn"];
+const NO_PEER: &str = "The tunnel has no active WireGuard peer endpoint yet.";
+const OPENVPN: &str = "OpenVPN endpoint discovery is not supported.";
+const IPV6: &str = "The endpoint is an IPv6 address, which Wayline does not measure.";
 
 const IGNORED: [&str; 7] = [
     ".name",
@@ -60,6 +65,42 @@ struct Address {
     address: Ipv4Addr,
 }
 
+#[derive(Deserialize)]
+struct Dump {
+    #[serde(default)]
+    interface: Vec<Interface>,
+}
+
+#[derive(Deserialize)]
+struct Interface {
+    #[serde(rename = "interface", default)]
+    name: String,
+    #[serde(default)]
+    up: bool,
+    #[serde(default)]
+    metric: u32,
+    #[serde(default)]
+    proto: String,
+    #[serde(default)]
+    l3_device: String,
+    ip4table: Option<Value>,
+    #[serde(rename = "ipv4-address", default)]
+    addresses: Vec<Address>,
+    #[serde(default)]
+    route: Vec<Route>,
+}
+
+#[derive(Deserialize)]
+struct Route {
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    mask: u8,
+    table: Option<Value>,
+    #[serde(rename = "type")]
+    kind: Option<u32>,
+}
+
 pub struct PathInfo {
     pub id: String,
     pub key: String,
@@ -69,6 +110,7 @@ pub struct PathInfo {
     pub mark: u32,
     pub identity: String,
     pub endpoint: Option<Target>,
+    pub endpoint_reason: String,
 }
 
 pub struct TunnelInfo {
@@ -82,6 +124,7 @@ pub struct Inventory {
     pub tunnels: Vec<TunnelInfo>,
     pub paths: Vec<PathInfo>,
     pub wan: Option<PathInfo>,
+    pub wan_reason: String,
     pub rules: Vec<(String, Rule)>,
 }
 
@@ -105,6 +148,26 @@ impl Rule {
     }
 }
 
+impl Interface {
+    fn uplink(&self) -> Option<(String, Ipv4Addr)> {
+        let source = self.addresses.first()?.address;
+        let default_route = self.route.iter().any(|route| {
+            route.target == "0.0.0.0"
+                && route.mask == 0
+                && route.table.is_none()
+                && route.kind != Some(6)
+        });
+        (self.up
+            && self.l3_device.len() <= 15
+            && settings::id(&self.l3_device)
+            && settings::ip(source)
+            && !VPN_PROTOCOLS.contains(&self.proto.as_str())
+            && self.ip4table.is_none()
+            && default_route)
+            .then(|| (self.l3_device.clone(), source))
+    }
+}
+
 impl PathInfo {
     pub fn series(&self, target: &Target) -> String {
         series_id(self.prefix(), target)
@@ -124,9 +187,16 @@ pub fn series_id(prefix: &str, target: &Target) -> String {
 }
 
 pub struct Endpoint {
-    pub tunnel: String,
-    pub name: String,
+    pub key: String,
     pub target: Target,
+}
+
+pub fn endpoint_series(wan: &PathInfo, key: &str) -> String {
+    format!(
+        "{}_{}",
+        wan.prefix(),
+        &digest(format!("endpoint|{key}").as_bytes())[..14]
+    )
 }
 
 impl Inventory {
@@ -165,12 +235,34 @@ fn number(value: &str) -> Option<u32> {
     )
 }
 
+fn endpoint(device: &str) -> (Option<Target>, String) {
+    let output = match text("wg", &["show", device, "endpoints"], 4096, 2) {
+        Ok(output) => output,
+        Err(error) => return (None, format!("The wg tool failed: {error}.")),
+    };
+    let value = output
+        .lines()
+        .next()
+        .and_then(|line| line.split('\t').nth(1))
+        .unwrap_or("(none)");
+    if value.starts_with('[') || value.matches(':').count() > 1 {
+        return (None, IPV6.into());
+    }
+    match value
+        .rsplit_once(':')
+        .map(|(host, _)| host.parse::<Ipv4Addr>())
+    {
+        Some(Ok(address)) => (Some(Target::Address(address)), String::new()),
+        _ => (None, NO_PEER.into()),
+    }
+}
+
 fn path(
     section_id: &str,
     key: &str,
     name: &str,
     network: &Map<String, Value>,
-    wan: bool,
+    wireguard: bool,
 ) -> Option<PathInfo> {
     let status: Status =
         native::bus(&format!("network.interface.{name}"), "status", &json!({})).ok()?;
@@ -181,25 +273,17 @@ fn path(
     if !status.up || !settings::ip(source) {
         return None;
     }
-    let mark = if wan {
-        0
-    } else {
-        let raw = section(network, &format!("rt_{name}")).mark?;
-        let (mark_text, scope) = raw.split_once('/')?;
-        if number(scope) != Some(0xf000) {
-            return None;
-        }
-        number(mark_text)?
-    };
+    let raw = section(network, &format!("rt_{name}")).mark?;
+    let (mark_text, scope) = raw.split_once('/')?;
+    if number(scope) != Some(0xf000) {
+        return None;
+    }
+    let mark = number(mark_text)?;
     let profile = section(network, name).config.unwrap_or_default();
-    let endpoint = if wan {
-        None
+    let (endpoint, endpoint_reason) = if wireguard {
+        endpoint(&device)
     } else {
-        let kind = format!("wireguard_{name}");
-        network
-            .values()
-            .filter(|value| value[".type"] == kind.as_str())
-            .find_map(|value| value["endpoint_host"].as_str()?.parse().ok())
+        (None, OPENVPN.into())
     };
     let identity = digest(format!("{key}|{name}|{device}|{source}|{mark}|{profile}").as_bytes());
     Some(PathInfo {
@@ -211,7 +295,34 @@ fn path(
         mark,
         identity,
         endpoint,
+        endpoint_reason,
     })
+}
+
+fn uplink() -> Result<Option<PathInfo>> {
+    let dump: Dump = native::bus("network.interface", "dump", &json!({}))?;
+    let candidate = dump
+        .interface
+        .into_iter()
+        .filter_map(|item| {
+            let (device, source) = item.uplink()?;
+            Some((item.metric, item.name, device, source))
+        })
+        .min_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+    Ok(candidate.map(|(_, name, device, source)| {
+        let identity = digest(format!("wan|{name}|{device}|{source}|0|").as_bytes());
+        PathInfo {
+            id: "wan".into(),
+            key: "wan".into(),
+            name,
+            interface: device,
+            source,
+            mark: 0,
+            identity,
+            endpoint: None,
+            endpoint_reason: String::new(),
+        }
+    }))
 }
 
 pub fn inventory() -> Result<Inventory> {
@@ -269,7 +380,9 @@ pub fn inventory() -> Result<Inventory> {
         if !enabled || interface.disabled.as_deref() == Some("1") {
             continue;
         }
-        if let Some(mut item) = path(id, &key, name, &network, false) {
+        let wireguard = rule.via_type.as_deref() == Some("wireguard")
+            || interface.proto.as_deref() == Some("wgclient");
+        if let Some(mut item) = path(id, &key, name, &network, wireguard) {
             item.name = label.into();
             paths.push(item);
         }
@@ -278,11 +391,22 @@ pub fn inventory() -> Result<Inventory> {
         tunnels.len() <= MAX_TUNNELS,
         "More than eight VPN tunnels are unsupported."
     );
-    let wan = path("wan", "wan", "wan", &network, true);
+    let (wan, wan_reason) = match uplink() {
+        Ok(Some(path)) => (Some(path), String::new()),
+        Ok(None) => (
+            None,
+            "No uplink interface has an IPv4 default route.".into(),
+        ),
+        Err(error) => (
+            None,
+            format!("The uplink interface list could not be read: {error}."),
+        ),
+    };
     Ok(Inventory {
         tunnels,
         paths,
         wan,
+        wan_reason,
         rules,
     })
 }
@@ -339,7 +463,7 @@ pub fn native_tunnel<'a>(
     Ok(tunnel)
 }
 
-fn monitored<'a>(
+pub fn monitored<'a>(
     settings: &'a Settings,
     inventory: &'a Inventory,
 ) -> impl Iterator<Item = &'a PathInfo> {
@@ -349,15 +473,18 @@ fn monitored<'a>(
         .filter(|item| settings.tunnels.contains(&item.key) || settings.tunnels.contains(&item.id))
 }
 
+pub const fn endpoints_enabled(settings: &Settings) -> bool {
+    settings.diagnostics && settings.direct_wan && settings.endpoint_diagnostics
+}
+
 pub fn endpoints(settings: &Settings, inventory: &Inventory) -> Vec<Endpoint> {
-    if !(settings.diagnostics && settings.direct_wan && settings.endpoint_diagnostics) {
+    if !endpoints_enabled(settings) {
         return Vec::new();
     }
     monitored(settings, inventory)
         .filter_map(|item| {
             Some(Endpoint {
-                tunnel: item.id.clone(),
-                name: item.name.clone(),
+                key: item.key.clone(),
                 target: item.endpoint.clone()?,
             })
         })
@@ -392,31 +519,32 @@ pub fn monitor(settings: &Settings, inventory: &Inventory, resolved: &Resolved) 
     }
     let mut wanted = Vec::new();
     for item in monitored(settings, inventory) {
-        wanted.extend(targets.iter().map(|target| (item, target.clone())));
+        wanted.extend(targets.iter().map(|target| (item, target.clone(), None)));
     }
     if settings.diagnostics
         && settings.direct_wan
         && let Some(wan) = &inventory.wan
     {
-        let extra = endpoints(settings, inventory)
-            .into_iter()
-            .map(|endpoint| endpoint.target);
         wanted.extend(
             settings
                 .targets
                 .iter()
-                .cloned()
-                .chain(extra)
-                .map(|target| (wan, target)),
+                .map(|target| (wan, target.clone(), None)),
         );
+        wanted.extend(endpoints(settings, inventory).into_iter().map(|endpoint| {
+            let id = endpoint_series(wan, &endpoint.key);
+            (wan, endpoint.target, Some(id))
+        }));
     }
     let mut seen = BTreeSet::new();
     let tunnels: Vec<_> = wanted
         .into_iter()
-        .filter_map(|(path, target)| {
+        .filter_map(|(path, target, id)| {
             let address = resolved.address(&target)?;
-            seen.insert((path.interface.clone(), address))
-                .then(|| measurement(path, &target, address))
+            seen.insert((path.interface.clone(), address)).then(|| {
+                let id = id.unwrap_or_else(|| path.series(&target));
+                measurement(path, id, address)
+            })
         })
         .take(MAX_SERIES)
         .collect();
@@ -432,9 +560,9 @@ pub fn monitor(settings: &Settings, inventory: &Inventory, resolved: &Resolved) 
     }
 }
 
-fn measurement(path: &PathInfo, target: &Target, address: Ipv4Addr) -> Tunnel {
+fn measurement(path: &PathInfo, id: String, address: Ipv4Addr) -> Tunnel {
     Tunnel {
-        id: path.series(target),
+        id,
         name: path.name.clone(),
         interface: path.interface.clone(),
         source: path.source,
@@ -508,12 +636,12 @@ pub fn safe_order(
 
 #[cfg(test)]
 mod tests {
-    use super::{Inventory, PathInfo, monitor, series_id};
+    use super::{Inventory, PathInfo, endpoint_series, monitor, series_id};
     use crate::{
         resolve::Resolved,
         settings::{Settings, Target},
     };
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use std::net::Ipv4Addr;
 
     fn path(id: &str, interface: &str, endpoint: Option<&str>) -> PathInfo {
@@ -526,6 +654,7 @@ mod tests {
             mark: 4096,
             identity: "ab".repeat(32),
             endpoint: endpoint.and_then(|value| value.parse().ok()),
+            endpoint_reason: String::new(),
         }
     }
 
@@ -534,6 +663,7 @@ mod tests {
             tunnels: Vec::new(),
             paths: vec![path("a", "wg1", Some("vpn.example.com"))],
             wan: Some(path("wan", "eth1", None)),
+            wan_reason: String::new(),
             rules: Vec::new(),
         }
     }
@@ -586,6 +716,10 @@ mod tests {
             on_wan,
             [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(203, 0, 113, 9)]
         );
+        let inventory = inventory();
+        let wan = inventory.wan.as_ref().context("WAN path")?;
+        let expected = endpoint_series(wan, "vpn:a");
+        assert!(config.tunnels.iter().any(|tunnel| tunnel.id == expected));
         Ok(())
     }
 }
