@@ -12,6 +12,8 @@
     ? query.get('compat')
     : 'full';
   const wanDown = query.get('wan') === 'unavailable';
+  const updateFailed = query.get('update') === 'failed';
+  const release = '0.1.0-alpha.9';
   const directExit = query.get('exit') === 'direct';
   const wanMs = wanDown ? null : 14.37;
   const compatMessages = {
@@ -31,6 +33,29 @@
   let revision = 1;
   const state = {
     version: '0.1.0-alpha.8',
+    update: updateFailed
+      ? {
+          current: '0.1.0-alpha.8',
+          latest: release,
+          available: true,
+          phase: 'failed',
+          message: 'The package signature did not match. Nothing was installed.',
+          failed: true,
+          needsAttention: true,
+          checkedAt: Math.floor(Date.now() / 1000) - 120,
+          updatedAt: Math.floor(Date.now() / 1000) - 120,
+        }
+      : {
+          current: '0.1.0-alpha.8',
+          latest: null,
+          available: false,
+          phase: 'idle',
+          message: '',
+          failed: false,
+          needsAttention: false,
+          checkedAt: 0,
+          updatedAt: 0,
+        },
     revision: '1',
     scope: 'All clients',
     compat: {
@@ -334,6 +359,27 @@
       }),
     };
   }
+  const nowSeconds = () => Math.floor(Date.now() / 1000);
+  const busyPhases = ['checking', 'downloading', 'verifying', 'installing'];
+  const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const updateFailure = {
+    phase: 'failed',
+    failed: true,
+    message: 'The package signature did not match. Nothing was installed.',
+  };
+  async function runUpdate(steps) {
+    for (const [ms, patch] of steps) {
+      await later(ms);
+      state.update = { ...state.update, ...patch(), updatedAt: nowSeconds() };
+    }
+  }
+  function startUpdate(phase, steps) {
+    if (busyPhases.includes(state.update.phase))
+      return Promise.resolve({ started: false, update: copy(state.update) });
+    state.update = { ...state.update, phase, message: '', failed: false };
+    runUpdate(steps);
+    return Promise.resolve({ started: true, update: copy(state.update) });
+  }
   window.previewApi = {
     get_state: () =>
       query.get('fail') === '1'
@@ -412,13 +458,32 @@
       });
     },
     check_update: () =>
-      delay({
-        available: level === 'unsupported',
-        message:
-          level === 'unsupported'
-            ? 'Wayline 0.2.0 is available. Preview only.'
-            : 'Preview only. No update was downloaded.',
-      }),
-    install_update: () => delay({ message: 'Preview only. No update was installed.' }),
+      startUpdate('checking', [
+        [
+          1200,
+          () => ({
+            phase: 'idle',
+            available: true,
+            latest: release,
+            checkedAt: nowSeconds(),
+          }),
+        ],
+      ]),
+    install_update: () =>
+      startUpdate('downloading', [
+        [1500, () => ({ phase: 'verifying' })],
+        [1000, () => (updateFailed ? updateFailure : { phase: 'installing' })],
+        ...(updateFailed
+          ? []
+          : [
+              [
+                1500,
+                () => {
+                  state.version = release;
+                  return { phase: 'done', current: release, available: false, latest: release };
+                },
+              ],
+            ]),
+      ]),
   };
 })();
