@@ -13,7 +13,7 @@
     : 'full';
   const wanDown = query.get('wan') === 'unavailable';
   const updateFailed = query.get('update') === 'failed';
-  const release = '0.1.0-alpha.9';
+  const release = '0.1.0-alpha.10';
   const directExit = query.get('exit') === 'direct';
   const wanMs = wanDown ? null : 14.37;
   const compatMessages = {
@@ -32,10 +32,10 @@
   const features = { full: 4, newer: 2, monitoring: 2, unsupported: 0 };
   let revision = 1;
   const state = {
-    version: '0.1.0-alpha.9',
+    version: '0.1.0-alpha.10',
     update: updateFailed
       ? {
-          current: '0.1.0-alpha.9',
+          current: '0.1.0-alpha.10',
           latest: release,
           available: true,
           phase: 'failed',
@@ -46,7 +46,7 @@
           updatedAt: Math.floor(Date.now() / 1000) - 120,
         }
       : {
-          current: '0.1.0-alpha.9',
+          current: '0.1.0-alpha.10',
           latest: null,
           available: false,
           phase: 'idle',
@@ -71,13 +71,21 @@
       control: level === 'full',
       update: true,
     },
+    history: {
+      days: 7,
+      tiers: [
+        { step: 15, keptSeconds: 21600 },
+        { step: 60, keptSeconds: 259200 },
+        { step: 300, keptSeconds: 604800 },
+      ],
+    },
     config: {
       enabled: true,
-      interval: 15,
+      interval: 5,
       tunnels: ['home', 'backup', 'tokyo'],
       targets: ['1.1.1.1', '9.9.9.9', 'example.com', 'missing.invalid'],
       directWan: true,
-      historyHours: 24,
+      historyDays: 7,
       autoUpdates: false,
       autoExit: true,
       autoTunnels: ['home', 'backup'],
@@ -315,7 +323,7 @@
     const base =
       { home: 32, backup: 24, tokyo: 130, zurich: 62, wan: 14, 'uplink:wwan': 22 }[id] || 32;
     const points = [];
-    for (let at = start; at <= end; at += step * 60000) {
+    for (let at = start; at <= end; at += step * 1000) {
       const n = Math.round((at - anchor) / 60000) + 1440;
       const outage = id === 'home' && n > 950 && n < 964;
       const spike = id !== 'wan' && n > 640 && n < 670 ? 50 : 0;

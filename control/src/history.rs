@@ -463,40 +463,28 @@ fn stored_at(
         identities.iter().all(|identity| settings::id(identity)),
         "Invalid measurement identity."
     );
-    if sql(path, "PRAGMA user_version;", true)?.trim() != "3" {
-        return Ok(result);
-    }
     let quoted = identities
         .iter()
         .map(|identity| format!("'{identity}'"))
         .collect::<Vec<_>>()
         .join(",");
-    let names: BTreeMap<String, String> = sql(
-        path,
-        &format!("SELECT id,name FROM series WHERE name IN ({quoted});"),
-        true,
-    )?
-    .lines()
-    .filter_map(|line| line.split_once('|'))
-    .map(|(id, name)| (id.to_owned(), name.to_owned()))
-    .collect();
-    if names.is_empty() {
-        return Ok(result);
-    }
-    let ids = names
-        .keys()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(",");
     let statement = format!(
-        "SELECT series,period,min_us,median_us,max_us,sent,lost FROM {table} WHERE series IN ({ids}) AND period BETWEEN {start} AND {last} ORDER BY series,period;"
+        "SELECT s.name,t.period,t.min_us,t.median_us,t.max_us,t.sent,t.lost FROM {table} t JOIN series s ON s.id=t.series WHERE s.name IN ({quoted}) AND t.period BETWEEN {start} AND {last};"
     );
-    for line in sql_with(path, &statement, true, HISTORY_LIMIT)?.lines() {
+    let output = match sql_with(path, &statement, true, HISTORY_LIMIT) {
+        Ok(output) => output,
+        Err(error) => {
+            return if sql(path, "PRAGMA user_version;", true)?.trim() == "3" {
+                Err(error)
+            } else {
+                Ok(result)
+            };
+        }
+    };
+    for line in output.lines() {
         let fields: Vec<_> = line.split('|').collect();
-        if fields.len() == 7
-            && let Some(name) = names.get(fields[0])
-        {
-            result.entry(name.clone()).or_default().insert(
+        if fields.len() == 7 {
+            result.entry(fields[0].to_owned()).or_default().insert(
                 fields[1].parse()?,
                 Bin {
                     min: fields[2].parse().ok(),
@@ -589,18 +577,25 @@ fn write(path: &Path, days: u32, levels: &[Level], newest: u64) -> Result<()> {
                 statement,
                 "INSERT OR IGNORE INTO series(name) VALUES('{name}');"
             )?;
-            for (period, bin) in rows {
-                write!(
-                    statement,
-                    "{verb} INTO {} SELECT id,{period},{},{},{},{},{} FROM series WHERE name='{name}';",
-                    level.table,
-                    number(bin.min),
-                    number(bin.median),
-                    number(bin.max),
-                    bin.sent,
-                    bin.lost
-                )?;
-            }
+            let values = rows
+                .iter()
+                .map(|(period, bin)| {
+                    format!(
+                        "({period},{},{},{},{},{})",
+                        number(bin.min),
+                        number(bin.median),
+                        number(bin.max),
+                        bin.sent,
+                        bin.lost
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            write!(
+                statement,
+                "{verb} INTO {} SELECT s.id,v.column1,v.column2,v.column3,v.column4,v.column5,v.column6 FROM (SELECT id FROM series WHERE name='{name}') s, (VALUES {values}) v;",
+                level.table
+            )?;
         }
     }
     for (step, table) in LEVELS {
@@ -624,12 +619,11 @@ fn write(path: &Path, days: u32, levels: &[Level], newest: u64) -> Result<()> {
     Ok(())
 }
 
-fn store(path: &Path, days: u32, snapshot: &[Series]) -> Result<()> {
+fn store(path: &Path, days: u32, snapshot: &[Series], since: u64) -> Result<bool> {
     if now() < 1_704_067_200 {
-        return Ok(());
+        return Ok(false);
     }
     convert(path)?;
-    let since = cursor(path);
     let newest = snapshot
         .iter()
         .flat_map(|series| &series.buckets)
@@ -637,13 +631,14 @@ fn store(path: &Path, days: u32, snapshot: &[Series]) -> Result<()> {
         .filter(|at| *at > since)
         .max();
     let Some(newest) = newest else {
-        return Ok(());
+        return Ok(false);
     };
     let levels = levels(path, days, fresh(snapshot, since))?;
-    write(path, days, &levels, newest)
+    write(path, days, &levels, newest)?;
+    Ok(true)
 }
 
-fn repair(path: &Path, days: u32, snapshot: &[Series], error: Error) -> Result<()> {
+fn repair(path: &Path, days: u32, snapshot: &[Series], since: u64, error: Error) -> Result<bool> {
     if path.exists() && !healthy(path) {
         fs::rename(path, path.with_file_name("latency.sqlite.broken"))?;
         let _ = fs::remove_file(path.with_file_name("latency.sqlite-journal"));
@@ -656,7 +651,7 @@ fn repair(path: &Path, days: u32, snapshot: &[Series], error: Error) -> Result<(
                 text: "The history database was damaged and was reset.".into(),
             }],
         )?;
-        return store(path, days, snapshot);
+        return store(path, days, snapshot, 0);
     }
     if pages(path) >= cap(path) {
         let mut statement = format!("{} BEGIN IMMEDIATE;", pragmas(path));
@@ -668,20 +663,29 @@ fn repair(path: &Path, days: u32, snapshot: &[Series], error: Error) -> Result<(
         }
         statement.push_str("COMMIT;");
         sql(path, &statement, false)?;
-        return store(path, days, snapshot);
+        return store(path, days, snapshot, since);
     }
     Err(error)
 }
 
+fn collect_since(path: &Path, days: u32, snapshot: &[Series], since: u64) -> Result<bool> {
+    store(path, days, snapshot, since).or_else(|error| repair(path, days, snapshot, since, error))
+}
+
+#[cfg(test)]
 fn collect_at(path: &Path, days: u32, snapshot: &[Series]) -> Result<()> {
-    store(path, days, snapshot).or_else(|error| repair(path, days, snapshot, error))
+    collect_since(path, days, snapshot, cursor(path)).map(drop)
 }
 
 pub fn collect(config: &Settings) -> Result<()> {
     let path = database(config);
     directory(path.parent().context("Invalid history directory.")?)?;
-    collect_at(&path, config.history_days, &snapshot_since(cursor(&path)))?;
-    refresh_known(&path)
+    let since = cursor(&path);
+    let written = collect_since(&path, config.history_days, &snapshot_since(since), since)?;
+    if written || !known_cache().exists() {
+        refresh_known(&path)?;
+    }
+    Ok(())
 }
 
 pub fn report(config: &Settings) -> Result<Report> {
@@ -724,47 +728,69 @@ fn point(period: u64, step: u64, bin: Option<&Bin>) -> Point {
     }
 }
 
-fn line(
+fn lines(
     path: &Path,
     step: u64,
     query: &Query,
     snapshot: &[Series],
-    subject: Subject,
-) -> Result<Line> {
-    let live = snapshot
+    subjects: Vec<Subject>,
+) -> Result<Vec<Line>> {
+    let identities: Vec<String> = subjects
         .iter()
-        .find(|series| series.id == subject.identity)
-        .map_or(&[][..], |series| series.buckets.as_slice());
-    let (first, last) = (query.start / 1_000 / step, query.end / 1_000 / step);
-    let identities = std::slice::from_ref(&subject.identity);
-    let mut bins = stored_at(path, table(step), identities, first, last)?
-        .remove(&subject.identity)
-        .unwrap_or_default();
-    let fresh: BTreeMap<u64, Bin> = live
-        .iter()
-        .map(|bucket| (bucket.at / BUCKET_SECONDS, bin(bucket)))
+        .map(|subject| subject.identity.clone())
         .collect();
-    if let (Some(&low), Some(&high)) = (fresh.keys().next(), fresh.keys().next_back()) {
-        let ratio = step / BUCKET_SECONDS;
-        let mut children = stored_at(
+    let (first, last) = (query.start / 1_000 / step, query.end / 1_000 / step);
+    let mut stored = stored_at(path, table(step), &identities, first, last)?;
+    let live: BTreeMap<&str, BTreeMap<u64, Bin>> = snapshot
+        .iter()
+        .filter(|series| identities.contains(&series.id))
+        .map(|series| {
+            let bins = series
+                .buckets
+                .iter()
+                .map(|bucket| (bucket.at / BUCKET_SECONDS, bin(bucket)))
+                .collect();
+            (series.id.as_str(), bins)
+        })
+        .filter(|(_, bins): &(_, BTreeMap<u64, Bin>)| !bins.is_empty())
+        .collect();
+    let ratio = step / BUCKET_SECONDS;
+    let span = live
+        .values()
+        .flat_map(|bins| [bins.keys().next(), bins.keys().next_back()])
+        .flatten()
+        .copied()
+        .fold(None, |span: Option<(u64, u64)>, at| {
+            Some(span.map_or((at, at), |(low, high)| (low.min(at), high.max(at))))
+        });
+    let mut children = match span {
+        Some((low, high)) => stored_at(
             path,
             LEVELS[0].1,
-            identities,
+            &identities,
             low / ratio * ratio,
             (high / ratio + 1) * ratio - 1,
-        )?
-        .remove(&subject.identity)
-        .unwrap_or_default();
-        children.extend(fresh);
-        bins.extend(parents(&children, ratio));
-    }
-    Ok(Line {
-        id: subject.id,
-        name: subject.name,
-        points: (first..=last)
-            .map(|period| point(period, step, bins.get(&period)))
-            .collect(),
-    })
+        )?,
+        None => Rows::new(),
+    };
+    Ok(subjects
+        .into_iter()
+        .map(|subject| {
+            let mut bins = stored.remove(&subject.identity).unwrap_or_default();
+            if let Some(fresh) = live.get(subject.identity.as_str()) {
+                let mut own = children.remove(&subject.identity).unwrap_or_default();
+                own.extend(fresh.iter().map(|(period, bin)| (*period, *bin)));
+                bins.extend(parents(&own, ratio));
+            }
+            Line {
+                id: subject.id,
+                name: subject.name,
+                points: (first..=last)
+                    .map(|period| point(period, step, bins.get(&period)))
+                    .collect(),
+            }
+        })
+        .collect())
 }
 
 pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {
@@ -826,10 +852,7 @@ pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<
     }
     let path = database(config);
     let snapshot = snapshot_since(cursor(&path));
-    let series = subjects
-        .into_iter()
-        .map(|subject| line(&path, step, query, &snapshot, subject))
-        .collect::<Result<_>>()?;
+    let series = lines(&path, step, query, &snapshot, subjects)?;
     let events = changes::read(config)
         .into_iter()
         .filter(|event| (query.start..=query.end).contains(&event.at))
@@ -840,7 +863,7 @@ pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        DAY, HOUR, LEVELS, Query, Subject, collect_at, convert, line, migrate_at, resolution, sql,
+        DAY, HOUR, LEVELS, Query, Subject, collect_at, convert, lines, migrate_at, resolution, sql,
         stored_at,
     };
     use crate::runtime::now;
@@ -1204,7 +1227,7 @@ mod tests {
             name: "Tunnel".into(),
             identity: identity(1),
         };
-        let line = line(&database, 60, &query, &[], subject)?;
+        let line = lines(&database, 60, &query, &[], vec![subject])?.remove(0);
         ensure!(line.points.len() <= 1_441, "Too many points.");
         let json = serde_json::to_vec(&line)?.len();
         ensure!(json < 262_144, "Response is {json} bytes.");

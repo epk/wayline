@@ -171,6 +171,8 @@
           <label class="vph-inline"
             >Measure every
             <select v-model.number="draft.interval">
+              <option :value="1">1 second</option>
+              <option :value="5">5 seconds</option>
               <option :value="15">15 seconds</option>
               <option :value="30">30 seconds</option>
               <option :value="60">60 seconds</option>
@@ -291,11 +293,16 @@
       </section>
       <section class="vph-set" aria-labelledby="vph-set-history">
         <h3 id="vph-set-history">History</h3>
-        <select v-model.number="draft.historyHours" aria-label="Keep history">
-          <option :value="24">Keep 24 hours on the router</option>
+        <select v-model.number="draft.historyDays" aria-label="Keep history">
+          <option :value="1">Keep 24 hours on the router</option>
+          <option :value="7">Keep 7 days on the router</option>
+          <option :value="30">Keep 30 days on the router</option>
           <option :value="0">Keep in memory only</option>
         </select>
-        <p class="vph-muted">The monitor saves history in batches to limit flash writes.</p>
+        <p class="vph-muted">
+          Recent minutes keep full detail; older history is summarized. The monitor saves in batches
+          to limit flash writes.
+        </p>
       </section>
       <section class="vph-set" aria-labelledby="vph-set-updates">
         <h3 id="vph-set-updates">Updates</h3>
@@ -553,7 +560,7 @@
               type="button"
               class="vph-step"
               aria-label="Earlier"
-              :disabled="offset + range >= 1440"
+              :disabled="offset + range >= maxMinutes"
               @click="shift(1)"
             >
               ‹
@@ -571,7 +578,7 @@
           </div>
           <div class="vph-ranges" role="group" aria-label="History range">
             <button
-              v-for="r in ranges"
+              v-for="r in visibleRanges"
               :key="r.minutes"
               type="button"
               :class="{ active: range === r.minutes }"
@@ -597,6 +604,8 @@
         @blur="hideTip"
       >
         <div ref="plot" class="vph-plot"></div>
+        <div class="vph-loss-title vph-muted">Packet loss</div>
+        <div ref="lossPlot" class="vph-plot vph-loss-plot"></div>
         <div v-if="chartNote" class="vph-chart-note" role="status">{{ chartNote }}</div>
         <div ref="tip" class="vph-tooltip" role="status" hidden></div>
       </div>
@@ -659,6 +668,7 @@
               <td class="vph-number">{{ latency(row.stats.mean) }}</td>
               <td class="vph-number">{{ latency(row.stats.min) }}</td>
               <td class="vph-number">{{ latency(row.stats.max) }}</td>
+              <td class="vph-number">{{ lossPercent(row.stats.loss) }}</td>
               <cursor-cell :line="row.line" :cursor="cursor" />
             </tr>
           </tbody>
@@ -701,11 +711,11 @@ import 'uplot/dist/uPlot.min.css';
 
 const defaults = () => ({
   enabled: false,
-  interval: 15,
+  interval: 5,
   tunnels: [],
   targets: ['1.1.1.1', '8.8.8.8', '9.9.9.9'],
   directWan: false,
-  historyHours: 24,
+  historyDays: 7,
   autoUpdates: false,
   autoExit: false,
   autoTunnels: [],
@@ -718,6 +728,7 @@ const validTarget = (value) =>
   /^[A-Za-z0-9.-]+$/.test(value);
 const isNumber = (value) => typeof value === 'number' && Number.isFinite(value);
 const chartHeight = 230;
+const lossHeight = 110;
 const frozenSeries = (items) =>
   Object.freeze(
     items.map((item) => Object.freeze({ ...item, points: Object.freeze(item.points) })),
@@ -794,6 +805,7 @@ const seriesColumns = [
   { key: 'mean', label: 'Mean' },
   { key: 'min', label: 'Min' },
   { key: 'max', label: 'Max' },
+  { key: 'loss', label: 'Loss' },
   { key: 'cursor', label: 'At cursor' },
 ];
 const valueAt = (line, index) =>
@@ -820,7 +832,19 @@ const summarize = (points) => {
     if (low !== null) min = min === null ? low : Math.min(min, low);
     if (high !== null) max = max === null ? high : Math.max(max, high);
   });
-  return { last, mean: count ? sum / count : null, min, max };
+  let sent = 0;
+  let lost = 0;
+  points.forEach((p) => {
+    sent += Number(p.sent) || 0;
+    lost += Number(p.lost) || 0;
+  });
+  return {
+    last,
+    mean: count ? sum / count : null,
+    min,
+    max,
+    loss: sent ? (lost / sent) * 100 : null,
+  };
 };
 const CursorCell = {
   props: ['line', 'cursor'],
@@ -891,6 +915,8 @@ export default {
         { label: '1h', minutes: 60 },
         { label: '6h', minutes: 360 },
         { label: '24h', minutes: 1440 },
+        { label: '7d', minutes: 10080 },
+        { label: '30d', minutes: 43200 },
       ],
     };
   },
@@ -1122,6 +1148,14 @@ export default {
     destinations() {
       return this.state.config.targets;
     },
+    maxMinutes() {
+      const tiers = (this.state.history && this.state.history.tiers) || [];
+      const seconds = Math.max(86400, ...tiers.map((t) => Number(t.keptSeconds) || 0));
+      return Math.floor(seconds / 60);
+    },
+    visibleRanges() {
+      return this.ranges.filter((r) => r.minutes <= this.maxMinutes);
+    },
     windowStart() {
       return this.anchor - (this.offset + this.range) * 60000;
     },
@@ -1171,6 +1205,7 @@ export default {
   created() {
     this.theme = {};
     this.plot = null;
+    this.lossPlot = null;
     this.plotLines = [];
     this.plotKey = '';
   },
@@ -1182,11 +1217,11 @@ export default {
       typeof ResizeObserver === 'undefined'
         ? null
         : new ResizeObserver((entries) => {
-            if (entries[0] && this.plot)
-              this.plot.setSize({
-                width: Math.max(280, entries[0].contentRect.width),
-                height: chartHeight,
-              });
+            if (entries[0] && this.plot) {
+              const width = Math.max(280, entries[0].contentRect.width);
+              this.plot.setSize({ width, height: chartHeight });
+              if (this.lossPlot) this.lossPlot.setSize({ width, height: lossHeight });
+            }
           });
     this.$nextTick(() => {
       if (this.$refs.chart && this.resize) this.resize.observe(this.$refs.chart);
@@ -1622,7 +1657,7 @@ export default {
           uplinks: true,
           start: this.windowStart,
           end: this.windowStart + this.range * 60000,
-          step: this.range > 360 ? 5 : 1,
+          step: this.stepSeconds(this.range),
           include_wan: this.wanGraph,
           ...(endpoints ? { endpoints: true } : {}),
         });
@@ -1658,6 +1693,14 @@ export default {
           this.syncPlot();
         }
       }
+    },
+    stepSeconds(minutes) {
+      if (minutes <= 60) return 15;
+      if (minutes <= 360) return 60;
+      return minutes <= 10080 ? 300 : 3600;
+    },
+    lossPercent(n) {
+      return isNumber(n) ? (n < 10 ? n.toFixed(1) : Math.round(n)) + '%' : '—';
     },
     hasMs(n) {
       return isNumber(n);
@@ -1721,6 +1764,15 @@ export default {
         });
         return values;
       };
+      const lossColumn = (points) => {
+        const values = at.map(() => null);
+        points.forEach((p) => {
+          if (p.sent > 0) values[index.get(p.at)] = (p.lost / p.sent) * 100;
+        });
+        return values;
+      };
+      const loss = [at.map((t) => t / 1000)];
+      const lossSeries = [{}];
       const order = (s) => (this.isServer(s) ? 0 : s.id === 'wan' || this.isUplink(s) ? 1 : 2);
       const data = [at.map((t) => t / 1000)];
       const series = [{}];
@@ -1789,6 +1841,16 @@ export default {
             bands.push({ series: [line.high, line.low], fill: () => fill });
           }
           lines.push(line);
+          line.lossIndex = loss.length;
+          loss.push(lossColumn(s.points));
+          lossSeries.push({
+            label: line.name,
+            stroke: color,
+            width: server ? 1 : 1.5,
+            spanGaps: false,
+            ...(server ? { dash: [6, 4] } : {}),
+            points: { show: false },
+          });
           rows.push(
             Object.freeze({
               key: s.id,
@@ -1806,6 +1868,8 @@ export default {
       return {
         key: JSON.stringify(series.map((o) => [o.label, o.stroke, o.width])),
         data,
+        loss,
+        lossSeries,
         series,
         bands,
         lines,
@@ -1822,7 +1886,7 @@ export default {
           width: Math.max(280, this.$refs.chart.clientWidth),
           height: chartHeight,
           legend: { show: false },
-          cursor: { drag: { x: true, y: false, setScale: false } },
+          cursor: { sync: { key: 'wayline' }, drag: { x: true, y: false, setScale: false } },
           scales: {
             x: { time: true, range: () => this.plotRange() },
             y: { range: (u, low, high) => [0, high > 0 ? high * 1.15 : 25] },
@@ -1849,6 +1913,31 @@ export default {
         this.$refs.plot,
       );
       this.plot.over.addEventListener('dblclick', () => this.choosePreset(this.preset));
+      this.lossPlot = new UPlot(
+        {
+          width: Math.max(280, this.$refs.chart.clientWidth),
+          height: lossHeight,
+          legend: { show: false },
+          cursor: { sync: { key: 'wayline' }, drag: { x: false, y: false, setScale: false } },
+          scales: {
+            x: { time: true, range: () => this.plotRange() },
+            y: { range: (u, low, high) => [0, high > 5 ? Math.min(100, high * 1.15) : 5] },
+          },
+          axes: [
+            this.axisOptions({
+              grid: { show: false },
+              values: (u, values) => values.map((v) => this.clock(v * 1000)),
+            }),
+            this.axisOptions({
+              label: '%',
+              values: (u, values) => values.map((v) => String(Math.round(v))),
+            }),
+          ],
+          series: built.lossSeries,
+        },
+        built.loss,
+        this.$refs.lossPlot,
+      );
     },
     syncPlot() {
       if (!this.history.length) {
@@ -1859,6 +1948,7 @@ export default {
       if (this.plot && this.plotKey === built.key) {
         this.plotLines = built.lines;
         this.plot.setData(built.data);
+        this.lossPlot.setData(built.loss);
       } else {
         this.destroyPlot();
         this.createPlot(built);
@@ -1868,7 +1958,9 @@ export default {
     },
     destroyPlot() {
       if (this.plot) this.plot.destroy();
+      if (this.lossPlot) this.lossPlot.destroy();
       this.plot = null;
+      this.lossPlot = null;
       this.plotLines = [];
       this.plotKey = '';
       this.tableRows = [];
@@ -1891,6 +1983,8 @@ export default {
       this.plotLines.forEach((line) => {
         const shown = this.shownLine(line);
         show(line.index, shown);
+        if (this.lossPlot && this.lossPlot.series[line.lossIndex].show !== shown)
+          this.lossPlot.setSeries(line.lossIndex, { show: shown });
         if (line.low !== undefined) {
           show(line.low, shown && line.owner === band);
           show(line.high, shown && line.owner === band);
@@ -1921,7 +2015,7 @@ export default {
         if (!nearest || Math.abs(value - pointer) < Math.abs(nearest.value - pointer))
           nearest = { line, value };
       });
-      const bucket = this.range > 360 ? 300000 : 60000;
+      const bucket = this.stepSeconds(this.range) * 1000;
       const marker = this.markerList.find((m) => Math.abs(m.at - at) <= bucket);
       const head = document.createElement('div');
       head.className = 'vph-tip-row';
@@ -1998,7 +2092,7 @@ export default {
       u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
       const minutes = Math.round((to - from) / 60000);
       if (minutes < 5) return;
-      this.range = Math.min(1440, minutes);
+      this.range = Math.min(this.maxMinutes, minutes);
       this.setOffset(Math.round((this.anchor - to) / 60000));
     },
     keyNav(e) {
@@ -2014,7 +2108,7 @@ export default {
       this.setOffset(this.offset + (direction * this.range) / 2);
     },
     setOffset(minutes) {
-      this.offset = Math.round(Math.min(1440 - this.range, Math.max(0, minutes)));
+      this.offset = Math.round(Math.min(this.maxMinutes - this.range, Math.max(0, minutes)));
       this.loadHistory();
     },
     goNow() {
@@ -2713,6 +2807,10 @@ th[aria-sort='descending'] .vph-sort::after {
 }
 .vph-chart {
   position: relative;
+}
+.vph-loss-title {
+  margin: 8px 0 2px;
+  font-size: 0.8125rem;
 }
 .vph-chart:focus-visible {
   outline: 2px solid var(--vph-brand);

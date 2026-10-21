@@ -2,7 +2,7 @@
 
 Wayline compares VPN tunnels on GL.iNet routers. The **VPN → Wayline** page shows latency, loss, history, and exit addresses. It provides native tunnel Start and Stop controls and manual exit selection.
 
-Wayline is experimental. This README describes **0.1.0-alpha.9**, which includes safety fixes and a separate automatic-switching pool. Install signed packages from [GitHub Releases](https://github.com/epk/wayline/releases).
+Wayline is experimental. This README describes **0.1.0-alpha.10**, which includes safety fixes and a separate automatic-switching pool. Install signed packages from [GitHub Releases](https://github.com/epk/wayline/releases).
 
 The screenshots use synthetic data. They contain no live router addresses, endpoints, locations, or tunnel names.
 
@@ -17,7 +17,7 @@ The screenshots use synthetic data. They contain no live router addresses, endpo
 - **Optional automatic switching.** Choose an explicit pool within the monitored tunnels. You can monitor four tunnels and permit automatic switching between only two.
 - **Destinations.** Configure up to five IPv4 addresses or hostnames. The first destination controls exit eligibility and automatic comparison.
 - **Optional WAN diagnostics.** Compare direct uplinks and WireGuard endpoints. Direct egress checks follow the WAN opt-in setting.
-- **History.** View 15 minutes to 24 hours. Drag to zoom, use arrow keys to move through history, and press Escape to return to now.
+- **History.** Probe every 1 to 60 seconds (default 5). Recent minutes keep 15-second detail and older history is summarized for up to 30 days (default 7). View 15 minutes to 30 days. Drag to zoom, use arrow keys to move through history, and press Escape to return to now.
 - **Exit addresses.** Egress IP checks refresh every five minutes through the monitored tunnels and opted-in WAN path.
 - **Signed updates.** Verify the manifest, package identity, size, and SHA-256 before installation. Automatic updates are off by default.
 
@@ -41,7 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/epk/wayline/main/install.sh | sh
 
 The installer downloads the newest published release, including prereleases. It checks the signing key fingerprint, manifest signature, and package hash before installation.
 
-To install a specific version, download `install.sh`. Run `WAYLINE_VERSION=0.1.0-alpha.9 sh install.sh`.
+To install a specific version, download `install.sh`. Run `WAYLINE_VERSION=0.1.0-alpha.10 sh install.sh`.
 
 Create your VPN profiles in the factory dashboard first. Open **VPN → Wayline → Settings**. Choose the tunnels and destinations to monitor, then enable monitoring.
 
