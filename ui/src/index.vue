@@ -596,54 +596,74 @@
         <div v-if="chartNote" class="vph-chart-note" role="status">{{ chartNote }}</div>
         <div ref="tip" class="vph-tooltip" role="status" hidden></div>
       </div>
-      <div class="vph-chart-footer">
-        <div v-if="legendItems.length" class="vph-legend-block">
-          <ul class="vph-key" aria-label="Line styles">
-            <li>
-              <svg class="vph-key-line" width="24" height="8" viewBox="0 0 24 8" aria-hidden="true">
-                <line x1="0" y1="4" x2="24" y2="4" />
-              </svg>
-              Through the tunnel
-            </li>
-            <li v-if="serverShown">
-              <svg class="vph-key-line" width="24" height="8" viewBox="0 0 24 8" aria-hidden="true">
-                <line x1="0" y1="4" x2="24" y2="4" class="vph-key-dashed" />
-              </svg>
-              To its VPN server, over WAN
-            </li>
-          </ul>
-          <ul class="vph-legend" aria-label="Tunnels in the graph">
-            <li v-for="item in legendItems" :key="item.id">
-              <button
-                type="button"
-                class="vph-legend-item"
-                :class="{
-                  active: isolated.includes(item.owner),
-                  dimmed: isolated.length && !isolated.includes(item.owner),
-                }"
-                :aria-pressed="isolated.includes(item.owner) ? 'true' : 'false'"
-                @click="isolate(item, $event)"
+      <div v-if="tableRows.length" class="vph-series-scroll">
+        <table class="vph-series">
+          <thead>
+            <tr>
+              <th scope="col" class="vph-series-name" :aria-sort="ariaSort('name')">
+                <button type="button" class="vph-sort" @click="sortBy('name')">
+                  Series <span class="vph-muted">(ms)</span>
+                </button>
+              </th>
+              <th
+                v-for="col in seriesColumns"
+                :key="col.key"
+                scope="col"
+                class="vph-series-num"
+                :aria-sort="ariaSort(col.key)"
               >
-                <span
-                  v-if="item.tunnel"
-                  class="vph-legend-dot"
-                  :style="{ '--series': item.color }"
+                <button type="button" class="vph-sort" @click="sortBy(col.key)">
+                  {{ col.label }}
+                </button>
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="row in sortedRows"
+              :key="row.key"
+              role="row"
+              tabindex="0"
+              :aria-selected="isolated.includes(row.owner) ? 'true' : 'false'"
+              :class="{
+                active: isolated.includes(row.owner),
+                dimmed: isolated.length && !isolated.includes(row.owner),
+              }"
+              @click="isolate(row, $event)"
+              @keydown.enter.prevent="isolate(row, $event)"
+              @keydown.space.prevent="isolate(row, $event)"
+              @mouseenter="emphasize(row.index)"
+              @mouseleave="emphasize(-1)"
+              @focus="emphasize(row.index)"
+              @blur="emphasize(-1)"
+            >
+              <th scope="row" class="vph-series-name">
+                <svg
+                  class="vph-series-swatch"
+                  width="20"
+                  height="4"
+                  viewBox="0 0 20 4"
                   aria-hidden="true"
-                ></span
-                ><span v-else class="vph-swatch vph-swatch-wan" aria-hidden="true"></span
-                >{{ item.name }}<span v-if="item.preferred" class="vph-muted"> Active exit</span
-                ><span v-if="item.stored" class="vph-muted"> Stored</span>
-              </button>
-            </li>
-          </ul>
-          <p class="vph-muted vph-legend-hint">
-            {{
-              isolated.length
-                ? 'Showing selected lines. Click a selected line again to show all.'
-                : 'Click a line to show only it. Ctrl- or Cmd-click to add more.'
-            }}
-          </p>
-        </div>
+                  :style="{ '--series': row.swatch }"
+                >
+                  <line x1="0" y1="2" x2="20" y2="2" :class="{ 'vph-series-dashed': row.dashed }" />
+                </svg>
+                {{ row.name }}
+                <span v-if="isPreferred(row)" class="vph-badge">Active exit</span>
+              </th>
+              <td class="vph-number">{{ latency(row.stats.last) }}</td>
+              <td class="vph-number">{{ latency(row.stats.mean) }}</td>
+              <td class="vph-number">{{ latency(row.stats.min) }}</td>
+              <td class="vph-number">{{ latency(row.stats.max) }}</td>
+              <cursor-cell :line="row.line" :cursor="cursor" />
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="vph-chart-footer">
+        <p class="vph-muted vph-series-hint">
+          Click a row to show only that line. Ctrl- or Cmd-click adds more.
+        </p>
         <span class="vph-muted vph-range-label">{{
           clock(windowStart) + ' – ' + clock(windowStart + range * 60000)
         }}</span>
@@ -765,9 +785,50 @@ const countryName = (code) => {
     return code;
   }
 };
+const seriesColumns = [
+  { key: 'last', label: 'Last' },
+  { key: 'mean', label: 'Mean' },
+  { key: 'min', label: 'Min' },
+  { key: 'max', label: 'Max' },
+  { key: 'cursor', label: 'At cursor' },
+];
+const valueAt = (line, index) =>
+  index >= 0 && isNumber(line.median[index]) ? line.median[index] : null;
+const summarize = (points) => {
+  let last = null;
+  let lastAt = -Infinity;
+  let sum = 0;
+  let count = 0;
+  let min = null;
+  let max = null;
+  points.forEach((p) => {
+    const median = isNumber(p.median) ? p.median : null;
+    const low = isNumber(p.min) ? p.min : median;
+    const high = isNumber(p.max) ? p.max : median;
+    if (median !== null) {
+      sum += median;
+      count += 1;
+      if (p.at > lastAt) {
+        lastAt = p.at;
+        last = median;
+      }
+    }
+    if (low !== null) min = min === null ? low : Math.min(min, low);
+    if (high !== null) max = max === null ? high : Math.max(max, high);
+  });
+  return { last, mean: count ? sum / count : null, min, max };
+};
+const CursorCell = {
+  props: ['line', 'cursor'],
+  render(h) {
+    const value = valueAt(this.line, this.cursor.index);
+    return h('td', { class: 'vph-number' }, value === null ? '—' : value.toFixed(2));
+  },
+};
+
 export default {
   name: 'WaylineDashboard',
-  components: { UpdatePanel },
+  components: { UpdatePanel, CursorCell },
   props: { api: Object, preview: Boolean },
   data() {
     return {
@@ -817,6 +878,10 @@ export default {
       stopped: false,
       historyRequest: 0,
       historyLoaded: false,
+      tableRows: [],
+      cursor: { index: -1 },
+      sort: { key: 'last', dir: -1 },
+      seriesColumns,
       ranges: [
         { label: '15m', minutes: 15 },
         { label: '1h', minutes: 60 },
@@ -1062,9 +1127,6 @@ export default {
     wanGraph() {
       return !!(this.state.config.directWan && this.wanAvailable);
     },
-    serverShown() {
-      return this.history.some((s) => this.isServer(s));
-    },
     markerList() {
       const end = this.windowStart + this.range * 60000;
       return this.historyMarkers.filter((m) => m.at >= this.windowStart && m.at <= end);
@@ -1072,23 +1134,18 @@ export default {
     recentEvents() {
       return (this.state.events || []).slice(0, 5);
     },
-    legendItems() {
-      return this.history
-        .filter((s) => !this.isServer(s))
-        .map((s) => {
-          const t = this.state.tunnels.find((tunnel) => tunnel.id === s.id);
-          const tunnel = s.id !== 'wan' && !this.isUplink(s);
-          return {
-            id: s.id,
-            name: this.seriesName(s),
-            owner: s.id,
-            tunnel,
-            selected: this.isSelected(s),
-            color: this.seriesColor(s),
-            preferred: tunnel && !!t && !!t.preferred,
-            stored: tunnel && !!t && !t.connected,
-          };
-        });
+    sortedRows() {
+      const { key, dir } = this.sort;
+      const rows = this.tableRows.slice();
+      if (key === 'name') return rows.sort((a, b) => dir * a.name.localeCompare(b.name));
+      const read = (row) =>
+        key === 'cursor' ? valueAt(row.line, this.cursor.index) : row.stats[key];
+      return rows.sort((a, b) => {
+        const x = read(a);
+        const y = read(b);
+        if (x === null || y === null) return (x === null) - (y === null);
+        return dir * (x - y);
+      });
     },
   },
   watch: {
@@ -1665,6 +1722,7 @@ export default {
       const series = [{}];
       const bands = [];
       const lines = [];
+      const rows = [];
       this.history
         .slice()
         .sort((a, b) => order(a) - order(b))
@@ -1727,6 +1785,19 @@ export default {
             bands.push({ series: [line.high, line.low], fill: () => fill });
           }
           lines.push(line);
+          rows.push(
+            Object.freeze({
+              key: s.id,
+              owner,
+              index: line.index,
+              name: line.name,
+              swatch: this.seriesColor(s),
+              dashed: server,
+              tunnel: !muted && !server,
+              stats: summarize(s.points),
+              line,
+            }),
+          );
         });
       return {
         key: JSON.stringify(series.map((o) => [o.label, o.stroke, o.width])),
@@ -1734,6 +1805,7 @@ export default {
         series,
         bands,
         lines,
+        rows,
       };
     },
     createPlot(built) {
@@ -1787,6 +1859,7 @@ export default {
         this.destroyPlot();
         this.createPlot(built);
       }
+      this.tableRows = built.rows;
       this.applyVisibility();
     },
     destroyPlot() {
@@ -1794,6 +1867,8 @@ export default {
       this.plot = null;
       this.plotLines = [];
       this.plotKey = '';
+      this.tableRows = [];
+      this.cursor.index = -1;
       this.hideTip();
     },
     hideTip() {
@@ -1818,60 +1893,75 @@ export default {
         }
       });
     },
+    timeLabel(t) {
+      if (this.range <= 1440) return this.clock(t);
+      return (
+        new Date(t).toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + this.clock(t)
+      );
+    },
     updateTip(u) {
+      const idx = u.cursor.idx == null ? -1 : u.cursor.idx;
+      if (this.cursor.index !== idx) this.cursor.index = idx;
       const tip = this.$refs.tip;
       if (!tip) return;
-      const idx = u.cursor.idx;
-      if (idx == null) {
+      if (idx < 0) {
         tip.hidden = true;
         return;
       }
       const at = u.data[0][idx] * 1000;
-      const rows = this.plotLines
-        .filter((line) => u.series[line.index].show)
-        .map((line) => ({
-          line,
-          median: line.median[idx],
-          low: line.min[idx],
-          high: line.max[idx],
-        }))
-        .sort((a, b) => {
-          if (a.median === null || b.median === null)
-            return (a.median === null) - (b.median === null);
-          return b.median - a.median;
-        });
-      const marker = this.markerList.find((m) => Math.abs(m.at - at) <= 60000);
-      const title = document.createElement('strong');
-      title.textContent = this.clock(at);
-      const children = [title];
+      const pointer = u.posToVal(u.cursor.top, 'y');
+      let nearest = null;
+      this.plotLines.forEach((line) => {
+        const value = line.median[idx];
+        if (!u.series[line.index].show || !isNumber(value)) return;
+        if (!nearest || Math.abs(value - pointer) < Math.abs(nearest.value - pointer))
+          nearest = { line, value };
+      });
+      const bucket = this.range > 360 ? 300000 : 60000;
+      const marker = this.markerList.find((m) => Math.abs(m.at - at) <= bucket);
+      const head = document.createElement('div');
+      head.className = 'vph-tip-row';
+      const time = document.createElement('strong');
+      time.textContent = this.timeLabel(at);
+      head.append(time);
+      if (nearest) {
+        const swatch = document.createElement('span');
+        swatch.className = 'vph-tip-swatch';
+        swatch.style.setProperty('--series', nearest.line.color);
+        swatch.setAttribute('aria-hidden', 'true');
+        const name = document.createElement('span');
+        name.textContent = nearest.line.name;
+        const value = document.createElement('span');
+        value.className = 'vph-tip-value';
+        value.textContent = this.ms(nearest.value);
+        head.append(swatch, name, value);
+      } else {
+        const none = document.createElement('span');
+        none.textContent = 'No data';
+        head.append(none);
+      }
+      const children = [head];
       if (marker) {
         const event = document.createElement('div');
         event.className = 'vph-tip-event';
         event.textContent = marker.text;
         children.push(event);
       }
-      rows.forEach(({ line, median, low, high }) => {
-        const row = document.createElement('div');
-        if (line.owner === this.selectedTunnel && !line.muted) row.className = 'vph-tip-selected';
-        const swatch = document.createElement('span');
-        swatch.className = 'vph-swatch vph-tip-swatch' + (line.muted ? ' vph-swatch-wan' : '');
-        swatch.style.setProperty('--series', line.color);
-        swatch.setAttribute('aria-hidden', 'true');
-        const range =
-          low === null || high === null
-            ? ''
-            : ' (min ' + low.toFixed(2) + ', max ' + high.toFixed(2) + ')';
-        const text = median === null ? 'no measurement' : 'median ' + this.ms(median) + range;
-        row.append(swatch, document.createTextNode(line.name + ': ' + text));
-        children.push(row);
-      });
       tip.replaceChildren(...children);
       tip.hidden = false;
       const box = this.$refs.chart.getBoundingClientRect();
       const over = u.over.getBoundingClientRect();
-      const x = over.left - box.left + u.cursor.left;
+      const left = over.left - box.left;
+      const top = over.top - box.top;
+      const x = left + u.cursor.left;
+      const y = top + u.cursor.top;
+      const gap = 12;
       const width = tip.offsetWidth;
-      tip.style.left = (x + 14 + width > box.width ? Math.max(0, x - 14 - width) : x + 14) + 'px';
+      const height = tip.offsetHeight;
+      const fitsRight = x + gap + width <= left + over.width;
+      const fitsBelow = y + gap + height <= top + over.height;
+      tip.style.left = Math.max(0, fitsRight ? x + gap : x - gap - width) + 'px';
+      tip.style.top = Math.max(0, fitsBelow ? y + gap : y - gap - height) + 'px';
     },
     drawMarkers(u) {
       const markers = this.markerList;
@@ -1934,6 +2024,23 @@ export default {
     highlight(id) {
       this.selectedTunnel = id;
     },
+    sortBy(key) {
+      this.sort =
+        this.sort.key === key
+          ? { key, dir: -this.sort.dir }
+          : { key, dir: key === 'name' ? 1 : -1 };
+    },
+    ariaSort(key) {
+      if (this.sort.key !== key) return 'none';
+      return this.sort.dir > 0 ? 'ascending' : 'descending';
+    },
+    isPreferred(row) {
+      const t = this.state.tunnels.find((tunnel) => tunnel.id === row.owner);
+      return row.tunnel && !!t && !!t.preferred;
+    },
+    emphasize(index) {
+      if (this.plot) this.plot.setSeries(index < 0 ? null : index, { focus: true });
+    },
     isolate(item, event) {
       const id = item.owner;
       if (event && (event.ctrlKey || event.metaKey || event.shiftKey)) {
@@ -1958,9 +2065,6 @@ export default {
     },
     ownerOf(series) {
       return this.isServer(series) ? series.id.slice(endpointPrefix.length) : series.id;
-    },
-    isSelected(series) {
-      return series.id !== 'wan' && this.ownerOf(series) === this.selectedTunnel;
     },
     seriesColor(series) {
       const owner = this.ownerOf(series);
@@ -2461,48 +2565,102 @@ export default {
   margin: 0;
   font-size: 13px;
 }
-.vph-key {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 16px;
-  margin: 0;
-  padding: 0 8px;
-  list-style: none;
+.vph-series-scroll {
+  max-height: 220px;
+  overflow: auto;
+  margin-top: 14px;
+  border-top: 1px solid var(--vph-border);
+}
+.vph-series {
+  width: 100%;
+  min-width: 460px;
+  border-collapse: separate;
+  border-spacing: 0;
   font-size: 12px;
+}
+.vph-series th,
+.vph-series td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--vph-border);
+  text-align: right;
+  white-space: nowrap;
+  font-weight: 400;
+}
+.vph-series thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding-top: 7px;
+  padding-bottom: 7px;
+  background: var(--vph-card);
   color: var(--vph-muted);
 }
-.vph-key li {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
+.vph-series .vph-series-name {
+  text-align: left;
+  color: var(--vph-text);
 }
-.vph-key-line {
-  display: block;
-  width: 24px;
-  height: 8px;
-  overflow: visible;
+.vph-series tbody tr {
+  cursor: pointer;
 }
-.vph-key-line line {
-  stroke: var(--vph-muted);
-  stroke-width: 1.8;
+.vph-series tbody tr:hover {
+  background: color-mix(in srgb, var(--vph-brand) 6%, var(--vph-card));
 }
-.vph-key-line .vph-key-dashed {
-  stroke-dasharray: 4 3;
+.vph-series tbody tr.active {
+  background: color-mix(in srgb, var(--vph-brand) 10%, var(--vph-card));
 }
-.vph-legend-item.dimmed {
+.vph-series tbody tr.dimmed {
   opacity: 0.45;
 }
-.vph-legend-hint {
-  margin: 6px 0 0;
-  font-size: 12px;
+.vph-series tbody tr:focus-visible {
+  outline: 2px solid var(--vph-brand);
+  outline-offset: -2px;
 }
-.vph-legend-dot {
+.vph-series-swatch {
   display: inline-block;
-  width: 9px;
-  height: 9px;
-  margin-right: 6px;
-  border-radius: 50%;
-  background: var(--series, var(--vph-brand));
+  overflow: visible;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+.vph-series-swatch line {
+  stroke: var(--series, var(--vph-brand));
+  stroke-width: 2;
+}
+.vph-series-swatch line.vph-series-dashed {
+  stroke-dasharray: 4 3;
+}
+.vph-series .vph-badge {
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.vph-sort {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.vph-sort::after {
+  content: '';
+  display: inline-block;
+  margin-left: 6px;
+  vertical-align: middle;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+}
+th[aria-sort='ascending'] .vph-sort,
+th[aria-sort='descending'] .vph-sort {
+  color: var(--vph-text);
+}
+th[aria-sort='ascending'] .vph-sort::after {
+  border-bottom: 5px solid currentColor;
+}
+th[aria-sort='descending'] .vph-sort::after {
+  border-top: 5px solid currentColor;
+}
+.vph-series-hint {
+  margin: 0;
 }
 .vph-history {
   padding: 22px;
@@ -2563,27 +2721,28 @@ export default {
 }
 .vph-tooltip {
   position: absolute;
-  top: 25px;
+  top: 0;
+  left: 0;
   width: max-content;
-  max-width: min(380px, calc(100% - 24px));
-  white-space: normal;
-  overflow-wrap: anywhere;
-  line-height: 1.5;
-  padding: 10px 12px;
+  white-space: nowrap;
+  padding: 4px 8px;
+  line-height: 18px;
   background: var(--vph-card);
   border: 1px solid var(--vph-border);
   border-radius: 5px;
   font-size: 12px;
   pointer-events: none;
 }
+.vph-tip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.vph-tip-value {
+  font-variant-numeric: tabular-nums;
+}
 .vph-tip-event {
   color: var(--vph-brand-text);
-  white-space: normal;
-  margin: 2px 0 4px;
-}
-.vph-tip-selected {
-  color: var(--vph-text);
-  font-weight: 600;
 }
 .vph-chart-footer {
   display: flex;
@@ -2594,72 +2753,13 @@ export default {
   font-size: 12px;
   margin-top: 5px;
 }
-.vph-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px 8px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-.vph-legend-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  min-height: 32px;
-  border: 0;
-  border-radius: 4px;
-  background: none;
-  padding: 4px 8px;
-  color: var(--vph-text);
-  font: inherit;
-  font-size: 12px;
-  text-align: left;
-}
-button.vph-legend-item {
-  cursor: pointer;
-}
-.vph-legend-item.active {
-  background: color-mix(in srgb, var(--vph-brand) 10%, var(--vph-card));
-  color: var(--vph-brand-text);
-}
-.vph-legend-item .vph-muted {
-  margin-left: 6px;
-}
-.vph-swatch {
-  display: inline-block;
-  width: 15px;
-  height: 3px;
-  vertical-align: middle;
-  background: var(--series, var(--vph-brand));
-  margin-right: 6px;
-  border-radius: 2px;
-}
-.vph-legend-item .vph-swatch {
-  margin-right: 4px;
-}
-.vph-swatch-wan {
-  height: 0;
-  background: none;
-  border-top: 1.5px solid var(--vph-muted);
-}
-.vph-legend-block {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  min-width: 0;
-}
 .vph-tip-swatch {
-  width: 10px;
-  height: 10px;
+  display: inline-block;
+  flex: none;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
-  margin-right: 6px;
-}
-.vph-tip-swatch.vph-swatch-wan {
-  height: 0;
-  width: 12px;
-  border-radius: 0;
+  background: var(--series, var(--vph-brand));
 }
 .vph-changes {
   padding: 16px 18px;
@@ -2928,6 +3028,21 @@ button.vph-legend-item {
   .vph-hero-primary .vph-hero-ip {
     font-size: 24px;
   }
+  .vph-series {
+    min-width: 0;
+  }
+  .vph-series th,
+  .vph-series td {
+    padding: 5px 4px;
+  }
+  .vph-series .vph-series-name {
+    white-space: normal;
+    min-width: 96px;
+  }
+  .vph-series thead th,
+  .vph-sort {
+    white-space: normal;
+  }
   .vph-exits thead {
     position: absolute;
     width: 1px;
@@ -2973,7 +3088,7 @@ button.vph-legend-item {
 }
 @media (pointer: coarse) {
   .vph .vph-control,
-  .vph .vph-legend-item {
+  .vph .vph-sort {
     min-height: 44px;
   }
   .vph .vph-switch {
