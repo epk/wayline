@@ -268,19 +268,20 @@ fn package_checks() -> Result<()> {
         "The native state contract failed."
     );
     let mut config = state["config"].clone();
-    config["target"] = json!(if config["target"] == "8.8.8.8" {
-        "1.1.1.1"
+    config["targets"] = json!(if config["targets"][0] == "8.8.8.8" {
+        ["1.1.1.1", "9.9.9.9"]
     } else {
-        "8.8.8.8"
+        ["8.8.8.8", "9.9.9.9"]
     });
     config["tunnels"] = json!([]);
     let mut input = config.clone();
     input["tunnels"] = json!({});
     let args = json!({"expected_revision":state["revision"],"config":input});
     request("set_config", &args)?;
+    let stored = request("get_state", &json!({}))?["config"].clone();
     ensure!(
-        request("get_state", &json!({}))?["config"] == config,
-        "Native settings did not persist."
+        stored == config,
+        "Native settings did not persist. Sent {config}, read {stored}."
     );
     let path = Path::new(ROOT).join("etc/wayline/settings.json");
     let saved = fs::read(&path)?;
