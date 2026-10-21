@@ -135,6 +135,7 @@ fn snapshot(
             received: p.received,
             success_age_ms: p.last_success.map(|at| millis(now.duration_since(at))),
             history: p.history(),
+            buckets: Vec::new(),
         })
         .collect();
     let mut data = serde_json::to_vec(&Status {

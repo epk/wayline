@@ -5,6 +5,7 @@ use std::net::Ipv4Addr;
 
 pub const HISTORY: usize = 64;
 pub const MAX_SERIES: usize = 90;
+pub const BUCKET_SECONDS: u64 = 15;
 pub const MAX_STATUS: usize = 768 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +93,18 @@ pub struct Series {
     pub received: u64,
     pub success_age_ms: Option<u64>,
     pub history: Vec<Sample>,
+    #[serde(default)]
+    pub buckets: Vec<Bucket>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct Bucket {
+    pub at: u64,
+    pub sent: u16,
+    pub lost: u16,
+    pub min_us: Option<u32>,
+    pub median_us: Option<u32>,
+    pub max_us: Option<u32>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
