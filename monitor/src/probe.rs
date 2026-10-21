@@ -23,20 +23,13 @@ const OPEN_BUCKETS: usize = 8;
 const RETAINED_BUCKETS: usize = 80;
 const SNAPSHOT_BUCKETS: usize = 8;
 const UNMATCHED_LIMIT: u16 = 16;
-const ROUTE_WINDOW: Duration = Duration::from_millis(200);
-pub const MAX_PENDING: usize = 4;
+const MAX_PENDING: usize = 4;
 
 struct Pending {
     started: Instant,
     deadline: Instant,
     bucket: u64,
     packet: [u8; PACKET_SIZE],
-}
-
-struct RoutePending {
-    sequence: u32,
-    deadline: Instant,
-    counter: u64,
 }
 
 struct OpenBucket {
@@ -113,7 +106,6 @@ pub struct Probe<'a> {
     sample_hint: usize,
     socket: Option<RegisteredSocket>,
     pending: Vec<Pending>,
-    route_pending: Option<RoutePending>,
     next_due: Instant,
     state: State,
     generation: u32,
@@ -144,7 +136,6 @@ impl<'a> Probe<'a> {
                 .map_or(BUCKET_SAMPLES, |n| n.min(BUCKET_SAMPLES)),
             socket: None,
             pending: Vec::new(),
-            route_pending: None,
             next_due,
             state: State::Waiting,
             generation: 0,
@@ -191,43 +182,23 @@ impl<'a> Probe<'a> {
         }
     }
 
-    pub fn attempts(&self) -> usize {
-        self.pending.len() + usize::from(self.route_pending.is_some())
-    }
-
-    pub const fn checking(&self) -> bool {
-        self.route_pending.is_some()
-    }
-
     pub const fn saturated(&self) -> bool {
         self.pending.len() >= MAX_PENDING
     }
 
     pub fn due(&self, now: Instant) -> bool {
-        now >= self.next_due && self.route_pending.is_none()
-    }
-
-    pub fn waiting_for(&self, sequence: u32) -> bool {
-        self.route_pending
-            .as_ref()
-            .is_some_and(|route| route.sequence == sequence)
+        now >= self.next_due
     }
 
     pub fn listening(&self) -> Option<&RegisteredSocket> {
         self.socket.as_ref().filter(|_| !self.pending.is_empty())
     }
 
-    pub fn deadline(&self, can_start: bool) -> Option<Instant> {
-        let slot = match &self.route_pending {
-            Some(route) => Some(route.deadline),
-            None if can_start => Some(self.next_due),
-            None => None,
-        };
+    pub fn deadline(&self) -> Instant {
         self.pending
             .iter()
             .map(|pending| pending.deadline)
-            .chain(slot)
-            .min()
+            .fold(self.next_due, Instant::min)
     }
 
     fn median_us(&self) -> Option<u32> {
@@ -251,7 +222,6 @@ impl<'a> Probe<'a> {
     fn reset_path(&mut self, generation: u32) {
         self.socket = None;
         self.pending.clear();
-        self.route_pending = None;
         self.generation = generation;
         self.history.clear();
         self.open.clear();
@@ -315,7 +285,13 @@ impl<'a> Probe<'a> {
         self.push_history(None);
     }
 
-    pub fn query_route(&mut self, now: Instant, routes: &RouteLookup, sequence: u64) {
+    pub fn query_route(
+        &mut self,
+        now: Instant,
+        routes: &RouteLookup,
+        sequence: u64,
+        nonce: &[u8; 16],
+    ) {
         self.advance_slot(now);
 
         let interface = self.tunnel.interface.as_str();
@@ -333,49 +309,20 @@ impl<'a> Probe<'a> {
             return;
         }
         let route_sequence = u32::try_from(sequence & u64::from(u32::MAX)).unwrap_or_default();
-        if routes
-            .request(
-                self.tunnel.source,
-                self.target,
-                self.tunnel.mark,
-                route_sequence,
-            )
-            .is_err()
-        {
-            self.fail(State::RouteQueryFailed);
-            return;
+        match routes.lookup(
+            self.tunnel.source,
+            self.target,
+            self.tunnel.mark,
+            route_sequence,
+        ) {
+            Err(_) => self.fail(State::RouteQueryFailed),
+            Ok(None) => self.fail(State::RouteUnavailable),
+            Ok(Some(route)) if route != self.generation => self.fail(State::RouteMismatch),
+            Ok(Some(_)) => self.send_echo(sequence, nonce),
         }
-        self.route_pending = Some(RoutePending {
-            sequence: route_sequence,
-            counter: sequence,
-            deadline: now + ROUTE_WINDOW,
-        });
-        self.state = State::CheckingRoute;
     }
 
-    pub fn route_reply(&mut self, interface: Option<u32>, nonce: &[u8; 16]) {
-        let Some(route) = self.route_pending.take() else {
-            return;
-        };
-        if Instant::now() >= route.deadline {
-            self.fail(State::RouteQueryTimeout);
-            return;
-        }
-        if interface != Some(self.generation) {
-            self.fail(if interface.is_none() {
-                State::RouteUnavailable
-            } else {
-                State::RouteMismatch
-            });
-            return;
-        }
-
-        let current = ifindex(&self.tunnel.interface);
-        if current != Some(self.generation) {
-            self.reset_path(current.unwrap_or(0));
-            self.state = State::InterfaceChanged;
-            return;
-        }
+    fn send_echo(&mut self, sequence: u64, nonce: &[u8; 16]) {
         if self.socket.is_none() {
             let Ok(socket) = open_socket(self.tunnel, self.target, self.generation) else {
                 self.state = State::SocketSetupFailed;
@@ -389,7 +336,7 @@ impl<'a> Probe<'a> {
         if self.pending.len() >= MAX_PENDING {
             return;
         }
-        let Some(packet) = echo_request(route.counter, nonce) else {
+        let Some(packet) = echo_request(sequence, nonce) else {
             return;
         };
         let sent_at = Instant::now();
@@ -448,14 +395,6 @@ impl<'a> Probe<'a> {
     }
 
     pub fn expire(&mut self, now: Instant, wall_ms: u64) {
-        if self
-            .route_pending
-            .as_ref()
-            .is_some_and(|route| now >= route.deadline)
-        {
-            self.route_pending = None;
-            self.fail(State::RouteQueryTimeout);
-        }
         while let Some(index) = self
             .pending
             .iter()

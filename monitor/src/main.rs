@@ -8,12 +8,11 @@ mod probe;
 mod readiness;
 mod route;
 
-use futures_util::future::select_all;
-use probe::{MAX_PENDING, Probe};
+use probe::Probe;
 use std::{
     fmt::Write as _,
     fs::{self, File, OpenOptions},
-    future::Future,
+    future::{self, Future},
     io::{self, Read, Write},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -21,12 +20,12 @@ use std::{
     },
     path::PathBuf,
     pin::Pin,
+    task::Poll,
     time::{Duration, Instant},
 };
-use wayline_protocol::{Config, MAX_SERIES, MAX_STATUS, Status};
+use wayline_protocol::{Config, MAX_STATUS, Status};
 
 const MAX_CLIENTS: usize = 4;
-const MAX_INFLIGHT: usize = MAX_SERIES * MAX_PENDING + 24;
 const MAX_REQUEST: usize = 64;
 const REQUEST_WINDOW: Duration = Duration::from_millis(200);
 const REPLY_WINDOW: Duration = Duration::from_secs(2);
@@ -260,7 +259,6 @@ fn advance(client: &mut Client, now: Instant, monitor: &mut Monitor) -> bool {
 
 enum Ready {
     Listener,
-    Route,
     Probe(usize),
     Other,
 }
@@ -273,7 +271,6 @@ type ReadinessFuture<'a> = Pin<Box<dyn Future<Output = io::Result<Ready>> + 'a>>
 )]
 async fn wait_ready(
     endpoint: &Endpoint,
-    routes: &route::RouteLookup,
     probes: &[Probe<'_>],
     clients: &[Client],
     wait: Duration,
@@ -286,14 +283,10 @@ async fn wait_ready(
             .filter_map(|(index, probe)| Some((index, probe.listening()?)))
     };
     let mut pending: Vec<ReadinessFuture<'_>> =
-        Vec::with_capacity(3 + listening().count() + clients.len());
+        Vec::with_capacity(2 + listening().count() + clients.len());
     pending.push(Box::pin(async {
         endpoint.ready.readable(false).await?;
         Ok(Ready::Listener)
-    }));
-    pending.push(Box::pin(async {
-        routes.socket.ready.readable(false).await?;
-        Ok(Ready::Route)
     }));
     for (index, socket) in listening() {
         pending.push(Box::pin(async move {
@@ -317,8 +310,18 @@ async fn wait_ready(
         Ok(Ready::Other)
     }));
     let start = round % pending.len();
-    pending.rotate_left(start);
-    select_all(pending).await.0
+    future::poll_fn(|cx| {
+        for offset in 0..pending.len() {
+            let index = (start + offset) % pending.len();
+            if let Some(future) = pending.get_mut(index)
+                && let Poll::Ready(event) = future.as_mut().poll(cx)
+            {
+                return Poll::Ready(event);
+            }
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 fn accept_clients(endpoint: &Endpoint, clients: &mut Vec<Client>, now: Instant) -> io::Result<()> {
@@ -347,21 +350,6 @@ fn accept_clients(endpoint: &Endpoint, clients: &mut Vec<Client>, now: Instant) 
     Ok(())
 }
 
-fn drain_routes(
-    routes: &route::RouteLookup,
-    probes: &mut [Probe],
-    nonce: &[u8; 16],
-) -> io::Result<()> {
-    if let Some(reply) = routes.receive()?
-        && let Some(probe) = probes
-            .iter_mut()
-            .find(|probe| probe.waiting_for(reply.sequence))
-    {
-        probe.route_reply(reply.interface, nonce);
-    }
-    Ok(())
-}
-
 #[expect(
     clippy::future_not_send,
     reason = "Monoio keeps each future on one local thread."
@@ -384,7 +372,6 @@ async fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>)
         for probe in &mut monitor.probes {
             probe.expire(now, wall_ms);
         }
-        let mut attempts: usize = monitor.probes.iter().map(Probe::attempts).sum();
         let count = monitor.probes.len();
         let first = next_probe;
         for index in (0..count).map(|offset| (first + offset) % count) {
@@ -398,31 +385,25 @@ async fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>)
                 probe.skip_slot(now);
                 continue;
             }
-            if attempts >= MAX_INFLIGHT {
-                break;
-            }
             next_probe = (index + 1) % count;
             sequence = sequence.wrapping_add(1);
-            probe.query_route(now, &routes, sequence);
-            attempts += usize::from(probe.checking());
+            probe.query_route(now, &routes, sequence, &monitor.nonce);
         }
 
         clients.retain_mut(|client| advance(client, now, &mut monitor));
-        let can_start = attempts < MAX_INFLIGHT;
         let deadline = monitor
             .probes
             .iter()
-            .filter_map(|probe| probe.deadline(can_start))
+            .map(Probe::deadline)
             .chain(clients.iter().map(|client| client.deadline))
             .chain(stop_at)
             .min()
             .unwrap_or(now + IDLE_WAIT);
         let wait = deadline.saturating_duration_since(Instant::now());
-        let ready = wait_ready(&endpoint, &routes, &monitor.probes, &clients, wait, round).await?;
+        let ready = wait_ready(&endpoint, &monitor.probes, &clients, wait, round).await?;
         round = round.wrapping_add(1);
         match ready {
             Ready::Listener => accept_clients(&endpoint, &mut clients, Instant::now())?,
-            Ready::Route => drain_routes(&routes, &mut monitor.probes, &monitor.nonce)?,
             Ready::Probe(index) => {
                 if let Some(probe) = monitor.probes.get_mut(index) {
                     probe.drain(Instant::now());

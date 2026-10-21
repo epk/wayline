@@ -1,4 +1,3 @@
-use crate::readiness::RegisteredSocket;
 use netlink_packet_core::{NLM_F_REQUEST, NetlinkBuffer, NlaBuffer, NlasIterator, parse_u32};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
@@ -7,6 +6,7 @@ use std::{
 };
 
 const SIZE: usize = 60;
+const REPLY_READS: usize = 4;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_GETROUTE: u16 = 26;
 const RTA_DST: u16 = 1;
@@ -19,11 +19,11 @@ const IPPROTO_ICMP: u8 = 1;
 const RTN_UNICAST: u8 = 1;
 
 pub struct RouteLookup {
-    pub socket: RegisteredSocket,
+    socket: Socket,
 }
-pub struct Reply {
-    pub sequence: u32,
-    pub interface: Option<u32>,
+struct Reply {
+    sequence: u32,
+    interface: Option<u32>,
 }
 
 impl RouteLookup {
@@ -31,12 +31,30 @@ impl RouteLookup {
         let socket = Socket::new(Domain::from(16), Type::RAW, Some(Protocol::from(0)))?;
         socket.set_nonblocking(true)?;
         socket.set_recv_buffer_size(8192)?;
-        Ok(Self {
-            socket: RegisteredSocket::new(socket)?,
-        })
+        Ok(Self { socket })
     }
 
-    pub fn request(
+    pub fn lookup(
+        &self,
+        source: Ipv4Addr,
+        target: Ipv4Addr,
+        mark: u32,
+        sequence: u32,
+    ) -> io::Result<Option<u32>> {
+        self.request(source, target, mark, sequence)?;
+        let mut data = [0_u8; 4096];
+        for _ in 0..REPLY_READS {
+            let size = (&self.socket).read(&mut data)?;
+            if let Some(reply) = decode(&data[..size])
+                && reply.sequence == sequence
+            {
+                return Ok(reply.interface);
+            }
+        }
+        Err(io::Error::other("no matching route reply"))
+    }
+
+    fn request(
         &self,
         source: Ipv4Addr,
         target: Ipv4Addr,
@@ -60,15 +78,6 @@ impl RouteLookup {
             Ok(())
         } else {
             Err(io::Error::other("incomplete route query"))
-        }
-    }
-
-    pub fn receive(&self) -> io::Result<Option<Reply>> {
-        let mut data = [0_u8; 4096];
-        match (&*self.socket).read(&mut data) {
-            Ok(size) => Ok(decode(&data[..size])),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(error) => Err(error),
         }
     }
 }
