@@ -278,7 +278,7 @@ fn licenses(version: &str) -> Result<()> {
             }
         }
     }
-    for name in ["vue-style-loader", "css-loader"] {
+    for name in ["vue-style-loader", "css-loader", "uplot"] {
         let source = PathBuf::from(format!("ui/node_modules/{name}"));
         let destination = output.join(name);
         fs::create_dir_all(&destination)?;

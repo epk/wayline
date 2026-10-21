@@ -12,6 +12,7 @@
     "eslint": "9.39.5",
     "eslint-plugin-vue": "10.11.1",
     "prettier": "3.9.10",
+    "uplot": "1.6.32",
     "vue": "2.7.16",
     "vue-loader": "15.11.1",
     "vue-style-loader": "4.1.3",
