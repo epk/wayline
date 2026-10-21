@@ -312,10 +312,21 @@ fn package_checks() -> Result<()> {
         cron.matches("/usr/sbin/wayline-ctl tick").count() == 1,
         "Installation duplicated its scheduler entry."
     );
-    request("check_update", &json!({}))?;
-    request("tick", &json!({}))?;
+    let started = request("check_update", &json!({}))?;
     ensure!(
-        request("get_state", &json!({}))?["update"]["failed"] == true,
+        started["started"] == true && started["update"]["current"].is_string(),
+        "The update check did not start immediately."
+    );
+    let mut update = Value::Null;
+    for _ in 0..30 {
+        update = request("get_state", &json!({}))?["update"].clone();
+        if update["phase"] == "failed" {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    ensure!(
+        update["failed"] == true && update["phase"] == "failed",
         "An offline update failure did not reach the UI state."
     );
     println!("{}", call("/bin/opkg", &["remove", "wayline"])?);
