@@ -7,23 +7,64 @@
     zurich: 'Zurich',
     wan: 'Direct WAN',
   };
+  const query = new URLSearchParams(window.location.search);
+  const level = ['monitoring', 'unsupported', 'newer'].includes(query.get('compat'))
+    ? query.get('compat')
+    : 'full';
+  const compatMessages = {
+    full: '',
+    monitoring: 'This firmware is newer than the tested range. Monitoring works.',
+    unsupported: 'This firmware is older than 4.9.0. Wayline cannot control its VPN module.',
+    newer: 'The VPN module is newer than the tested one. Wayline works but is not verified.',
+  };
+  const featureList = (on) =>
+    ['Monitoring', 'History', 'Exit selection', 'Start and Stop', 'Signed updates'].map(
+      (name, i) => ({
+        name,
+        available: i < on || i === 4,
+      }),
+    );
+  const features = { full: 4, newer: 4, monitoring: 2, unsupported: 0 };
   let revision = 1;
   const state = {
-    version: '0.1.0-alpha.2',
+    version: '0.1.0-alpha.3',
     revision: '1',
     scope: 'All clients',
+    compat: {
+      level: level === 'newer' ? 'full' : level,
+      verified: level !== 'newer',
+      firmware: level === 'unsupported' ? '4.8.1' : '4.9.2',
+      message: compatMessages[level],
+      features: level === 'full' ? [] : featureList(features[level]),
+    },
     capabilities: { configure: true, select: true, control: true },
     config: {
       enabled: true,
       target: '1.1.1.1',
       interval: 15,
       tunnels: ['home', 'backup', 'tokyo'],
-      diagnostics: false,
-      targets: ['1.1.1.1', '8.8.8.8', '9.9.9.9'],
+      diagnostics: true,
+      targets: ['1.1.1.1', '9.9.9.9', 'example.com', 'missing.invalid'],
       directWan: true,
       historyHours: 24,
       autoUpdates: false,
+      autoExit: true,
+      endpointDiagnostics: true,
     },
+    auto: {
+      enabled: true,
+      last: {
+        at: Date.now() - 12 * 60000,
+        from: 'backup',
+        to: 'home',
+        reason: 'Home is 38% faster and healthy.',
+      },
+    },
+    endpoints: [
+      { tunnel: 'home', name: names.home, address: '203.0.113.10' },
+      { tunnel: 'backup', name: names.backup, address: '198.51.100.24' },
+    ],
+    resolved: { 'example.com': '93.184.216.34', 'missing.invalid': null },
     tunnels: [
       {
         id: 'home',
@@ -88,20 +129,24 @@
         lost: 0,
         samples: 0,
         eligible: false,
+        historyAvailable: true,
         recent: [],
       },
     ],
     diagnostics: {
-      '1.1.1.1': { home: 32, backup: 48, tokyo: 131, wan: 14 },
-      '8.8.8.8': { home: 39, backup: 55, tokyo: 124, wan: 18 },
-      '9.9.9.9': { home: 35, backup: 49, tokyo: 136, wan: 16 },
+      '1.1.1.1': { home: 32, backup: 48, tokyo: 131, zurich: null, wan: 14 },
+      '9.9.9.9': { home: 36, backup: 52, tokyo: 128, zurich: null, wan: 15 },
+      'example.com': { home: 39, backup: 55, tokyo: 124, zurich: null, wan: 18 },
+      'missing.invalid': { home: null, backup: null, tokyo: null, zurich: null, wan: null },
+      '203.0.113.10': { wan: 21 },
+      '198.51.100.24': { wan: 29 },
     },
   };
   state.tunnels.forEach((tunnel) => (tunnel.monitorId = tunnel.id));
   const copy = (o) => JSON.parse(JSON.stringify(o));
   const delay = (o) => new Promise((resolve) => setTimeout(() => resolve(copy(o)), 180));
   function series(id, target, start, end, step) {
-    const targetBias = target === '8.8.8.8' ? 7 : target === '9.9.9.9' ? 3 : 0;
+    const targetBias = target === 'example.com' ? 7 : target === '9.9.9.9' ? 4 : 0;
     const base = { home: 32, backup: 48, tokyo: 130, wan: 14 }[id] || 32;
     const points = [];
     for (let at = start; at <= end; at += step * 60000) {
@@ -126,7 +171,21 @@
     return { id, name: names[id], points };
   }
   window.previewApi = {
-    get_state: () => Promise.resolve(copy(state)),
+    get_state: () =>
+      query.get('fail') === '1'
+        ? Promise.reject(Error('RPC error: Object not found'))
+        : Promise.resolve(
+            level === 'unsupported'
+              ? {
+                  ...copy(state),
+                  tunnels: [],
+                  endpoints: [],
+                  diagnostics: {},
+                  resolved: {},
+                  auto: { enabled: false, last: null },
+                }
+              : copy(state),
+          ),
     set_config: async ({ config, expected_revision }) => {
       if (expected_revision !== state.revision) throw Error('State changed. Refresh first.');
       state.config = copy(config);
@@ -153,6 +212,7 @@
           enabled,
           connected: false,
           eligible: false,
+          historyAvailable: true,
           stateLabel: enabled ? 'Enabled, offline' : 'Stopped',
           age: 'unknown',
           median: null,
@@ -172,7 +232,14 @@
           ...(include_wan ? [series('wan', target, start, end, step)] : []),
         ],
       }),
-    check_update: () => delay({ message: 'Preview only. No update was downloaded.' }),
+    check_update: () =>
+      delay({
+        available: level === 'unsupported',
+        message:
+          level === 'unsupported'
+            ? 'Wayline 0.2.0 is available. Preview only.'
+            : 'Preview only. No update was downloaded.',
+      }),
     install_update: () => delay({ message: 'Preview only. No update was installed.' }),
   };
 })();

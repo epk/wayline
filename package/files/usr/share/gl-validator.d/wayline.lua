@@ -12,5 +12,10 @@ return {
             return type(value) == 'table'
         end,
     },
-    get_history = { tunnel = '^[%w_-]+$', target = '^%d+%.%d+%.%d+%.%d+$' },
+    get_history = {
+        tunnel = '^[%w_-]+$',
+        target = function(value)
+            return type(value) == 'string' and #value <= 253 and value:match('^[%w%.%-]+$') ~= nil
+        end,
+    },
 }

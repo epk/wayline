@@ -24,6 +24,9 @@
         font-size: 22px;
         letter-spacing: 0.01em;
       }
+      .router-header a {
+        color: inherit;
+      }
       .router-header span {
         font-size: 13px;
         opacity: 0.9;
@@ -73,7 +76,14 @@
     </style>
   </head>
   <body>
-    <header class="router-header"><strong>GL.iNet</strong><span>Beryl 7 · UI preview</span></header>
+    <header class="router-header">
+      <strong>GL.iNet</strong
+      ><span
+        >Beryl 7 · UI preview · <a href="?">Full</a> · <a href="?compat=monitoring">Monitoring</a> ·
+        <a href="?compat=newer">Newer</a> · <a href="?compat=unsupported">Unsupported</a> ·
+        <a href="?fail=1">Read fails</a></span
+      >
+    </header>
     <div class="router-layout">
       <aside aria-label="Router navigation">
         <div>Internet</div>

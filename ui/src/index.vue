@@ -3,6 +3,69 @@
     <div v-if="preview" class="vph-preview">
       Interactive preview · sample data · no router changes
     </div>
+    <section
+      v-if="level === 'unsupported'"
+      class="vph-panel vph-compat vph-compat-unsupported"
+      role="alert"
+    >
+      <h2>This firmware is not supported.</h2>
+      <p>
+        <strong>Firmware {{ compat.firmware || 'unknown' }}</strong>
+      </p>
+      <p>{{ compat.message }}</p>
+      <ul v-if="compat.features.length" class="vph-features" aria-label="Features">
+        <li v-for="f in compat.features" :key="f.name">
+          {{ f.name }}: <strong>{{ f.available ? 'Available' : 'Off' }}</strong>
+        </li>
+      </ul>
+      <p>Update Wayline below. A newer release may support this firmware.</p>
+      <p class="vph-muted">Run wayline-ctl doctor on the router and send the output.</p>
+      <div class="vph-updates">
+        <button type="button" class="vph-button" :disabled="busy" @click="checkUpdates">
+          Check for update
+        </button>
+        <button
+          v-if="updateAvailable"
+          type="button"
+          class="vph-button vph-primary"
+          :disabled="busy"
+          @click="installUpdate"
+        >
+          Install update
+        </button>
+        <span v-if="updateText" class="vph-muted">{{ updateText }}</span>
+      </div>
+    </section>
+    <div
+      v-else-if="showCompat"
+      class="vph-panel vph-compat"
+      :class="level === 'monitoring' ? 'vph-compat-monitoring' : 'vph-compat-note'"
+      role="status"
+    >
+      <p>
+        <strong>Firmware {{ compat.firmware || 'unknown' }}</strong> {{ compat.message }}
+      </p>
+      <ul v-if="compat.features.length" class="vph-features" aria-label="Features">
+        <li v-for="f in compat.features" :key="f.name">
+          {{ f.name }}: <strong>{{ f.available ? 'Available' : 'Off' }}</strong>
+        </li>
+      </ul>
+      <div class="vph-updates">
+        <button type="button" class="vph-button" :disabled="busy" @click="checkUpdates">
+          Check for update
+        </button>
+        <button
+          v-if="updateAvailable"
+          type="button"
+          class="vph-button vph-primary"
+          :disabled="busy"
+          @click="installUpdate"
+        >
+          Install update
+        </button>
+        <span v-if="updateText" class="vph-muted">{{ updateText }}</span>
+      </div>
+    </div>
     <header class="vph-heading">
       <div>
         <div class="vph-eyebrow">VPN</div>
@@ -10,32 +73,80 @@
         <p>Compare your tunnels and choose an exit.</p>
       </div>
       <button
+        ref="settingsButton"
         class="vph-button"
-        :disabled="!state.capabilities.configure"
-        :aria-expanded="settingsOpen"
+        :disabled="!can.configure"
+        :aria-expanded="settingsOpen ? 'true' : 'false'"
+        aria-controls="vph-settings"
         @click="openSettings"
       >
         Settings
       </button>
     </header>
-    <div v-if="error || readError || historyError" class="vph-error" role="alert">
-      {{ error || readError || historyError }}
+    <p class="vph-statusline" role="status">{{ statusLine }}</p>
+    <p v-if="!can.configure && ready" class="vph-muted vph-hint">{{ configureReason }}</p>
+    <div role="alert">
+      <div v-if="!ready && readError" class="vph-panel vph-fail">
+        <h2>Wayline could not read the tunnel state.</h2>
+        <p class="vph-fail-text">{{ readError }}</p>
+        <p class="vph-muted">Run wayline-ctl doctor on the router and send the output.</p>
+        <button type="button" class="vph-button" :disabled="loading" @click="retry">Retry</button>
+        <div class="vph-updates">
+          <button type="button" class="vph-button" :disabled="busy" @click="checkUpdates">
+            Check for update
+          </button>
+          <button
+            v-if="updateAvailable"
+            type="button"
+            class="vph-button vph-primary"
+            :disabled="busy"
+            @click="installUpdate"
+          >
+            Install update
+          </button>
+          <span v-if="updateText" class="vph-muted">{{ updateText }}</span>
+        </div>
+      </div>
+      <div v-if="error || (ready && readError)" ref="alert" class="vph-error">
+        <span>{{ error || readError }}</span>
+        <button v-if="error" type="button" class="vph-link" @click="error = ''">Dismiss</button>
+      </div>
     </div>
-    <div v-if="notice" class="vph-notice" role="status">{{ notice }}</div>
+    <div role="status">
+      <div v-if="notice" class="vph-notice">
+        <span>{{ notice }}</span>
+        <button type="button" class="vph-link" @click="notice = ''">Dismiss</button>
+      </div>
+    </div>
 
-    <form v-if="settingsOpen" class="vph-panel vph-settings" @submit.prevent="saveSettings">
-      <h2>Settings</h2>
+    <form
+      v-if="settingsOpen"
+      id="vph-settings"
+      ref="settings"
+      class="vph-panel vph-settings"
+      aria-labelledby="vph-settings-title"
+      @submit.prevent="saveSettings"
+      @keydown.esc="closeSettings"
+    >
+      <h2 id="vph-settings-title">Settings</h2>
       <label class="vph-check"
         ><input type="checkbox" v-model="draft.enabled" /> Measure tunnel latency</label
       >
       <div class="vph-fields">
         <label
           >Comparison target<input
+            ref="firstField"
             v-model.trim="draft.target"
             required
+            maxlength="253"
             placeholder="1.1.1.1"
-            inputmode="decimal"
-          /><small>The monitor uses the same target for every tunnel.</small></label
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+          /><small
+            >Use an IPv4 address or a host name. The monitor uses the same target for every
+            tunnel.</small
+          ><small v-if="resolvedText(draft.target)">{{ resolvedText(draft.target) }}</small></label
         >
         <label
           >Probe interval<select v-model.number="draft.interval">
@@ -53,6 +164,19 @@
       </fieldset>
       <hr />
       <label class="vph-check"
+        ><input type="checkbox" v-model="draft.autoExit" /> Switch the exit automatically</label
+      >
+      <p class="vph-muted">
+        Wayline moves the best healthy tunnel to the top priority. It looks only at monitored
+        tunnels that are eligible. A tunnel must be at least 20% and 10 ms better. Wayline waits 5
+        minutes between switches. If the top tunnel is not healthy, it switches after 1 minute. You
+        can still choose an exit yourself.
+      </p>
+      <p v-if="draft.autoExit" class="vph-warning" role="note">
+        Warning: this changes the native VPN priority by itself. Existing connections do not move.
+      </p>
+      <hr />
+      <label class="vph-check"
         ><input type="checkbox" v-model="draft.diagnostics" /> Internet diagnostics
         <span class="vph-muted">Optional</span></label
       >
@@ -61,15 +185,25 @@
       </p>
       <div v-if="draft.diagnostics">
         <div class="vph-target" v-for="(_, i) in draft.targets" :key="i">
-          <label :for="'vph-target-' + i">Target {{ i + 1 }}</label
-          ><input
-            :id="'vph-target-' + i"
-            v-model.trim="draft.targets[i]"
-            required
-            inputmode="decimal"
-          /><button
+          <label :for="'vph-target-' + i">Target {{ i + 1 }}</label>
+          <div>
+            <input
+              :id="'vph-target-' + i"
+              v-model.trim="draft.targets[i]"
+              required
+              maxlength="253"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="IP address or host name"
+            /><small v-if="resolvedText(draft.targets[i])">{{
+              resolvedText(draft.targets[i])
+            }}</small>
+          </div>
+          <button
             type="button"
             class="vph-link"
+            :aria-label="'Remove target ' + (i + 1)"
             :disabled="draft.targets.length === 1"
             @click="draft.targets.splice(i, 1)"
           >
@@ -84,6 +218,7 @@
         >
           Add target
         </button>
+        <small v-if="draft.targets.length === 4">You can add up to 4 targets.</small>
         <label class="vph-check"
           ><input type="checkbox" v-model="draft.directWan" /> Include direct WAN
           measurements</label
@@ -93,6 +228,23 @@
           shows Unavailable.</small
         >
       </div>
+      <label class="vph-check" :class="{ 'vph-off': !endpointAllowed }"
+        ><input
+          type="checkbox"
+          v-model="draft.endpointDiagnostics"
+          :disabled="!endpointAllowed"
+          aria-describedby="vph-endpoint-help"
+        />
+        Measure VPN endpoints</label
+      >
+      <small id="vph-endpoint-help"
+        >Measure the public address of each monitored WireGuard server over WAN. This shows the
+        route to the server. It does not show latency through the tunnel.<span
+          v-if="!endpointAllowed"
+        >
+          Turn on Internet diagnostics and direct WAN first.</span
+        ></small
+      >
       <hr />
       <div class="vph-fields">
         <label
@@ -109,9 +261,9 @@
           ><button type="button" class="vph-link" :disabled="busy" @click="checkUpdates">
             Check updates
           </button>
-          <p v-if="state.update" class="vph-muted">{{ state.update.message }}</p>
+          <p v-if="updateText" class="vph-muted">{{ updateText }}</p>
           <button
-            v-if="state.update && state.update.available"
+            v-if="updateAvailable"
             type="button"
             class="vph-button"
             :disabled="busy"
@@ -122,7 +274,7 @@
         </div>
       </div>
       <footer>
-        <button type="button" class="vph-button" @click="settingsOpen = false">Cancel</button
+        <button type="button" class="vph-button" @click="closeSettings">Cancel</button
         ><button class="vph-button vph-primary" :disabled="busy">
           {{ busy ? 'Saving…' : 'Save settings' }}
         </button>
@@ -130,8 +282,17 @@
     </form>
 
     <nav class="vph-tabs" aria-label="Wayline views">
-      <button :class="{ active: tab === 'tunnels' }" @click="tab = 'tunnels'">Exit tunnels</button
-      ><button :class="{ active: tab === 'diagnostics' }" @click="tab = 'diagnostics'">
+      <button
+        :class="{ active: tab === 'tunnels' }"
+        :aria-pressed="tab === 'tunnels' ? 'true' : 'false'"
+        @click="tab = 'tunnels'"
+      >
+        Exit tunnels</button
+      ><button
+        :class="{ active: tab === 'diagnostics' }"
+        :aria-pressed="tab === 'diagnostics' ? 'true' : 'false'"
+        @click="tab = 'diagnostics'"
+      >
         Internet diagnostics
       </button>
     </nav>
@@ -140,18 +301,40 @@
         <span
           >Exit preference for <strong>{{ state.scope || 'Scope unavailable' }}</strong></span
         ><span class="vph-muted"
-          >Target {{ state.config.target }} · every {{ state.config.interval }}s</span
+          >Target {{ state.config.target }}
+          <span v-if="resolvedText(state.config.target)"
+            >({{ resolvedText(state.config.target) }})</span
+          >
+          · every {{ state.config.interval }}s</span
         >
       </div>
-      <div class="vph-panel vph-table-wrap">
+      <p v-if="!can.select && selectReason" class="vph-muted vph-hint">{{ selectReason }}</p>
+      <div v-if="state.auto && state.auto.enabled" class="vph-panel vph-info">
+        <strong>Automatic exit switching is on.</strong>
+        <span v-if="state.auto.last">
+          Last switch
+          <time :title="new Date(state.auto.last.at).toLocaleString()">{{
+            ago(state.auto.last.at)
+          }}</time
+          >: {{ tunnelName(state.auto.last.from) }} → {{ tunnelName(state.auto.last.to) }}.
+          {{ state.auto.last.reason }}</span
+        >
+        <span v-else class="vph-muted"> No switch yet.</span>
+      </div>
+      <div
+        class="vph-panel vph-table-wrap"
+        tabindex="0"
+        role="region"
+        aria-label="Exit tunnels table"
+      >
         <table>
           <thead>
             <tr>
-              <th>Tunnel</th>
-              <th>Latency</th>
-              <th>Loss</th>
-              <th class="vph-spark-column">Recent latency</th>
-              <th></th>
+              <th scope="col">Tunnel</th>
+              <th scope="col">Latency</th>
+              <th scope="col">Loss</th>
+              <th scope="col" class="vph-spark-column">Recent latency</th>
+              <th scope="col"><span class="vph-sr">Actions</span></th>
             </tr>
           </thead>
           <tbody>
@@ -163,6 +346,8 @@
               <td>
                 <button
                   class="vph-name"
+                  :aria-pressed="selectedTunnel === t.id ? 'true' : 'false'"
+                  :aria-label="'Show history for ' + t.name"
                   @click="
                     selectedTunnel = t.id;
                     loadHistory();
@@ -189,32 +374,50 @@
                 </svg>
               </td>
               <td class="vph-action">
-                <span v-if="t.preferred" class="vph-muted">Highest priority</span
-                ><button
-                  v-else
-                  class="vph-button"
-                  :disabled="busy || !t.eligible || !state.capabilities.select"
-                  :title="t.reason || ''"
-                  @click="selectExit(t)"
+                <div v-if="pendingStop === t.id" class="vph-actions">
+                  <button
+                    ref="confirm"
+                    class="vph-button vph-danger"
+                    :disabled="busy"
+                    :aria-label="'Confirm stop ' + t.name"
+                    @click="setTunnelEnabled(t)"
+                  >
+                    Stop tunnel
+                  </button>
+                  <button class="vph-button" @click="pendingStop = ''">Keep running</button>
+                </div>
+                <div v-else class="vph-actions">
+                  <span v-if="t.preferred" class="vph-muted">Highest priority</span
+                  ><button
+                    v-else
+                    class="vph-button"
+                    :disabled="busy || !t.eligible || !can.select"
+                    :aria-label="'Use ' + t.name + ' as exit'"
+                    @click="selectExit(t)"
+                  >
+                    {{ busyTunnel === t.id && busyAction === 'select' ? 'Applying…' : 'Use exit' }}
+                  </button>
+                  <button
+                    class="vph-button"
+                    :disabled="busy || !t.controllable || !can.control"
+                    :aria-label="(t.enabled ? 'Stop ' : 'Start ') + t.name"
+                    @click="askToggle(t)"
+                  >
+                    {{ toggleLabel(t) }}
+                  </button>
+                </div>
+                <small v-if="pendingStop === t.id"
+                  >Stop {{ t.name }}? Traffic can use WAN under your GL.iNet policy.</small
                 >
-                  {{ busyTunnel === t.id ? 'Applying…' : 'Use exit' }}
-                </button>
-                <button
-                  class="vph-button"
-                  :disabled="busy || !t.controllable || !state.capabilities.control"
-                  :aria-label="(t.enabled ? 'Stop ' : 'Start ') + t.name"
-                  @click="setTunnelEnabled(t)"
-                >
-                  {{ t.enabled ? 'Stop' : 'Start' }}
-                </button>
-                <small v-if="!t.eligible && t.connected">{{ t.reason }}</small>
+                <small v-if="exitHint(t)">{{ exitHint(t) }}</small>
                 <small v-if="!t.controllable">Native tunnel control is unavailable.</small>
+                <small v-else-if="!can.control">{{ controlReason }}</small>
               </td>
             </tr>
           </tbody>
         </table>
-        <div v-if="!state.tunnels.length" class="vph-empty">
-          {{ loading ? 'Reading tunnel state…' : 'No configured VPN tunnels available.' }}
+        <div v-if="!state.tunnels.length" class="vph-empty" role="status">
+          {{ emptyText }}
         </div>
       </div>
       <p class="vph-muted">
@@ -230,17 +433,23 @@
       <section v-if="!state.config.diagnostics" class="vph-panel vph-empty">
         <h2>Internet diagnostics</h2>
         <p>See how destinations perform through each tunnel and directly through WAN.</p>
-        <button class="vph-button" :disabled="!state.capabilities.configure" @click="openSettings">
+        <button class="vph-button" :disabled="!can.configure" @click="openSettings">
           Enable in settings
         </button>
       </section>
-      <div v-else class="vph-panel vph-table-wrap">
+      <div
+        v-else
+        class="vph-panel vph-table-wrap"
+        tabindex="0"
+        role="region"
+        aria-label="Internet diagnostics table"
+      >
         <table>
           <thead>
             <tr>
-              <th>Destination</th>
-              <th v-if="state.config.directWan">Direct WAN</th>
-              <th v-for="t in state.tunnels" :key="t.id">{{ t.name }}</th>
+              <th scope="col">Destination</th>
+              <th scope="col" v-if="state.config.directWan">Direct WAN</th>
+              <th scope="col" v-for="t in state.tunnels" :key="t.id">{{ t.name }}</th>
             </tr>
           </thead>
           <tbody>
@@ -252,6 +461,8 @@
               <td>
                 <button
                   class="vph-name"
+                  :aria-pressed="selectedTarget === target ? 'true' : 'false'"
+                  :aria-label="'Show history for ' + target"
                   @click="
                     selectedTarget = target;
                     loadHistory();
@@ -259,6 +470,9 @@
                 >
                   {{ target }}
                 </button>
+                <div v-if="resolvedText(target)" class="vph-muted vph-status">
+                  {{ resolvedText(target) }}
+                </div>
               </td>
               <td v-if="state.config.directWan" class="vph-number">
                 {{ diagnostic(target, 'wan') }}
@@ -267,22 +481,44 @@
                 {{ diagnostic(target, t.id) }}
               </td>
             </tr>
+            <tr
+              v-for="e in endpoints"
+              :key="'endpoint-' + e.tunnel + e.address"
+              class="vph-endpoint"
+            >
+              <td>
+                Endpoint of {{ e.name }}
+                <div class="vph-muted vph-status">{{ e.address }}</div>
+              </td>
+              <td class="vph-number">{{ diagnostic(e.address, 'wan') }}</td>
+              <td v-for="t in state.tunnels" :key="t.id" class="vph-number vph-muted">
+                <span aria-hidden="true">—</span><span class="vph-sr">Not measured</span>
+              </td>
+            </tr>
           </tbody>
         </table>
       </div>
+      <p v-if="state.config.endpointDiagnostics" class="vph-muted">
+        {{
+          endpoints.length
+            ? 'Endpoint rows show the route to the VPN server over WAN. They do not show latency through the tunnel.'
+            : 'No VPN endpoints found yet. Endpoint rows show the route to the server, not latency through the tunnel.'
+        }}
+      </p>
     </template>
 
     <section v-if="tab === 'tunnels' || state.config.diagnostics" class="vph-panel vph-history">
       <header class="vph-chart-heading">
         <div>
           <h2>{{ selectedName }} <span class="vph-muted">latency</span></h2>
+          <p v-if="storedHistory" class="vph-stored">Stored history (tunnel stopped)</p>
           <p class="vph-muted">
             {{ graphTarget }} ·
             {{ range === 1440 ? '5-minute aggregates' : '1-minute aggregates' }} · gaps indicate
             missing measurements
           </p>
         </div>
-        <div class="vph-ranges" aria-label="History range">
+        <div class="vph-ranges" role="group" aria-label="History range">
           <button
             v-for="r in ranges"
             :key="r.minutes"
@@ -302,9 +538,18 @@
         <svg
           :viewBox="'0 0 ' + chartWidth + ' 236'"
           role="img"
-          :aria-label="'Latency history for ' + selectedName + ' to ' + graphTarget"
+          tabindex="0"
+          :aria-label="
+            'Latency history for ' +
+            selectedName +
+            ' to ' +
+            graphTarget +
+            '. Use the arrow keys to read values.'
+          "
           @mousemove="hoverAt"
           @click="hoverAt"
+          @keydown="keyHover"
+          @blur="hover = null"
         >
           <title>Latency in milliseconds over time</title>
           <desc>
@@ -343,8 +588,10 @@
           </text>
           <line v-if="hover" :x1="hover.x" :x2="hover.x" y1="24" y2="200" class="vph-guide" />
         </svg>
+        <div v-if="chartNote" class="vph-chart-note" role="status">{{ chartNote }}</div>
         <div
           v-if="hover"
+          role="status"
           class="vph-tooltip"
           :style="{ left: Math.min(Math.max(hover.x, 0), chartWidth - 190) + 'px' }"
         >
@@ -369,6 +616,7 @@
       <label class="vph-scroll"
         >Scroll through the last 24 hours<input
           type="range"
+          :aria-valuetext="clock(windowStart) + ' to ' + clock(windowStart + range * 60000)"
           :min="0"
           :max="1440 - range"
           :step="5"
@@ -381,10 +629,7 @@
       /></label>
     </section>
     <footer class="vph-footnote">
-      {{ preview ? 'Design preview' : 'Wayline' }} · {{ state.version || '0.1.0'
-      }}<span v-if="!state.capabilities.select && state.capabilities.reason">
-        · {{ state.capabilities.reason }}</span
-      >
+      {{ preview ? 'Design preview' : 'Wayline' }} · {{ state.version || '0.1.0' }}
     </footer>
   </main>
 </template>
@@ -400,18 +645,14 @@ const defaults = () => ({
   directWan: false,
   historyHours: 24,
   autoUpdates: false,
+  autoExit: false,
+  endpointDiagnostics: false,
 });
-const validIp = (value) => {
-  const a = value.split('.');
-  return (
-    a.length === 4 &&
-    a.every((v) => /^\d{1,3}$/.test(v) && Number(v) <= 255) &&
-    Number(a[0]) > 0 &&
-    Number(a[0]) < 224 &&
-    Number(a[0]) !== 127 &&
-    value !== '255.255.255.255'
-  );
-};
+const validTarget = (value) =>
+  typeof value === 'string' &&
+  value.length > 0 &&
+  value.length <= 253 &&
+  /^[A-Za-z0-9.-]+$/.test(value);
 export default {
   name: 'WaylineDashboard',
   props: { api: Object, preview: Boolean },
@@ -421,9 +662,19 @@ export default {
         config: defaults(),
         tunnels: [],
         capabilities: { configure: false, select: false, control: false },
+        compat: { level: 'full', firmware: '', message: '' },
         scope: '',
         revision: '',
+        auto: { enabled: false, last: null },
+        endpoints: [],
+        resolved: {},
       },
+      loaded: false,
+      ready: false,
+      updateInfo: null,
+      pendingStop: '',
+      busyAction: '',
+      noticeTimer: null,
       draft: defaults(),
       tab: 'tunnels',
       selectedTunnel: '',
@@ -445,6 +696,7 @@ export default {
       timer: null,
       stopped: false,
       historyRequest: 0,
+      historyLoaded: false,
       ranges: [
         { label: '15m', minutes: 15 },
         { label: '1h', minutes: 60 },
@@ -454,9 +706,101 @@ export default {
     };
   },
   computed: {
+    compat() {
+      const c = this.state.compat || {};
+      const level = ['monitoring', 'unsupported'].includes(c.level) ? c.level : 'full';
+      return {
+        level,
+        verified: c.verified !== false,
+        firmware: c.firmware || '',
+        message: c.message || '',
+        features: Array.isArray(c.features) ? c.features.filter((f) => f && f.name) : [],
+      };
+    },
+    showCompat() {
+      return this.level !== 'full' || !this.compat.verified;
+    },
+    updateAvailable() {
+      return !!(
+        (this.updateInfo && this.updateInfo.available) ||
+        (this.state.update || {}).available
+      );
+    },
+    updateText() {
+      return (
+        (this.updateInfo && this.updateInfo.message) || (this.state.update || {}).message || ''
+      );
+    },
+    level() {
+      return this.compat.level;
+    },
+    can() {
+      const c = this.state.capabilities || {};
+      const full = this.level === 'full';
+      return {
+        configure: !!c.configure && this.level !== 'unsupported',
+        select: !!c.select && full,
+        control: !!c.control && full,
+      };
+    },
+    configureReason() {
+      if (this.level === 'unsupported')
+        return 'This firmware is not supported. Settings are unavailable.';
+      return 'Settings are unavailable. You do not have permission to change them.';
+    },
+    selectReason() {
+      if (this.level === 'monitoring')
+        return "This firmware's VPN module is not verified. Monitoring still works.";
+      if (this.level === 'unsupported')
+        return 'This firmware is not supported. Use exit is unavailable.';
+      return (this.state.capabilities || {}).reason || '';
+    },
+    controlReason() {
+      if (this.level === 'monitoring')
+        return "This firmware's VPN module is not verified. Monitoring still works.";
+      if (this.level === 'unsupported')
+        return 'This firmware is not supported. Start and Stop are unavailable.';
+      return 'Start and Stop are unavailable.';
+    },
+    statusLine() {
+      if (!this.ready)
+        return this.readError ? 'The tunnel state is not available.' : 'Reading tunnel state…';
+      if (this.readError) return 'Showing the last known state. Trying again.';
+      return 'Tunnel state is up to date.';
+    },
     selectedName() {
       const t = this.state.tunnels.find((t) => t.id === this.selectedTunnel);
       return t ? t.name : 'Tunnel';
+    },
+    endpoints() {
+      return this.state.config.endpointDiagnostics && Array.isArray(this.state.endpoints)
+        ? this.state.endpoints
+        : [];
+    },
+    endpointAllowed() {
+      return this.draft.diagnostics && this.draft.directWan;
+    },
+    selectedTunnelState() {
+      return this.state.tunnels.find((t) => t.id === this.selectedTunnel);
+    },
+    storedHistory() {
+      const t = this.selectedTunnelState;
+      return !!t && !t.connected && !!t.historyAvailable;
+    },
+    emptyText() {
+      if (!this.ready && !this.readError) return 'Reading tunnel state…';
+      if (this.readError) return 'Tunnel state could not be read.';
+      return 'No configured VPN tunnels available.';
+    },
+    chartNote() {
+      if (this.historyError) return this.historyError;
+      if (!this.selectedTunnel) return 'Choose a tunnel to see its history.';
+      if (
+        !this.history.length ||
+        this.history.every((s) => s.points.every((p) => p.median === null))
+      )
+        return this.historyLoaded ? 'No measurements in this range.' : 'Loading history…';
+      return '';
     },
     graphTarget() {
       return this.tab === 'diagnostics' ? this.selectedTarget : this.state.config.target;
@@ -478,6 +822,14 @@ export default {
     tab() {
       this.loadHistory();
     },
+    error(value) {
+      if (value) this.$nextTick(() => this.reveal());
+    },
+    notice(value) {
+      clearTimeout(this.noticeTimer);
+      if (value && !value.endsWith('…'))
+        this.noticeTimer = setTimeout(() => (this.notice = ''), 10000);
+    },
   },
   mounted() {
     this.refresh();
@@ -495,17 +847,26 @@ export default {
   beforeDestroy() {
     this.stopped = true;
     clearTimeout(this.timer);
+    clearTimeout(this.noticeTimer);
     document.removeEventListener('visibilitychange', this.visibility);
     if (this.resize) this.resize.disconnect();
   },
   methods: {
     call(method, params) {
-      const request = this.api
-        ? this.api[method](params || {})
-        : this.$rpcRequest('call', ['sid', 'wayline', method, params || {}], {
-            timeout: method === 'set_tunnel_enabled' ? 45000 : 12000,
-          });
       return new Promise((resolve, reject) => {
+        let request;
+        try {
+          if (this.api) request = this.api[method](params || {});
+          else if (typeof this.$rpcRequest !== 'function')
+            throw Error('The router page API is missing. Reload the page or update the firmware.');
+          else
+            request = this.$rpcRequest('call', ['sid', 'wayline', method, params || {}], {
+              timeout: method === 'set_tunnel_enabled' ? 45000 : 12000,
+            });
+        } catch (e) {
+          reject(e);
+          return;
+        }
         const timer = setTimeout(
           () => reject(Error('The request timed out. Refresh its status before another change.')),
           method === 'set_tunnel_enabled' ? 45000 : 12000,
@@ -529,12 +890,25 @@ export default {
       try {
         const next = await this.call('get_state');
         if (this.stopped) return;
+        if (!next || typeof next !== 'object') throw Error('The router sent an empty state.');
         next.tunnels = Array.isArray(next.tunnels) ? next.tunnels : [];
+        next.config = next.config || {};
         next.config.tunnels = Array.isArray(next.config.tunnels) ? next.config.tunnels : [];
+        next.capabilities = Object.assign(
+          { configure: false, select: false, control: false },
+          next.capabilities,
+        );
         next.tunnels.forEach((tunnel) => {
           tunnel.recent = Array.isArray(tunnel.recent) ? tunnel.recent : [];
         });
+        next.config = Object.assign(defaults(), next.config);
+        next.auto = next.auto || { enabled: false, last: null };
+        next.endpoints = Array.isArray(next.endpoints) ? next.endpoints : [];
+        next.resolved = next.resolved || {};
         this.state = next;
+        this.ready = true;
+        if (!next.config.targets.includes(this.selectedTarget))
+          this.selectedTarget = next.config.targets[0] || next.config.target;
         if (this.offset === 0) this.anchor = Math.floor(Date.now() / 60000) * 60000;
         if (!next.tunnels.some((t) => t.id === this.selectedTunnel))
           this.selectedTunnel =
@@ -542,29 +916,87 @@ export default {
         this.readError = '';
         await this.loadHistory();
       } catch (e) {
-        this.readError = 'Wayline is unavailable. ' + (e.message || 'Try again shortly.');
+        this.readError = 'Wayline is unavailable. ' + this.describe(e, 'Try again shortly.');
       } finally {
         this.loading = false;
+        this.loaded = true;
         if (!this.stopped && !document.hidden) this.timer = setTimeout(this.refresh, 5000);
       }
+    },
+    describe(e, fallback) {
+      if (typeof e === 'string' && e) return e;
+      return (e && e.message) || fallback;
+    },
+    retry() {
+      clearTimeout(this.timer);
+      this.refresh();
     },
     visibility() {
       clearTimeout(this.timer);
       if (!document.hidden) this.refresh();
     },
+    reveal() {
+      const el = this.$refs.alert;
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+    },
     openSettings() {
-      this.draft = JSON.parse(JSON.stringify(this.state.config));
+      if (!this.can.configure) return;
+      this.draft = Object.assign(defaults(), JSON.parse(JSON.stringify(this.state.config)));
       this.settingsOpen = !this.settingsOpen;
+      if (this.settingsOpen)
+        this.$nextTick(() => this.$refs.firstField && this.$refs.firstField.focus());
+    },
+    closeSettings() {
+      this.settingsOpen = false;
+      this.$nextTick(() => this.$refs.settingsButton && this.$refs.settingsButton.focus());
+    },
+    resolvedText(target) {
+      const map = this.state.resolved || {};
+      if (!target || !Object.prototype.hasOwnProperty.call(map, target)) return '';
+      return map[target] ? '→ ' + map[target] : 'cannot resolve';
+    },
+    tunnelName(id) {
+      const t = this.state.tunnels.find((t) => t.id === id || t.monitorId === id || t.name === id);
+      return t ? t.name : id;
+    },
+    ago(at) {
+      const s = Math.max(0, Math.round((Date.now() - at) / 1000));
+      if (s < 60) return 'just now';
+      if (s < 3600) return Math.round(s / 60) + ' min ago';
+      if (s < 86400) return Math.round(s / 3600) + ' h ago';
+      return Math.round(s / 86400) + ' d ago';
+    },
+    exitHint(t) {
+      if (t.preferred || !this.can.select) return '';
+      if (!t.enabled) return 'Start this tunnel to use it as an exit.';
+      if (!t.eligible) return t.reason || 'This tunnel is not ready.';
+      return '';
+    },
+    toggleLabel(t) {
+      if (this.busyTunnel === t.id && this.busyAction === 'toggle')
+        return t.enabled ? 'Stopping…' : 'Starting…';
+      return t.enabled ? 'Stop' : 'Start';
+    },
+    askToggle(t) {
+      if (!t.enabled) return this.setTunnelEnabled(t);
+      this.pendingStop = t.id;
+      this.$nextTick(() => {
+        const c = [].concat(this.$refs.confirm || [])[0];
+        if (c) c.focus();
+      });
     },
     async saveSettings() {
       if (this.busy) return;
       this.error = '';
       const targets = [this.draft.target].concat(this.draft.diagnostics ? this.draft.targets : []);
       if (
-        targets.some((t) => !validIp(t)) ||
-        new Set(this.draft.targets).size !== this.draft.targets.length
+        targets.some((t) => !validTarget(t)) ||
+        (this.draft.diagnostics &&
+          new Set(this.draft.targets.map((t) => t.toLowerCase())).size !==
+            this.draft.targets.length)
       ) {
-        this.error = 'Use unique unicast IPv4 addresses for the targets.';
+        this.error =
+          'Use an IPv4 address or a host name for each target. Each diagnostics target must be unique.';
         return;
       }
       if (this.draft.enabled && !this.draft.tunnels.length) {
@@ -574,10 +1006,12 @@ export default {
       this.busy = true;
       try {
         await this.call('set_config', {
-          config: this.draft,
+          config: Object.assign({}, this.draft, {
+            endpointDiagnostics: this.draft.endpointDiagnostics && this.endpointAllowed,
+          }),
           expected_revision: this.state.revision,
         });
-        this.settingsOpen = false;
+        this.closeSettings();
         this.notice = 'Settings saved.';
         await this.refresh();
       } catch (e) {
@@ -587,31 +1021,38 @@ export default {
       }
     },
     async selectExit(t) {
-      if (this.busy || t.preferred || !t.eligible || !this.state.capabilities.select) return;
+      if (this.busy || t.preferred || !t.eligible || !this.can.select) return;
       this.busy = true;
       this.busyTunnel = t.id;
+      this.busyAction = 'select';
       this.error = '';
+      this.notice = 'Applying exit preference…';
       try {
         await this.call('select_tunnel', {
           section_id: t.id,
           expected_revision: this.state.revision,
         });
-        this.notice = 'Exit preference updated.';
+        this.notice = t.name + ' now has the highest priority. Existing connections do not move.';
         await this.refresh();
       } catch (e) {
+        this.notice = '';
         this.error =
           'Selection outcome needs checking. ' + (e.message || 'Refresh before trying again.');
         await this.refresh();
       } finally {
         this.busy = false;
         this.busyTunnel = '';
+        this.busyAction = '';
       }
     },
     async setTunnelEnabled(t) {
-      if (this.busy || !t.controllable || !this.state.capabilities.control) return;
+      if (this.busy || !t.controllable || !this.can.control) return;
       this.busy = true;
+      this.busyTunnel = t.id;
+      this.busyAction = 'toggle';
+      this.pendingStop = '';
       this.error = '';
-      this.notice = t.enabled ? 'Stopping tunnel…' : 'Starting tunnel…';
+      this.notice = (t.enabled ? 'Stopping ' : 'Starting ') + t.name + '…';
       try {
         const result = await this.call('set_tunnel_enabled', {
           section_id: t.id,
@@ -619,35 +1060,42 @@ export default {
           expected_revision: this.state.revision,
         });
         this.notice = result.enabled
-          ? 'Tunnel enabled. Connection and measurements can take time.'
-          : 'Tunnel stopped. GL.iNet traffic policy applies.';
+          ? t.name + ' is enabled. Connection and measurements can take time.'
+          : t.name + ' is stopped. GL.iNet traffic policy applies.';
         if (result.monitor_pending) this.notice += ' Monitoring will reconcile within one minute.';
       } catch (e) {
+        this.notice = '';
         this.error =
           'Tunnel outcome needs checking. ' + (e.message || 'Refresh before trying again.');
       } finally {
         await this.refresh();
         this.busy = false;
+        this.busyTunnel = '';
+        this.busyAction = '';
       }
     },
     async installUpdate() {
       this.busy = true;
+      this.error = '';
       try {
         const r = await this.call('install_update');
+        this.updateInfo = r;
         this.notice = r.message;
       } catch (e) {
-        this.error = e.message || 'Update unavailable.';
+        this.error = this.describe(e, 'Update unavailable.');
       } finally {
         this.busy = false;
       }
     },
     async checkUpdates() {
       this.busy = true;
+      this.error = '';
       try {
         const r = await this.call('check_update');
+        this.updateInfo = r;
         this.notice = r.message;
       } catch (e) {
-        this.error = e.message || 'Update check unavailable.';
+        this.error = this.describe(e, 'Update check unavailable.');
       } finally {
         this.busy = false;
       }
@@ -655,9 +1103,10 @@ export default {
     async loadHistory() {
       const request = ++this.historyRequest;
       const selected = this.state.tunnels.find((tunnel) => tunnel.id === this.selectedTunnel);
-      if (selected && !selected.connected) {
+      if (selected && !selected.connected && !selected.historyAvailable) {
         this.history = [];
-        this.historyError = 'History is unavailable until this tunnel has a connected path.';
+        this.historyError = 'No history is stored for this tunnel. Start it to collect history.';
+        this.historyLoaded = true;
         this.hover = null;
         return;
       }
@@ -678,6 +1127,7 @@ export default {
             series.points = Array.isArray(series.points) ? series.points : [];
           });
           this.historyError = '';
+          this.historyLoaded = true;
           this.hover = null;
           this.$nextTick(() => {
             if (this.$refs.chart && this.resize) this.resize.observe(this.$refs.chart);
@@ -772,12 +1222,27 @@ export default {
       });
       return d;
     },
+    keyHover(e) {
+      if (e.key === 'Escape') {
+        this.hover = null;
+        return;
+      }
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      e.preventDefault();
+      const dir = e.key === 'ArrowRight' ? 1 : -1;
+      const from = this.hover
+        ? this.hover.x
+        : dir > 0
+          ? 45 - (this.chartWidth - 63) / 30
+          : this.chartWidth - 18 + (this.chartWidth - 63) / 30;
+      this.hoverX(from + (dir * (this.chartWidth - 63)) / 30);
+    },
     hoverAt(e) {
       const rect = e.currentTarget.getBoundingClientRect();
-      const x = Math.max(
-        45,
-        Math.min(this.chartWidth - 18, ((e.clientX - rect.left) * this.chartWidth) / rect.width),
-      );
+      this.hoverX(((e.clientX - rect.left) * this.chartWidth) / rect.width);
+    },
+    hoverX(raw) {
+      const x = Math.max(45, Math.min(this.chartWidth - 18, raw));
       const at = this.windowStart + ((x - 45) / (this.chartWidth - 63)) * this.range * 60000;
       this.hover = {
         x,
@@ -802,6 +1267,11 @@ export default {
   --vph-muted: var(--label-color, #667984);
   --vph-border: var(--table-border, #e3e9ed);
   --vph-brand: var(--primary-color, #159b9b);
+  --vph-brand-text: color-mix(in srgb, var(--vph-brand) 65%, var(--vph-text));
+  --vph-brand-strong: color-mix(in srgb, var(--vph-brand) 72%, #000);
+  --vph-danger: #c62d3f;
+  --vph-danger-text: color-mix(in srgb, var(--vph-danger) 70%, var(--vph-text));
+  --vph-warn-text: color-mix(in srgb, #b7791f 55%, var(--vph-text));
   color: var(--vph-text);
   font:
     14px/1.5 -apple-system,
@@ -841,7 +1311,23 @@ export default {
 }
 .vph button:disabled {
   cursor: default;
-  opacity: 0.45;
+  opacity: 0.55;
+}
+.vph-off {
+  opacity: 0.6;
+}
+.vph-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+.vph svg:focus-visible,
+.vph-table-wrap:focus-visible {
+  outline: 2px solid var(--vph-brand);
+  outline-offset: 2px;
 }
 .vph button:focus-visible,
 .vph input:focus-visible,
@@ -873,8 +1359,8 @@ export default {
   letter-spacing: 0.08em;
 }
 .vph-preview {
-  background: #fff4d3;
-  color: #73551a;
+  background: color-mix(in srgb, #e0a800 20%, var(--vph-card));
+  color: var(--vph-warn-text);
   text-align: center;
   padding: 8px;
   border-radius: 5px;
@@ -888,16 +1374,20 @@ export default {
   white-space: nowrap;
 }
 .vph-primary {
-  background: var(--vph-brand);
-  border-color: var(--vph-brand);
+  background: var(--vph-brand-strong);
+  border-color: var(--vph-brand-strong);
   color: #fff;
+}
+.vph-danger {
+  border-color: var(--vph-danger);
+  color: var(--vph-danger-text);
 }
 .vph-link,
 .vph-name {
   border: 0;
   background: none;
   padding: 0;
-  color: var(--vph-brand);
+  color: var(--vph-brand-text);
   text-align: left;
 }
 .vph-name {
@@ -928,13 +1418,33 @@ export default {
 }
 .vph-tabs button.active {
   border-color: var(--vph-brand);
-  color: var(--vph-brand);
+  color: var(--vph-brand-text);
 }
 .vph-scope {
   margin: 18px 0 12px;
 }
 .vph-table-wrap {
   overflow-x: auto;
+  min-height: 120px;
+}
+.vph-hint {
+  margin: 8px 0;
+  font-size: 12px;
+}
+.vph-info {
+  padding: 12px 18px;
+}
+.vph-warning {
+  color: var(--vph-warn-text);
+  font-size: 13px;
+}
+.vph-stored {
+  color: var(--vph-brand-text);
+  font-size: 12px;
+  margin: 2px 0 0;
+}
+.vph-endpoint td {
+  background: color-mix(in srgb, var(--vph-muted) 5%, var(--vph-card));
 }
 .vph table {
   width: 100%;
@@ -957,20 +1467,25 @@ export default {
   border-bottom: 0;
 }
 .vph tr.selected {
-  background: color-mix(in srgb, var(--vph-brand) 3%, var(--vph-card));
+  background: color-mix(in srgb, var(--vph-brand) 5%, var(--vph-card));
+}
+.vph tr.selected td:first-child {
+  box-shadow: inset 3px 0 var(--vph-brand);
 }
 .vph-number {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
-.vph-number small {
+.vph .vph-number small {
+  display: inline;
+  margin: 0;
   font-size: 12px;
 }
 .vph-badge {
   display: inline-block;
   border-radius: 4px;
   font-size: 11px;
-  color: var(--vph-brand);
+  color: var(--vph-brand-text);
   background: color-mix(in srgb, var(--vph-brand) 9%, var(--vph-card));
   padding: 2px 7px;
   margin-left: 9px;
@@ -983,9 +1498,12 @@ export default {
   text-align: right;
   min-width: 195px;
 }
-.vph-action > button + button,
-.vph-action > span + button {
-  margin-left: 8px;
+.vph-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
 }
 .vph-action small {
   display: block;
@@ -1025,7 +1543,16 @@ export default {
 }
 .vph-ranges button.active {
   background: color-mix(in srgb, var(--vph-brand) 10%, var(--vph-card));
-  color: var(--vph-brand);
+  color: var(--vph-brand-text);
+}
+.vph-chart-note {
+  position: absolute;
+  left: 45px;
+  right: 18px;
+  top: 100px;
+  text-align: center;
+  color: var(--vph-muted);
+  pointer-events: none;
 }
 .vph-chart {
   position: relative;
@@ -1170,12 +1697,16 @@ export default {
   display: grid;
   grid-template-columns: 70px 1fr 70px;
   gap: 15px;
-  align-items: center;
+  align-items: start;
   max-width: 500px;
   margin: 9px 0;
 }
 .vph-target input {
   margin-top: 0 !important;
+}
+.vph-target > label,
+.vph-target > button {
+  padding-top: 9px;
 }
 .vph-settings footer {
   display: flex;
@@ -1192,27 +1723,99 @@ export default {
   margin: 10px auto 22px;
   color: var(--vph-muted);
 }
-.vph-error {
+.vph-error,
+.vph-notice {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
   padding: 12px;
-  color: #9f2836;
-  background: #fff0f1;
   border-radius: 4px;
   margin: 12px 0;
 }
+.vph-error {
+  color: var(--vph-danger-text);
+  background: color-mix(in srgb, var(--vph-danger) 10%, var(--vph-card));
+  border: 1px solid color-mix(in srgb, var(--vph-danger) 35%, var(--vph-card));
+}
 .vph-notice {
-  padding: 12px;
-  color: var(--vph-brand);
+  color: var(--vph-brand-text);
   background: color-mix(in srgb, var(--vph-brand) 8%, var(--vph-card));
-  border-radius: 4px;
-  margin: 12px 0;
+}
+.vph-error .vph-link,
+.vph-notice .vph-link {
+  padding: 0;
+  white-space: nowrap;
+  color: inherit;
+  text-decoration: underline;
 }
 .vph-footnote {
   font-size: 12px;
   color: var(--vph-muted);
   padding: 12px 0 25px;
 }
+.vph-statusline {
+  margin: 0 0 8px !important;
+  font-size: 13px;
+  color: var(--vph-muted);
+}
+.vph-compat {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 12px;
+  border-radius: 5px;
+  margin-bottom: 12px;
+}
+.vph-compat-monitoring {
+  color: var(--vph-warn-text);
+  background: color-mix(in srgb, #e0a800 18%, var(--vph-card));
+  border: 1px solid color-mix(in srgb, #e0a800 45%, var(--vph-card));
+}
+.vph-compat-unsupported {
+  color: var(--vph-danger-text);
+  background: color-mix(in srgb, var(--vph-danger) 10%, var(--vph-card));
+  border: 1px solid color-mix(in srgb, var(--vph-danger) 35%, var(--vph-card));
+}
+.vph-compat {
+  padding: 14px 18px;
+}
+.vph-compat p {
+  margin: 4px 0 10px;
+}
+.vph-compat-note {
+  color: var(--vph-text);
+  background: color-mix(in srgb, var(--vph-brand) 6%, var(--vph-card));
+}
+.vph-features {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+  padding: 0;
+  margin: 8px 0 12px;
+}
+.vph-updates {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 10px 0 4px;
+}
+.vph-fail {
+  padding: 20px;
+  border-color: color-mix(in srgb, var(--vph-danger) 45%, var(--vph-card));
+}
+.vph-fail h2 {
+  color: var(--vph-danger-text);
+}
+.vph-fail-text {
+  overflow-wrap: anywhere;
+}
 .vph-button:hover:enabled {
   border-color: var(--vph-brand);
+}
+.vph-button {
+  min-height: 36px;
 }
 @media (max-width: 700px) {
   .vph-heading {
@@ -1223,6 +1826,23 @@ export default {
   }
   .vph-spark-column {
     display: none;
+  }
+  .vph-action {
+    min-width: 0;
+  }
+  .vph-button,
+  .vph-tabs button,
+  .vph-ranges button {
+    min-height: 44px;
+  }
+  .vph-link {
+    min-height: 44px;
+  }
+  .vph-action small {
+    max-width: none;
+  }
+  .vph-info {
+    padding: 12px;
   }
   .vph td,
   .vph th {

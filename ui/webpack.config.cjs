@@ -1,7 +1,7 @@
 const path = require('path');
 const { VueLoaderPlugin } = require('vue-loader');
 module.exports = {
-  entry: './src/index.vue',
+  entry: './src/boundary.js',
   output: {
     path: path.resolve(__dirname, 'dist'),
     filename: 'gl-sdk4-ui-wayline.common.js',

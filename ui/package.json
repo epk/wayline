@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "build": "webpack --mode production",
-    "check": "eslint src/index.vue preview/demo.js webpack.config.cjs && prettier --check src preview webpack.config.cjs package.json",
+    "check": "eslint src/index.vue src/boundary.js preview/demo.js webpack.config.cjs && prettier --check src preview webpack.config.cjs package.json",
     "format": "prettier --write src preview webpack.config.cjs package.json"
   },
   "devDependencies": {

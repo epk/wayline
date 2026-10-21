@@ -8,10 +8,8 @@ mod probe;
 mod readiness;
 mod route;
 
-use config::{Config, MAX_SERIES};
 use futures_util::future::select_all;
 use probe::Probe;
-use serde::Serialize;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -23,9 +21,9 @@ use std::{
     time::{Duration, Instant},
 };
 use std::{future::Future, pin::Pin};
+use wayline_protocol::{Config, MAX_SERIES, MAX_STATUS, Series, Status};
 
 const MAX_CLIENTS: usize = 4;
-const MAX_STATUS: usize = 384 * 1024;
 const MAX_INFLIGHT: usize = 8;
 
 struct Endpoint {
@@ -106,39 +104,6 @@ struct Client {
     deadline: Instant,
 }
 
-#[derive(Serialize)]
-struct Status<'a> {
-    schema: u8,
-    run_id: String,
-    mode: &'static str,
-    target: std::net::Ipv4Addr,
-    uptime_ms: u64,
-    interval_ms: u64,
-    window: usize,
-    latency_window: usize,
-    selection_enabled: bool,
-    tunnels: Vec<TunnelStatus<'a>>,
-}
-#[derive(Serialize)]
-struct TunnelStatus<'a> {
-    id: &'a str,
-    name: &'a str,
-    interface: &'a str,
-    path_id: &'a str,
-    target: std::net::Ipv4Addr,
-    history: Vec<probe::Sample>,
-    state: &'static str,
-    interface_index: u32,
-    median_us: Option<u32>,
-    samples: usize,
-    lost: usize,
-    sent: u64,
-    received: u64,
-    success_age_ms: Option<u64>,
-    completed_age_ms: Option<u64>,
-    history_us: Vec<Option<u32>>,
-}
-
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -154,31 +119,26 @@ fn snapshot(
         .tunnels
         .iter()
         .zip(probes)
-        .map(|(t, p)| TunnelStatus {
-            id: &t.id,
-            name: &t.name,
-            interface: &t.interface,
+        .map(|(t, p)| Series {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            interface: t.interface.clone(),
             path_id: if t.path_id.is_empty() {
-                &t.id
+                t.id.clone()
             } else {
-                &t.path_id
+                t.path_id.clone()
             },
             target: t.target.unwrap_or(config.target),
-            history: p.timed_history(),
             state: p.state,
-            interface_index: p.generation,
             median_us: p.median_us(),
-            samples: p.sample_count(),
-            lost: p.lost(),
             sent: p.sent,
             received: p.received,
             success_age_ms: p.last_success.map(|at| millis(now.duration_since(at))),
-            completed_age_ms: p.last_completed.map(|at| millis(now.duration_since(at))),
-            history_us: p.history(),
+            history: p.history(),
         })
         .collect();
     let mut data = serde_json::to_vec(&Status {
-        schema: 2,
+        schema: 3,
         run_id: nonce
             .iter()
             .fold(String::with_capacity(32), |mut out, byte| {
@@ -186,13 +146,9 @@ fn snapshot(
                 let _ = write!(out, "{byte:02x}");
                 out
             }),
-        mode: "ipv4_icmp",
         target: config.target,
         uptime_ms: millis(now.duration_since(started)),
         interval_ms: config.interval_ms,
-        window: 64,
-        latency_window: probe::LATENCY_WINDOW,
-        selection_enabled: false,
         tunnels,
     })?;
     data.push(b'\n');
@@ -475,7 +431,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = socket_path.ok_or("--socket is required")?;
     match command.as_str() {
         "monitor" => {
-            let config = Config::read(&config_path.ok_or("--config is required")?)?;
+            let config = config::read(&config_path.ok_or("--config is required")?)?;
             monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
                 .with_entries(32)
                 .enable_timer()

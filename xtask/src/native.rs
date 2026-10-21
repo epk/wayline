@@ -10,7 +10,7 @@ use std::{
 };
 
 const ROOT: &str = "artifacts/local/firmware-root";
-const CONTRACT: &str = "9c8a9102c046ff12ba95e4c9a03b4e5392c461584c5d4d8ab9c5591ab6ec9237";
+use wayline_support::FIRMWARE_CONTRACT as CONTRACT;
 const NATIVE_PATH: &str = "PATH=/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub fn prepare(source: &Path) -> Result<()> {

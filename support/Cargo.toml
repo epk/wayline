@@ -1,19 +1,19 @@
 [package]
 name = "wayline-support"
 version = "0.1.0"
-edition = "2024"
-publish = false
-
-[dependencies]
-anyhow = "1"
-sha2 = "0.10"
-serde_json = "=1.0.154"
-tempfile = "3"
-wait-timeout = "0.2"
-
-[lints]
-workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [lib]
 test = false
 doctest = false
+
+[dependencies]
+anyhow.workspace = true
+sha2 = "0.10"
+tempfile.workspace = true
+wait-timeout = "0.2"
+
+[lints]
+workspace = true

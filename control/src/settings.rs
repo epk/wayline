@@ -1,14 +1,13 @@
+use crate::runtime::SETTINGS;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    net::Ipv4Addr,
-    os::unix::fs::{MetadataExt, PermissionsExt},
-    path::Path,
-};
+use std::{fmt, net::Ipv4Addr, path::Path, str::FromStr};
 
-pub const RUNTIME: &str = "/var/run/wayline";
-pub const SETTINGS: &str = "/etc/wayline/settings.json";
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Target {
+    Address(Ipv4Addr),
+    Host(String),
+}
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -18,15 +17,19 @@ pub const SETTINGS: &str = "/etc/wayline/settings.json";
 )]
 pub struct Settings {
     pub enabled: bool,
-    pub target: Ipv4Addr,
+    pub target: Target,
     pub interval: u32,
     #[serde(deserialize_with = "tunnel_list")]
     pub tunnels: Vec<String>,
     pub diagnostics: bool,
-    pub targets: Vec<Ipv4Addr>,
+    pub targets: Vec<Target>,
     pub direct_wan: bool,
     pub history_hours: u32,
     pub auto_updates: bool,
+    #[serde(default)]
+    pub auto_exit: bool,
+    #[serde(default)]
+    pub endpoint_diagnostics: bool,
 }
 
 fn tunnel_list<'de, D: serde::Deserializer<'de>>(
@@ -43,18 +46,20 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
-            target: Ipv4Addr::new(1, 1, 1, 1),
+            target: Target::Address(Ipv4Addr::new(1, 1, 1, 1)),
             interval: 15,
             tunnels: Vec::new(),
             diagnostics: false,
             targets: vec![
-                Ipv4Addr::new(1, 1, 1, 1),
-                Ipv4Addr::new(8, 8, 8, 8),
-                Ipv4Addr::new(9, 9, 9, 9),
+                Target::Address(Ipv4Addr::new(1, 1, 1, 1)),
+                Target::Address(Ipv4Addr::new(8, 8, 8, 8)),
+                Target::Address(Ipv4Addr::new(9, 9, 9, 9)),
             ],
             direct_wan: false,
             history_hours: 24,
             auto_updates: false,
+            auto_exit: false,
+            endpoint_diagnostics: false,
         }
     }
 }
@@ -72,17 +77,62 @@ pub const fn ip(value: Ipv4Addr) -> bool {
     first > 0 && first < 224 && !value.is_loopback()
 }
 
-pub fn directory(path: &Path) -> Result<()> {
-    if !path.exists() {
-        fs::create_dir(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+impl FromStr for Target {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+        if let Ok(address) = value.parse::<Ipv4Addr>() {
+            ensure!(ip(address), "Use a unicast IPv4 address.");
+            return Ok(Self::Address(address));
+        }
+        let label = |label: &str| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        };
+        ensure!(
+            value.len() <= 253
+                && value.split('.').all(label)
+                && value
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|last| last.bytes().any(|byte| byte.is_ascii_alphabetic())),
+            "Use an IPv4 address or a host name."
+        );
+        Ok(Self::Host(value))
     }
-    let metadata = fs::symlink_metadata(path)?;
-    ensure!(
-        metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o777 == 0o700,
-        "Private directory is not secure."
-    );
-    Ok(())
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Address(address) => address.fmt(formatter),
+            Self::Host(host) => formatter.write_str(host),
+        }
+    }
+}
+
+impl Serialize for Target {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Target {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl Settings {
@@ -98,10 +148,7 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            ip(self.target) && [15, 30, 60].contains(&self.interval),
-            "Invalid target or interval."
-        );
+        ensure!([15, 30, 60].contains(&self.interval), "Invalid interval.");
         ensure!(
             [0, 24].contains(&self.history_hours),
             "Invalid history retention."
@@ -111,8 +158,8 @@ impl Settings {
             "Choose one to eight tunnels."
         );
         ensure!(
-            (1..=4).contains(&self.targets.len()) && self.targets.iter().all(|value| ip(*value)),
-            "Use one to four unicast IPv4 targets."
+            (1..=4).contains(&self.targets.len()),
+            "Use one to four targets."
         );
         ensure!(
             self.tunnels.iter().all(|value| id(value)
@@ -131,6 +178,40 @@ impl Settings {
         for (index, value) in self.targets.iter().enumerate() {
             ensure!(!self.targets[..index].contains(value), "Duplicate target.");
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Settings, Target};
+    use anyhow::Result;
+
+    #[test]
+    fn targets() -> Result<()> {
+        assert!(matches!("1.1.1.1".parse::<Target>()?, Target::Address(_)));
+        assert_eq!("Example.COM.".parse::<Target>()?.to_string(), "example.com");
+        for bad in [
+            "",
+            "999.1.1.1",
+            "127.0.0.1",
+            "a b",
+            "-a.com",
+            "a..com",
+            "1.2.3",
+            "::1",
+        ] {
+            assert!(bad.parse::<Target>().is_err(), "{bad}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_settings_load() -> Result<()> {
+        let old = r#"{"enabled":false,"target":"1.1.1.1","interval":15,"tunnels":{},"diagnostics":false,"targets":["8.8.8.8"],"directWan":false,"historyHours":24,"autoUpdates":false}"#;
+        let settings: Settings = serde_json::from_str(old)?;
+        settings.validate()?;
+        assert!(!settings.auto_exit && !settings.endpoint_diagnostics);
         Ok(())
     }
 }

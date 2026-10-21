@@ -6,6 +6,18 @@ use std::{
     net::Ipv4Addr,
 };
 
+const SIZE: usize = 60;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETROUTE: u16 = 26;
+const RTA_DST: u16 = 1;
+const RTA_SRC: u16 = 2;
+const RTA_OIF: u16 = 4;
+const RTA_MARK: u16 = 16;
+const RTA_IP_PROTO: u16 = 27;
+const AF_INET: u8 = 2;
+const IPPROTO_ICMP: u8 = 1;
+const RTN_UNICAST: u8 = 1;
+
 pub struct RouteLookup {
     pub socket: RegisteredSocket,
 }
@@ -31,23 +43,23 @@ impl RouteLookup {
         mark: u32,
         sequence: u32,
     ) -> io::Result<()> {
-        let mut data = [0_u8; 60];
+        let mut data = [0_u8; SIZE];
         let mut header = NetlinkBuffer::new(&mut data[..]);
-        header.set_length(60);
-        header.set_message_type(26);
+        header.set_length(u32::try_from(SIZE).map_err(io::Error::other)?);
+        header.set_message_type(RTM_GETROUTE);
         header.set_flags(NLM_F_REQUEST);
         header.set_sequence_number(sequence);
-        data[16] = 2;
+        data[16] = AF_INET;
         data[17] = 32;
         data[18] = 32;
-        attribute(&mut data[28..36], 1, &target.octets())?;
-        attribute(&mut data[36..44], 2, &source.octets())?;
-        attribute(&mut data[44..52], 16, &mark.to_ne_bytes())?;
-
-        attribute(&mut data[52..60], 27, &[1])?;
-        match self.socket.send(&data)? {
-            60 => Ok(()),
-            _ => Err(io::Error::other("incomplete route query")),
+        attribute(&mut data[28..36], RTA_DST, &target.octets())?;
+        attribute(&mut data[36..44], RTA_SRC, &source.octets())?;
+        attribute(&mut data[44..52], RTA_MARK, &mark.to_ne_bytes())?;
+        attribute(&mut data[52..60], RTA_IP_PROTO, &[IPPROTO_ICMP])?;
+        if self.socket.send(&data)? == SIZE {
+            Ok(())
+        } else {
+            Err(io::Error::other("incomplete route query"))
         }
     }
 
@@ -78,7 +90,11 @@ fn decode(data: &[u8]) -> Option<Reply> {
     };
     let body = message.payload();
 
-    if message.message_type() != 24 || body.len() < 12 || body[0] != 2 || body[7] != 1 {
+    if message.message_type() != RTM_NEWROUTE
+        || body.len() < 12
+        || body[0] != AF_INET
+        || body[7] != RTN_UNICAST
+    {
         return Some(reply);
     }
     for attr in NlasIterator::new(&body[12..]) {
@@ -88,7 +104,7 @@ fn decode(data: &[u8]) -> Option<Reply> {
                 interface: None,
             });
         };
-        if attr.kind() == 4 {
+        if attr.kind() == RTA_OIF {
             if reply.interface.is_some() || attr.nested_flag() || attr.network_byte_order_flag() {
                 return Some(Reply {
                     sequence,

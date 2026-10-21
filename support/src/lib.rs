@@ -16,6 +16,9 @@ use std::{
 use tempfile::NamedTempFile;
 use wait_timeout::ChildExt;
 
+pub const FIRMWARE_CONTRACT: &str =
+    "9c8a9102c046ff12ba95e4c9a03b4e5392c461584c5d4d8ab9c5591ab6ec9237";
+
 #[must_use]
 pub fn digest(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
@@ -42,6 +45,8 @@ pub fn atomic(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+const MAX_INPUT: usize = 2 * 1024 * 1024;
+
 pub fn output(program: &str, args: &[&str], limit: usize, seconds: u64) -> Result<Vec<u8>> {
     let (success, bytes) = output_status(program, args, limit, seconds)?;
     ensure!(success, "{program} failed.");
@@ -54,28 +59,7 @@ pub fn output_status(
     limit: usize,
     seconds: u64,
 ) -> Result<(bool, Vec<u8>)> {
-    let mut data = NamedTempFile::new()?;
-    let mut child = Command::new(program)
-        .args(args)
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(data.reopen()?))
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("Cannot start {program}."))?;
-    let status = child.wait_timeout(Duration::from_secs(seconds))?;
-    if status.is_none() {
-        child.kill()?;
-        child.wait()?;
-    }
-    ensure!(status.is_some(), "{program} exceeded its time limit.");
-    ensure!(
-        data.as_file().metadata()?.len() <= u64::try_from(limit)?,
-        "Helper output exceeds its size limit."
-    );
-    let mut bytes = Vec::new();
-    data.read_to_end(&mut bytes)?;
-    Ok((status.is_some_and(|value| value.success()), bytes))
+    run(program, args, None, limit, seconds)
 }
 
 pub fn text(program: &str, args: &[&str], limit: usize, seconds: u64) -> Result<String> {
@@ -90,36 +74,50 @@ pub fn input(
     limit: usize,
     seconds: u64,
 ) -> Result<Vec<u8>> {
-    use std::io::{Seek, SeekFrom};
     ensure!(
-        input.len() <= 2 * 1024 * 1024,
+        input.len() <= MAX_INPUT,
         "Helper input exceeds its size limit."
     );
-    let mut source = NamedTempFile::new()?;
-    source.write_all(input)?;
-    source.seek(SeekFrom::Start(0))?;
-    let mut destination = NamedTempFile::new()?;
+    let (success, bytes) = run(program, args, Some(input), limit, seconds)?;
+    ensure!(success, "{program} failed.");
+    Ok(bytes)
+}
+
+fn run(
+    program: &str,
+    args: &[&str],
+    input: Option<&[u8]>,
+    limit: usize,
+    seconds: u64,
+) -> Result<(bool, Vec<u8>)> {
+    let stdin = match input {
+        Some(bytes) => {
+            let mut source = NamedTempFile::new()?;
+            source.write_all(bytes)?;
+            Stdio::from(source.reopen()?)
+        }
+        None => Stdio::null(),
+    };
+    let mut data = NamedTempFile::new()?;
     let mut child = Command::new(program)
         .args(args)
         .env("LC_ALL", "C")
-        .stdin(Stdio::from(source.reopen()?))
-        .stdout(Stdio::from(destination.reopen()?))
+        .stdin(stdin)
+        .stdout(Stdio::from(data.reopen()?))
         .stderr(Stdio::null())
-        .spawn()?;
+        .spawn()
+        .with_context(|| format!("Cannot start {program}."))?;
     let status = child.wait_timeout(Duration::from_secs(seconds))?;
-    if status.is_none() {
+    let Some(status) = status else {
         child.kill()?;
         child.wait()?;
-    }
+        anyhow::bail!("{program} exceeded its time limit.");
+    };
     ensure!(
-        status.is_some_and(|value| value.success()),
-        "{program} failed or exceeded its time limit."
-    );
-    ensure!(
-        destination.as_file().metadata()?.len() <= u64::try_from(limit)?,
+        data.as_file().metadata()?.len() <= u64::try_from(limit)?,
         "Helper output exceeds its size limit."
     );
     let mut bytes = Vec::new();
-    destination.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    data.read_to_end(&mut bytes)?;
+    Ok((status.success(), bytes))
 }

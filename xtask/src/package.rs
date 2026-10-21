@@ -242,7 +242,7 @@ pub fn release(version: &str) -> Result<()> {
     let name = format!("wayline_{version}_aarch64_cortex-a53.ipk");
     let bytes = fs::read(Path::new("dist").join(&name))?;
     let manifest = json!({"schema":1,"repository":"epk/wayline","package":"wayline","version":version,
-        "firmware_contracts":["9c8a9102c046ff12ba95e4c9a03b4e5392c461584c5d4d8ab9c5591ab6ec9237"],
+        "firmware_contracts":[wayline_support::FIRMWARE_CONTRACT],
         "artifacts":[{"name":name,"architecture":"aarch64_cortex-a53","bytes":bytes.len(),"sha256":digest(&bytes)}]});
     fs::write("dist/manifest.json", serde_json::to_vec_pretty(&manifest)?)?;
     let mut key = tempfile::NamedTempFile::new()?;

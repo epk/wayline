@@ -1,26 +1,74 @@
-use crate::settings::{self, Settings};
+use crate::{
+    native::{self, List, MAX_TUNNELS},
+    resolve::Resolved,
+    runtime::SETTINGS,
+    settings::{self, Settings, Target},
+};
 use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
-use std::{collections::BTreeMap, fs, path::Path};
-use wayline_support::{digest, read, text};
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::Ipv4Addr,
+    path::Path,
+};
+use wayline_protocol::{Config, MAX_SERIES, Tunnel};
+use wayline_support::{digest, read};
 
-const CONTRACT: &str = "9c8a9102c046ff12ba95e4c9a03b4e5392c461584c5d4d8ab9c5591ab6ec9237";
+const IGNORED: [&str; 7] = [
+    ".name",
+    ".anonymous",
+    "peer_id",
+    "group_id",
+    "client_id",
+    "profiles",
+    "options_in_used",
+];
+
+#[derive(Deserialize)]
+pub struct Rule {
+    #[serde(rename = ".index")]
+    index: Option<u64>,
+    enabled: Option<String>,
+    via: Option<String>,
+    via_type: Option<String>,
+    tunnel_id: Option<String>,
+    name: Option<String>,
+    #[serde(flatten)]
+    rest: BTreeMap<String, Value>,
+}
+
+#[derive(Default, Deserialize)]
+struct Section {
+    proto: Option<String>,
+    disabled: Option<String>,
+    config: Option<String>,
+    mark: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct Status {
+    #[serde(default)]
+    up: bool,
+    l3_device: Option<String>,
+    #[serde(rename = "ipv4-address", default)]
+    addresses: Vec<Address>,
+}
+
+#[derive(Deserialize)]
+struct Address {
+    address: Ipv4Addr,
+}
 
 pub struct PathInfo {
     pub id: String,
     pub key: String,
     pub name: String,
     pub interface: String,
-    pub source: String,
+    pub source: Ipv4Addr,
     pub mark: u32,
     pub identity: String,
-}
-
-pub struct Inventory {
-    pub tunnels: Vec<TunnelInfo>,
-    pub paths: Vec<PathInfo>,
-    pub wan: Option<PathInfo>,
-    pub rules: Vec<(String, Value)>,
+    pub endpoint: Option<Target>,
 }
 
 pub struct TunnelInfo {
@@ -30,47 +78,84 @@ pub struct TunnelInfo {
     pub enabled: bool,
 }
 
-pub fn contract() -> bool {
-    read(Path::new("/usr/lib/oui-httpd/rpc/vpn-client"), 131_072)
-        .is_ok_and(|data| digest(&data) == CONTRACT)
-        && fs::read_to_string("/etc/glversion").is_ok_and(|value| value.trim() == "4.9.0")
+pub struct Inventory {
+    pub tunnels: Vec<TunnelInfo>,
+    pub paths: Vec<PathInfo>,
+    pub wan: Option<PathInfo>,
+    pub rules: Vec<(String, Rule)>,
 }
 
-pub fn bus(object: &str, method: &str, params: &Value) -> Result<Value> {
-    let encoded = serde_json::to_string(params)?;
-    Ok(serde_json::from_str(&text(
-        "ubus",
-        &["-t", "3", "call", object, method, &encoded],
-        262_144,
-        4,
-    )?)?)
+impl Rule {
+    fn signature(&self) -> Option<BTreeMap<&str, &Value>> {
+        let fields: BTreeMap<_, _> = self
+            .rest
+            .iter()
+            .filter(|(key, _)| !IGNORED.contains(&key.as_str()))
+            .map(|(key, value)| (key.as_str(), value))
+            .collect();
+        fields
+            .values()
+            .all(|value| {
+                value.is_string()
+                    || value.as_array().is_some_and(|items| {
+                        items.len() <= 64 && items.iter().all(Value::is_string)
+                    })
+            })
+            .then_some(fields)
+    }
 }
 
-pub fn native(method: &str, params: &Value) -> Result<Value> {
-    let params = json!({"module":"vpn-client","func":method,"params":params}).to_string();
-    let (timeout, deadline) = if method == "set_tunnel" {
-        ("30", 35)
-    } else {
-        ("3", 4)
+impl PathInfo {
+    pub fn series(&self, target: &Target) -> String {
+        series_id(self.prefix(), target)
+    }
+
+    pub fn prefix(&self) -> &str {
+        &self.identity[..48]
+    }
+}
+
+pub fn series_id(prefix: &str, target: &Target) -> String {
+    let label = match target {
+        Target::Address(address) => address.to_string().replace('.', "_"),
+        Target::Host(host) => digest(host.as_bytes())[..14].to_owned(),
     };
-    let response: Value = serde_json::from_str(&text(
-        "ubus",
-        &["-t", timeout, "call", "gl-session", "call", &params],
-        262_144,
-        deadline,
-    )?)?;
-    response
-        .get("result")
-        .cloned()
-        .context("Unknown native RPC response.")
+    format!("{prefix}_{label}")
 }
 
-fn config(name: &str) -> Result<Value> {
-    let response = bus("uci", "get", &json!({"config":name}))?;
-    response
-        .get("values")
-        .cloned()
-        .context("Unknown native configuration schema.")
+pub struct Endpoint {
+    pub tunnel: String,
+    pub name: String,
+    pub target: Target,
+}
+
+impl Inventory {
+    fn rule(&self, id: &str) -> Result<&Rule> {
+        self.rules
+            .iter()
+            .find(|(name, _)| name == id)
+            .map(|(_, rule)| rule)
+            .context("The tunnel rule is unavailable.")
+    }
+
+    pub fn has_path(&self, id: &str) -> bool {
+        self.paths.iter().any(|path| path.id == id)
+    }
+}
+
+fn uci(name: &str) -> Result<Map<String, Value>> {
+    let mut response: Map<String, Value> = native::bus("uci", "get", &json!({"config":name}))?;
+    match response.remove("values") {
+        Some(Value::Object(values)) => Ok(values),
+        _ => anyhow::bail!("Unknown native configuration schema."),
+    }
+}
+
+fn section(network: &Map<String, Value>, name: &str) -> Section {
+    network
+        .get(name)
+        .and_then(|value| Section::deserialize(value).ok())
+        .unwrap_or_default()
 }
 
 fn number(value: &str) -> Option<u32> {
@@ -81,66 +166,78 @@ fn number(value: &str) -> Option<u32> {
 }
 
 fn path(
-    section: &str,
+    section_id: &str,
     key: &str,
     name: &str,
-    interface: &Value,
-    network: &Value,
+    network: &Map<String, Value>,
     wan: bool,
 ) -> Option<PathInfo> {
-    let status = bus(&format!("network.interface.{name}"), "status", &json!({})).ok()?;
-    if status["up"] != true {
-        return None;
-    }
-    let device = status["l3_device"].as_str()?;
-    let source = status["ipv4-address"][0]["address"].as_str()?;
-    if device.len() > 15 || !settings::id(device) || !settings::ip(source.parse().ok()?) {
+    let status: Status =
+        native::bus(&format!("network.interface.{name}"), "status", &json!({})).ok()?;
+    let device = status
+        .l3_device
+        .filter(|device| device.len() <= 15 && settings::id(device))?;
+    let source = status.addresses.first()?.address;
+    if !status.up || !settings::ip(source) {
         return None;
     }
     let mark = if wan {
         0
     } else {
-        let raw = network[format!("rt_{name}")]["mark"].as_str()?;
+        let raw = section(network, &format!("rt_{name}")).mark?;
         let (mark_text, scope) = raw.split_once('/')?;
         if number(scope) != Some(0xf000) {
             return None;
         }
         number(mark_text)?
     };
-    let profile = interface["config"].as_str().unwrap_or_default();
+    let profile = section(network, name).config.unwrap_or_default();
+    let endpoint = if wan {
+        None
+    } else {
+        let kind = format!("wireguard_{name}");
+        network
+            .values()
+            .filter(|value| value[".type"] == kind.as_str())
+            .find_map(|value| value["endpoint_host"].as_str()?.parse().ok())
+    };
     let identity = digest(format!("{key}|{name}|{device}|{source}|{mark}|{profile}").as_bytes());
     Some(PathInfo {
-        id: section.into(),
+        id: section_id.into(),
         key: key.into(),
-        name: section.into(),
-        interface: device.into(),
-        source: source.into(),
+        name: section_id.into(),
+        interface: device,
+        source,
         mark,
         identity,
+        endpoint,
     })
 }
 
 pub fn inventory() -> Result<Inventory> {
-    let network = config("network")?;
-    let policy = config("route_policy")?;
-    let mut rules: Vec<_> = policy
-        .as_object()
-        .context("Unknown policy schema.")?
-        .iter()
+    let network = uci("network")?;
+    let mut rules = uci("route_policy")?
+        .into_iter()
         .filter(|(_, value)| value[".type"] == "rule")
-        .map(|(id, value)| (id.clone(), value.clone()))
-        .collect();
-    rules.sort_by_key(|(_, value)| value[".index"].as_u64().unwrap_or(u64::MAX));
+        .map(|(id, value)| Ok((id, Rule::deserialize(value)?)))
+        .collect::<Result<Vec<_>>>()?;
+    rules.sort_by_key(|(_, rule)| rule.index.unwrap_or(u64::MAX));
     let mut paths = Vec::new();
-    let mut tunnels = Vec::new();
+    let mut tunnels: Vec<TunnelInfo> = Vec::new();
     for (id, rule) in &rules {
-        if !settings::id(id) || ![Some("0"), Some("1")].contains(&rule["enabled"].as_str()) {
+        let enabled = match rule.enabled.as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => continue,
+        };
+        if !settings::id(id) {
             continue;
         }
-        let name = rule["via"].as_str().unwrap_or_default();
-        let interface = &network[name];
-        let Some(number) = rule["tunnel_id"]
-            .as_str()
+        let name = rule.via.as_deref().unwrap_or_default();
+        let interface = section(&network, name);
+        let Some(number) = rule
+            .tunnel_id
+            .as_deref()
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
         else {
@@ -148,16 +245,17 @@ pub fn inventory() -> Result<Inventory> {
         };
         let key = format!("vpn:{number}");
         ensure!(
-            !tunnels.iter().any(|tunnel: &TunnelInfo| tunnel.key == key),
+            !tunnels.iter().any(|tunnel| tunnel.key == key),
             "Duplicate native tunnel number."
         );
-        if ![Some("wireguard"), Some("openvpn")].contains(&rule["via_type"].as_str())
-            && ![Some("wgclient"), Some("ovpnclient")].contains(&interface["proto"].as_str())
+        if !matches!(rule.via_type.as_deref(), Some("wireguard" | "openvpn"))
+            && !matches!(interface.proto.as_deref(), Some("wgclient" | "ovpnclient"))
         {
             continue;
         }
-        let label = rule["name"]
-            .as_str()
+        let label = rule
+            .name
+            .as_deref()
             .filter(|text| {
                 !text.is_empty() && text.len() <= 80 && !text.chars().any(char::is_control)
             })
@@ -166,21 +264,21 @@ pub fn inventory() -> Result<Inventory> {
             id: id.clone(),
             key: key.clone(),
             name: label.into(),
-            enabled: rule["enabled"] == "1",
+            enabled,
         });
-        if rule["enabled"] != "1" || interface["disabled"] == "1" {
+        if !enabled || interface.disabled.as_deref() == Some("1") {
             continue;
         }
-        if let Some(mut item) = path(id, &key, name, interface, &network, false) {
+        if let Some(mut item) = path(id, &key, name, &network, false) {
             item.name = label.into();
             paths.push(item);
         }
     }
     ensure!(
-        tunnels.len() <= 8,
+        tunnels.len() <= MAX_TUNNELS,
         "More than eight VPN tunnels are unsupported."
     );
-    let wan = path("wan", "wan", "wan", &network["wan"], &network, true);
+    let wan = path("wan", "wan", "wan", &network, true);
     Ok(Inventory {
         tunnels,
         paths,
@@ -198,113 +296,157 @@ pub fn normalize(settings: &mut Settings, inventory: &Inventory) {
 }
 
 pub fn native_tunnel<'a>(
-    native: &'a Value,
+    native: &'a List,
     inventory: &Inventory,
     selected: &str,
-) -> Result<&'a Value> {
-    let tunnels = native["tunnels"]
-        .as_array()
-        .context("Unknown native tunnel schema.")?;
+) -> Result<&'a native::Tunnel> {
     ensure!(
-        tunnels.len() <= 8,
+        native.tunnels.len() <= MAX_TUNNELS,
         "More than eight VPN tunnels are unsupported."
     );
     let mut ids = std::collections::BTreeSet::new();
     let mut numbers = std::collections::BTreeSet::new();
-    for tunnel in tunnels {
-        let id = tunnel["id"]
-            .as_str()
-            .context("Unknown native tunnel identity.")?;
-        let number = tunnel["tunnel_id"]
-            .as_u64()
-            .context("Unknown native tunnel number.")?;
+    for tunnel in &native.tunnels {
         ensure!(
-            settings::id(id)
-                && number > 0
-                && u32::try_from(number).is_ok()
-                && ids.insert(id)
-                && numbers.insert(number),
+            settings::id(&tunnel.id)
+                && tunnel.number > 0
+                && ids.insert(tunnel.id.as_str())
+                && numbers.insert(tunnel.number),
             "Ambiguous native tunnel identity."
         );
     }
-    let tunnel = tunnels
+    let tunnel = native
+        .tunnels
         .iter()
-        .find(|item| item["id"] == selected)
+        .find(|item| item.id == selected)
         .context("The tunnel is unavailable.")?;
     let configured = inventory
         .tunnels
         .iter()
         .find(|item| item.id == selected)
         .context("The VPN tunnel is unavailable.")?;
-    let rule = &inventory
-        .rules
-        .iter()
-        .find(|(id, _)| id == selected)
-        .context("The tunnel rule is unavailable.")?
-        .1;
+    let rule = inventory.rule(selected)?;
     ensure!(
-        [Some("wireguard"), Some("openvpn")].contains(&tunnel["via"]["type"].as_str())
-            && tunnel["enabled"].as_bool() == Some(configured.enabled)
-            && rule["tunnel_id"]
-                .as_str()
-                .and_then(|id| id.parse::<u64>().ok())
-                == tunnel["tunnel_id"].as_u64(),
+        matches!(tunnel.via.kind.as_str(), "wireguard" | "openvpn")
+            && tunnel.enabled == configured.enabled
+            && rule
+                .tunnel_id
+                .as_deref()
+                .and_then(|id| id.parse::<u32>().ok())
+                == Some(tunnel.number),
         "The native tunnel state differs from its configuration."
     );
     Ok(tunnel)
 }
 
-pub fn startable(tunnel: &Value) -> bool {
-    tunnel["via"]["configs"].as_array().is_some_and(|groups| {
-        groups.iter().any(|group| {
-            group["id_list"]
-                .as_array()
-                .is_some_and(|ids| !ids.is_empty())
-        })
-    })
+fn monitored<'a>(
+    settings: &'a Settings,
+    inventory: &'a Inventory,
+) -> impl Iterator<Item = &'a PathInfo> {
+    inventory
+        .paths
+        .iter()
+        .filter(|item| settings.tunnels.contains(&item.key) || settings.tunnels.contains(&item.id))
 }
 
-impl PathInfo {
-    pub fn series(&self, target: &str) -> String {
-        format!("{}_{}", &self.identity[..48], target.replace('.', "_"))
+pub fn endpoints(settings: &Settings, inventory: &Inventory) -> Vec<Endpoint> {
+    if !(settings.diagnostics && settings.direct_wan && settings.endpoint_diagnostics) {
+        return Vec::new();
     }
+    monitored(settings, inventory)
+        .filter_map(|item| {
+            Some(Endpoint {
+                tunnel: item.id.clone(),
+                name: item.name.clone(),
+                target: item.endpoint.clone()?,
+            })
+        })
+        .collect()
 }
 
-pub fn monitor(settings: &Settings, inventory: &Inventory) -> Value {
-    let mut targets = vec![settings.target];
+pub fn hosts(settings: &Settings, inventory: &Inventory) -> Vec<String> {
+    let mut hosts = BTreeSet::new();
+    for target in std::iter::once(&settings.target)
+        .chain(&settings.targets)
+        .chain(
+            endpoints(settings, inventory)
+                .iter()
+                .map(|endpoint| &endpoint.target),
+        )
+    {
+        if let Target::Host(host) = target {
+            hosts.insert(host.clone());
+        }
+    }
+    hosts.into_iter().collect()
+}
+
+pub fn monitor(settings: &Settings, inventory: &Inventory, resolved: &Resolved) -> Config {
+    let mut targets = vec![settings.target.clone()];
     if settings.diagnostics {
         for target in &settings.targets {
             if !targets.contains(target) {
-                targets.push(*target);
+                targets.push(target.clone());
             }
         }
     }
-    let mut series = Vec::new();
-    for item in &inventory.paths {
-        if settings.tunnels.contains(&item.key) || settings.tunnels.contains(&item.id) {
-            for target in &targets {
-                series.push(measurement(item, &target.to_string()));
-            }
-        }
+    let mut wanted = Vec::new();
+    for item in monitored(settings, inventory) {
+        wanted.extend(targets.iter().map(|target| (item, target.clone())));
     }
     if settings.diagnostics
         && settings.direct_wan
         && let Some(wan) = &inventory.wan
     {
-        for target in &settings.targets {
-            series.push(measurement(wan, &target.to_string()));
-        }
+        let extra = endpoints(settings, inventory)
+            .into_iter()
+            .map(|endpoint| endpoint.target);
+        wanted.extend(
+            settings
+                .targets
+                .iter()
+                .cloned()
+                .chain(extra)
+                .map(|target| (wan, target)),
+        );
     }
-    json!({"target":settings.target,"interval_ms":settings.interval*1000,"timeout_ms":2000,"tunnels":series})
+    let mut seen = BTreeSet::new();
+    let tunnels: Vec<_> = wanted
+        .into_iter()
+        .filter_map(|(path, target)| {
+            let address = resolved.address(&target)?;
+            seen.insert((path.interface.clone(), address))
+                .then(|| measurement(path, &target, address))
+        })
+        .take(MAX_SERIES)
+        .collect();
+    let target = resolved
+        .address(&settings.target)
+        .or_else(|| tunnels.first().and_then(|tunnel| tunnel.target))
+        .unwrap_or(Ipv4Addr::new(1, 1, 1, 1));
+    Config {
+        target,
+        interval_ms: u64::from(settings.interval) * 1000,
+        timeout_ms: 2000,
+        tunnels,
+    }
 }
 
-fn measurement(path: &PathInfo, target: &str) -> Value {
-    json!({"id":path.series(target),"path_id":path.id,"name":path.name,"interface":path.interface,"source":path.source,"mark":path.mark,"target":target})
+fn measurement(path: &PathInfo, target: &Target, address: Ipv4Addr) -> Tunnel {
+    Tunnel {
+        id: path.series(target),
+        name: path.name.clone(),
+        interface: path.interface.clone(),
+        source: path.source,
+        mark: path.mark,
+        target: Some(address),
+        path_id: path.id.clone(),
+    }
 }
 
 pub fn revision() -> Result<String> {
     let data = [
-        read(Path::new(settings::SETTINGS), 32_768).unwrap_or_default(),
+        read(Path::new(SETTINGS), 32_768).unwrap_or_default(),
         read(Path::new("/etc/config/route_policy"), 131_072)?,
         read(Path::new("/etc/config/network"), 131_072)?,
     ]
@@ -313,77 +455,43 @@ pub fn revision() -> Result<String> {
 }
 
 pub fn safe_order(
-    native: &Value,
+    native: &List,
     inventory: &Inventory,
     selected: &str,
 ) -> Result<(Vec<String>, bool)> {
-    let tunnels = native["tunnels"]
-        .as_array()
-        .context("Unknown native tunnel schema.")?;
     ensure!(
-        !tunnels.is_empty() && tunnels.len() <= 8,
+        !native.tunnels.is_empty() && native.tunnels.len() <= MAX_TUNNELS,
         "The tunnel group is not eligible."
     );
-    let ignored = [
-        ".name",
-        ".index",
-        ".anonymous",
-        "tunnel_id",
-        "via",
-        "via_type",
-        "peer_id",
-        "group_id",
-        "client_id",
-        "profiles",
-        "name",
-        "options_in_used",
-        "enabled",
-    ];
     let mut signature = None;
-    let mut ids = Vec::new();
-    for tunnel in tunnels {
-        let id = tunnel["id"]
-            .as_str()
-            .context("Unknown native tunnel identity.")?;
+    let mut ids: Vec<String> = Vec::new();
+    for tunnel in &native.tunnels {
+        let id = tunnel.id.as_str();
         native_tunnel(native, inventory, id)?;
         ensure!(
             settings::id(id)
                 && !ids.iter().any(|other| other == id)
-                && inventory.tunnels.iter().any(|item| item.id == id
-                    && (!item.enabled || inventory.paths.iter().any(|path| path.id == id))),
+                && inventory
+                    .tunnels
+                    .iter()
+                    .any(|item| item.id == id && (!item.enabled || inventory.has_path(id))),
             "The tunnel group is not eligible."
         );
-        let rule = &inventory
-            .rules
-            .iter()
-            .find(|(name, _)| name == id)
-            .context("The tunnel rule is unavailable.")?
-            .1;
-        let fields: BTreeMap<_, _> = rule
-            .as_object()
-            .context("Unknown rule schema.")?
-            .iter()
-            .filter(|(key, _)| !ignored.contains(&key.as_str()))
-            .collect();
-        ensure!(
-            fields.values().all(|value| value.is_string()
-                || value
-                    .as_array()
-                    .is_some_and(|items| items.len() <= 64 && items.iter().all(Value::is_string))),
-            "Unsupported rule fields prevent selection."
-        );
-        if let Some(previous) = &signature {
-            ensure!(
+        let fields = inventory
+            .rule(id)?
+            .signature()
+            .context("Unsupported rule fields prevent selection.")?;
+        match &signature {
+            Some(previous) => ensure!(
                 &fields == previous,
                 "Different traffic rules prevent selection."
-            );
-        } else {
-            signature = Some(fields);
+            ),
+            None => signature = Some(fields),
         }
         ids.push(id.to_owned());
     }
     ensure!(
-        inventory.paths.iter().any(|item| item.id == selected),
+        inventory.has_path(selected),
         "The selected tunnel is not connected."
     );
     let index = ids
@@ -396,4 +504,88 @@ pub fn safe_order(
         ids.insert(0, id);
     }
     Ok((ids, changed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Inventory, PathInfo, monitor, series_id};
+    use crate::{
+        resolve::Resolved,
+        settings::{Settings, Target},
+    };
+    use anyhow::Result;
+    use std::net::Ipv4Addr;
+
+    fn path(id: &str, interface: &str, endpoint: Option<&str>) -> PathInfo {
+        PathInfo {
+            id: id.into(),
+            key: format!("vpn:{id}"),
+            name: id.into(),
+            interface: interface.into(),
+            source: Ipv4Addr::new(10, 0, 0, 2),
+            mark: 4096,
+            identity: "ab".repeat(32),
+            endpoint: endpoint.and_then(|value| value.parse().ok()),
+        }
+    }
+
+    fn inventory() -> Inventory {
+        Inventory {
+            tunnels: Vec::new(),
+            paths: vec![path("a", "wg1", Some("vpn.example.com"))],
+            wan: Some(path("wan", "eth1", None)),
+            rules: Vec::new(),
+        }
+    }
+
+    fn resolved() -> Result<Resolved> {
+        Ok(serde_json::from_str(
+            r#"{"at":0,"hosts":{"dns.example.com":["1.1.1.1"],"vpn.example.com":["203.0.113.9"]}}"#,
+        )?)
+    }
+
+    #[test]
+    fn host_series_keep_one_identity_per_name() -> Result<()> {
+        let host: Target = "dns.example.com".parse()?;
+        let address: Target = "9.9.9.9".parse()?;
+        assert_eq!(series_id("p", &address), "p_9_9_9_9");
+        assert_eq!(series_id("p", &host), series_id("p", &host));
+        assert!(series_id(&"x".repeat(48), &host).len() <= 64);
+        Ok(())
+    }
+
+    #[test]
+    fn monitor_skips_duplicates_and_unresolved_names() -> Result<()> {
+        let mut settings = Settings {
+            enabled: true,
+            diagnostics: true,
+            direct_wan: true,
+            endpoint_diagnostics: true,
+            tunnels: vec!["vpn:a".into()],
+            ..Settings::default()
+        };
+        settings.targets = vec![
+            "dns.example.com".parse()?,
+            "1.1.1.1".parse()?,
+            "missing.example.com".parse()?,
+        ];
+        let config = monitor(&settings, &inventory(), &resolved()?);
+        let on_tunnel = config
+            .tunnels
+            .iter()
+            .filter(|tunnel| tunnel.interface == "wg1")
+            .count();
+        assert_eq!(on_tunnel, 1);
+        let on_wan: Vec<_> = config
+            .tunnels
+            .iter()
+            .filter(|tunnel| tunnel.interface == "eth1")
+            .filter_map(|tunnel| tunnel.target)
+            .collect();
+        assert_eq!(
+            on_wan,
+            [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(203, 0, 113, 9)]
+        );
+        Ok(())
+    }
 }

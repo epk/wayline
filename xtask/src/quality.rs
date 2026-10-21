@@ -50,6 +50,16 @@ pub fn check() -> Result<()> {
         ],
     )?;
     run(
+        "cargo",
+        &[
+            "test",
+            "--locked",
+            "--offline",
+            "--package",
+            "wayline-control",
+        ],
+    )?;
+    run(
         "luacheck",
         &[
             "package/files/usr/lib/oui-httpd/rpc/wayline",
@@ -96,7 +106,13 @@ pub fn check() -> Result<()> {
     )?;
     run("actionlint", &[])?;
     run("pnpm", &["--dir", "ui", "check"])?;
-    for root in ["src", "control/src", "support/src", "xtask/src"] {
+    for root in [
+        "monitor/src",
+        "control/src",
+        "protocol/src",
+        "support/src",
+        "xtask/src",
+    ] {
         for path in sources(root, "rs") {
             let data = fs::read_to_string(&path)?;
             ensure!(

@@ -627,7 +627,15 @@ dependencies = [
  "serde_json",
  "tar",
  "tempfile",
+ "wayline-protocol",
  "wayline-support",
+]
+
+[[package]]
+name = "wayline-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -635,7 +643,6 @@ name = "wayline-support"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "serde_json",
  "sha2",
  "tempfile",
  "wait-timeout",
@@ -643,16 +650,16 @@ dependencies = [
 
 [[package]]
 name = "waylined"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "futures-util",
  "monoio",
  "netlink-packet-core",
  "pnet_packet",
  "rustix",
- "serde",
  "serde_json",
  "socket2 0.6.5",
+ "wayline-protocol",
 ]
 
 [[package]]

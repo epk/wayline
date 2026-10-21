@@ -1,0 +1,27 @@
+[package]
+name = "waylined"
+version = "0.1.0-alpha.3"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+autotests = false
+autobenches = false
+
+[[bin]]
+name = "waylined"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+wayline-protocol.workspace = true
+rustix = { workspace = true, features = ["process"] }
+serde_json.workspace = true
+socket2 = { version = "=0.6.5", features = ["all"] }
+netlink-packet-core = "=0.9.0"
+pnet_packet = { version = "=0.35.0", default-features = false }
+monoio = { version = "=0.2.4", default-features = false, features = ["legacy"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

@@ -1,19 +1,18 @@
 use crate::{
-    router::{Inventory, PathInfo},
-    settings::{self, RUNTIME, Settings},
+    router::{Inventory, series_id},
+    runtime::{RUNTIME, directory, milliseconds, now},
+    settings::{self, Settings, Target},
 };
 use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    fmt::Write,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, fmt::Write, fs, path::PathBuf};
+use wayline_protocol::{MAX_SERIES, Sample, Series};
+
+const MINUTE_MS: u64 = 60_000;
+const DAY_MS: u64 = 86_400_000;
 
 #[derive(Default, Clone)]
 struct Bin {
-    values: Vec<u32>,
     min: Option<u32>,
     median: Option<u32>,
     max: Option<u32>,
@@ -21,11 +20,37 @@ struct Bin {
     lost: u32,
 }
 
-pub fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+#[derive(Deserialize)]
+pub struct Query {
+    start: u64,
+    end: u64,
+    step: usize,
+    target: Target,
+    tunnel: String,
+    #[serde(default)]
+    include_wan: bool,
+}
+
+#[derive(Serialize)]
+pub struct Response {
+    series: Vec<Line>,
+}
+
+#[derive(Serialize)]
+struct Line {
+    id: String,
+    name: String,
+    points: Vec<Point>,
+}
+
+#[derive(Serialize)]
+struct Point {
+    at: u64,
+    median: Option<f64>,
+    min: Option<f64>,
+    max: Option<f64>,
+    sent: u32,
+    lost: u32,
 }
 
 fn database(config: &Settings) -> PathBuf {
@@ -36,10 +61,44 @@ fn database(config: &Settings) -> PathBuf {
     }
 }
 
+#[derive(Default, Serialize, Deserialize)]
+pub struct Known(BTreeMap<String, String>);
+
+impl Known {
+    fn path(config: &Settings) -> PathBuf {
+        database(config).with_file_name("paths.json")
+    }
+
+    pub fn read(config: &Settings) -> Self {
+        fs::read(Self::path(config))
+            .ok()
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn contains(&self, key: &str) -> bool {
+        self.0.contains_key(key)
+    }
+
+    pub fn remember(config: &Settings, inventory: &Inventory) -> Result<()> {
+        let mut known = Self::read(config);
+        let before = known.0.clone();
+        for path in &inventory.paths {
+            known.0.insert(path.key.clone(), path.prefix().to_owned());
+        }
+        if known.0 != before {
+            let path = Self::path(config);
+            directory(path.parent().context("Invalid history directory.")?)?;
+            wayline_support::atomic(&path, &serde_json::to_vec(&known)?)?;
+        }
+        Ok(())
+    }
+}
+
 fn sql(config: &Settings, statement: &str, readonly: bool) -> Result<String> {
     let path = database(config);
     if !readonly {
-        settings::directory(path.parent().context("Invalid history directory.")?)?;
+        directory(path.parent().context("Invalid history directory.")?)?;
     }
     let mode = if readonly { "-readonly" } else { "-readwrite" };
     let input = format!(
@@ -61,45 +120,40 @@ fn sql(config: &Settings, statement: &str, readonly: bool) -> Result<String> {
     )?)?)
 }
 
-fn bins(samples: &Value) -> BTreeMap<u64, Bin> {
-    let mut bins = BTreeMap::<u64, Bin>::new();
+fn bins(samples: &[Sample]) -> BTreeMap<u64, Bin> {
     let now = now() * 1000;
-    for sample in samples.as_array().into_iter().flatten().take(64) {
-        let Some(at) = sample["at_ms"]
-            .as_u64()
-            .filter(|at| *at >= now.saturating_sub(86_400_000) && *at <= now)
-        else {
-            continue;
-        };
-        let bin = bins.entry(at / 60_000).or_default();
-        bin.sent += 1;
-        if let Some(us) = sample["us"]
-            .as_u64()
-            .filter(|us| *us <= 5_000_000)
-            .and_then(|us| u32::try_from(us).ok())
-        {
-            bin.values.push(us);
-        } else {
-            bin.lost += 1;
+    let mut grouped = BTreeMap::<u64, (Vec<u32>, u32)>::new();
+    for sample in samples
+        .iter()
+        .filter(|sample| sample.at_ms >= now.saturating_sub(DAY_MS) && sample.at_ms <= now)
+    {
+        let (values, sent) = grouped.entry(sample.at_ms / MINUTE_MS).or_default();
+        *sent += 1;
+        if let Some(us) = sample.us.filter(|us| *us <= 5_000_000) {
+            values.push(us);
         }
     }
-    for bin in bins.values_mut() {
-        bin.values.sort_unstable();
-        bin.min = bin.values.first().copied();
-        bin.max = bin.values.last().copied();
-        bin.median = bin
-            .values
-            .get(bin.values.len().saturating_sub(1) / 2)
-            .copied();
-    }
-    bins
+    grouped
+        .into_iter()
+        .map(|(minute, (mut values, sent))| {
+            values.sort_unstable();
+            let bin = Bin {
+                min: values.first().copied(),
+                median: values.get(values.len().saturating_sub(1) / 2).copied(),
+                max: values.last().copied(),
+                sent,
+                lost: sent - u32::try_from(values.len()).unwrap_or(sent),
+            };
+            (minute, bin)
+        })
+        .collect()
 }
 
 fn number(value: Option<u32>) -> String {
     value.map_or_else(|| "NULL".into(), |value| value.to_string())
 }
 
-pub fn collect(config: &Settings, snapshot: &Value) -> Result<()> {
+pub fn collect(config: &Settings, snapshot: &[Series]) -> Result<()> {
     if now() < 1_704_067_200 {
         return Ok(());
     }
@@ -112,21 +166,14 @@ pub fn collect(config: &Settings, snapshot: &Value) -> Result<()> {
         "DELETE FROM bins WHERE minute < {} OR minute > {current};",
         current.saturating_sub(1439)
     )?;
-    for series in snapshot["tunnels"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .take(45)
-    {
-        let id = series["id"]
-            .as_str()
-            .filter(|id| settings::id(id))
-            .context("Invalid measurement identity.")?;
-        for (minute, bin) in bins(&series["history"]) {
+    for series in snapshot.iter().take(MAX_SERIES) {
+        ensure!(settings::id(&series.id), "Invalid measurement identity.");
+        for (minute, bin) in bins(&series.history) {
             if minute < current {
                 write!(
                     statement,
-                    "INSERT INTO bins VALUES({minute},'{id}',{},{},{},{},{}) ON CONFLICT(minute,series) DO UPDATE SET min_us=excluded.min_us,median_us=excluded.median_us,max_us=excluded.max_us,sent=excluded.sent,lost=excluded.lost WHERE excluded.sent>bins.sent;",
+                    "INSERT INTO bins VALUES({minute},'{}',{},{},{},{},{}) ON CONFLICT(minute,series) DO UPDATE SET min_us=excluded.min_us,median_us=excluded.median_us,max_us=excluded.max_us,sent=excluded.sent,lost=excluded.lost WHERE excluded.sent>bins.sent;",
+                    series.id,
                     number(bin.min),
                     number(bin.median),
                     number(bin.max),
@@ -155,7 +202,6 @@ fn stored(config: &Settings, identity: &str, start: u64, end: u64) -> Result<BTr
             bins.insert(
                 fields[0].parse()?,
                 Bin {
-                    values: Vec::new(),
                     min: fields[1].parse().ok(),
                     median: fields[2].parse().ok(),
                     max: fields[3].parse().ok(),
@@ -168,105 +214,146 @@ fn stored(config: &Settings, identity: &str, start: u64, end: u64) -> Result<BTr
     Ok(bins)
 }
 
-fn series(
-    config: &Settings,
-    snapshot: &Value,
-    path: &PathInfo,
-    target: &str,
-    start: u64,
-    end: u64,
-    step: usize,
-) -> Result<Value> {
-    let identity = path.series(target);
+struct Subject<'a> {
+    id: &'a str,
+    name: &'a str,
+    prefix: &'a str,
+}
+
+fn line(config: &Settings, snapshot: &[Series], subject: &Subject, query: &Query) -> Result<Line> {
+    let (start, end) = (query.start / MINUTE_MS, query.end / MINUTE_MS);
+    let identity = series_id(subject.prefix, &query.target);
     let mut history = stored(config, &identity, start, end)?;
-    for measurement in snapshot["tunnels"].as_array().into_iter().flatten() {
-        if measurement["id"] == identity {
-            for (minute, bin) in bins(&measurement["history"]) {
-                if history.get(&minute).is_none_or(|old| old.sent <= bin.sent) {
-                    history.insert(minute, bin);
-                }
+    if let Some(live) = snapshot.iter().find(|series| series.id == identity) {
+        for (minute, bin) in bins(&live.history) {
+            if history.get(&minute).is_none_or(|old| old.sent <= bin.sent) {
+                history.insert(minute, bin);
             }
         }
     }
-    let mut points = Vec::new();
-    for minute in (start..end).step_by(step) {
-        let mut values = Vec::new();
-        let mut min = None;
-        let mut max = None;
-        let mut sent = 0;
-        let mut lost = 0;
-        for offset in 0..u64::try_from(step)? {
-            if let Some(bin) = history.get(&(minute + offset)) {
-                sent += bin.sent;
-                lost += bin.lost;
-                if let Some(value) = bin.median {
-                    values.push(value);
-                }
-                if let Some(value) = bin.min {
-                    min = Some(min.map_or(value, |old: u32| old.min(value)));
-                }
-                if let Some(value) = bin.max {
-                    max = Some(max.map_or(value, |old: u32| old.max(value)));
-                }
+    let width = u64::try_from(query.step)?;
+    let points = (start..end)
+        .step_by(query.step)
+        .map(|minute| {
+            let group: Vec<_> = (minute..minute + width)
+                .filter_map(|at| history.get(&at))
+                .collect();
+            let mut medians: Vec<u32> = group.iter().filter_map(|bin| bin.median).collect();
+            medians.sort_unstable();
+            Point {
+                at: minute * MINUTE_MS,
+                median: medians
+                    .get(medians.len().saturating_sub(1) / 2)
+                    .copied()
+                    .map(milliseconds),
+                min: group
+                    .iter()
+                    .filter_map(|bin| bin.min)
+                    .min()
+                    .map(milliseconds),
+                max: group
+                    .iter()
+                    .filter_map(|bin| bin.max)
+                    .max()
+                    .map(milliseconds),
+                sent: group.iter().map(|bin| bin.sent).sum(),
+                lost: group.iter().map(|bin| bin.lost).sum(),
             }
-        }
-        values.sort_unstable();
-        points.push(json!({"at":minute*60_000,"median":values.get(values.len().saturating_sub(1)/2).map(|value|f64::from(*value)/1000.0),"min":min.map(|value|f64::from(value)/1000.0),"max":max.map(|value|f64::from(value)/1000.0),"sent":sent,"lost":lost}));
-    }
-    Ok(json!({"id":path.id,"name":path.name,"points":points}))
+        })
+        .collect();
+    Ok(Line {
+        id: subject.id.to_owned(),
+        name: subject.name.to_owned(),
+        points,
+    })
 }
 
 pub fn query(
     config: &Settings,
-    snapshot: &Value,
+    snapshot: &[Series],
     inventory: &Inventory,
-    args: &Value,
-) -> Result<Value> {
-    let start = args["start"].as_u64().context("Invalid history range.")?;
-    let end = args["end"].as_u64().context("Invalid history range.")?;
-    let step = args["step"].as_u64().context("Invalid history step.")?;
+    query: &Query,
+) -> Result<Response> {
     let now = now() * 1000;
     ensure!(
-        start < end
-            && end - start <= 86_400_000
-            && start >= now.saturating_sub(86_460_000)
-            && end <= now + 60_000
-            && [1, 5].contains(&step),
+        query.start < query.end
+            && query.end - query.start <= DAY_MS
+            && query.start >= now.saturating_sub(DAY_MS + MINUTE_MS)
+            && query.end <= now + MINUTE_MS
+            && [1, 5].contains(&query.step),
         "History range exceeds its limit."
     );
-    let target = args["target"]
-        .as_str()
-        .context("A history target is required.")?;
-    ensure!(settings::ip(target.parse()?), "Invalid history target.");
-    let selected = inventory
-        .paths
+    let tunnel = inventory
+        .tunnels
         .iter()
-        .find(|path| args["tunnel"] == path.id)
-        .context("The selected path is unavailable.")?;
-    let step = usize::try_from(step)?;
-    let mut result = vec![series(
+        .find(|tunnel| tunnel.id == query.tunnel)
+        .context("The selected tunnel is unavailable.")?;
+    let live = inventory.paths.iter().find(|path| path.id == tunnel.id);
+    let stored_prefix = Known::read(config).0.get(&tunnel.key).cloned();
+    let prefix = live
+        .map(|path| path.prefix().to_owned())
+        .or(stored_prefix)
+        .context("No history exists for this tunnel.")?;
+    let mut series = vec![line(
         config,
         snapshot,
-        selected,
-        target,
-        start / 60_000,
-        end / 60_000,
-        step,
+        &Subject {
+            id: &tunnel.id,
+            name: &tunnel.name,
+            prefix: &prefix,
+        },
+        query,
     )?];
-    if args["include_wan"] == true
+    if query.include_wan
         && config.diagnostics
         && config.direct_wan
         && let Some(wan) = &inventory.wan
     {
-        result.push(series(
+        series.push(line(
             config,
             snapshot,
-            wan,
-            target,
-            start / 60_000,
-            end / 60_000,
-            step,
+            &Subject {
+                id: &wan.id,
+                name: &wan.name,
+                prefix: wan.prefix(),
+            },
+            query,
         )?);
     }
-    Ok(json!({"series":result}))
+    Ok(Response { series })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bins;
+    use crate::runtime::now;
+    use wayline_protocol::Sample;
+
+    #[test]
+    fn bins_count_losses_and_take_the_median() {
+        let base = (now() * 1000 / 60_000 - 2) * 60_000;
+        let sample = |offset: u64, us: Option<u32>| Sample {
+            at_ms: base + offset,
+            us,
+        };
+        let samples = [
+            sample(0, Some(30_000)),
+            sample(1_000, Some(10_000)),
+            sample(2_000, Some(20_000)),
+            sample(3_000, None),
+            sample(4_000, Some(9_000_000)),
+            Sample {
+                at_ms: 1,
+                us: Some(1),
+            },
+        ];
+        let result = bins(&samples);
+        assert_eq!(result.len(), 1);
+        let bin = &result[&(base / 60_000)];
+        assert_eq!((bin.sent, bin.lost), (5, 2));
+        assert_eq!(
+            (bin.min, bin.median, bin.max),
+            (Some(10_000), Some(20_000), Some(30_000))
+        );
+    }
 }

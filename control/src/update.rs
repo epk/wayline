@@ -1,13 +1,10 @@
 use crate::{
-    history::now,
-    locked, router,
-    settings::{RUNTIME, Settings},
-    version,
+    runtime::{RUNTIME, locked, now, version},
+    settings::Settings,
 };
 use anyhow::{Context, Result, ensure};
 use semver::Version;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::Read,
@@ -23,6 +20,7 @@ struct Artifact {
     bytes: u64,
     sha256: String,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
@@ -30,8 +28,60 @@ struct Manifest {
     repository: String,
     package: String,
     version: String,
+    #[expect(
+        dead_code,
+        reason = "The signed manifest lists tested modules for readers."
+    )]
     firmware_contracts: Vec<String>,
     artifacts: Vec<Artifact>,
+}
+
+#[derive(Deserialize)]
+struct Release {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+pub struct Status {
+    message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    installing: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    failed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    needs_attention: bool,
+    #[serde(default)]
+    checked_at: u64,
+}
+
+impl Status {
+    pub fn read() -> Option<Self> {
+        serde_json::from_slice(&fs::read(Self::path()).ok()?).ok()
+    }
+
+    fn path() -> PathBuf {
+        PathBuf::from(format!("{RUNTIME}/update.json"))
+    }
+
+    fn write(&self) -> Result<()> {
+        atomic(&Self::path(), &serde_json::to_vec(self)?)
+    }
+
+    fn checked(message: &str, available: bool, version: String) -> Self {
+        Self {
+            message: message.into(),
+            available: Some(available),
+            version: Some(version),
+            checked_at: now(),
+            ..Self::default()
+        }
+    }
 }
 
 fn download(url: &str, path: &Path, limit: u64) -> Result<()> {
@@ -85,17 +135,14 @@ fn metadata(folder: &Path) -> Result<(Manifest, Artifact, String)> {
         &release_path,
         65_536,
     )?;
-    let release: Value = serde_json::from_slice(&read(&release_path, 65_536)?)?;
-    let tag = release["tag_name"]
-        .as_str()
-        .and_then(|value| value.strip_prefix('v'))
+    let release: Release = serde_json::from_slice(&read(&release_path, 65_536)?)?;
+    let tag = release
+        .tag_name
+        .strip_prefix('v')
         .context("Invalid release tag.")?;
     let parsed = Version::parse(tag)?;
     ensure!(
-        release["draft"] == false
-            && release["prerelease"] == false
-            && parsed.pre.is_empty()
-            && parsed.build.is_empty(),
+        !release.draft && !release.prerelease && parsed.pre.is_empty() && parsed.build.is_empty(),
         "The release is not a stable version."
     );
     let prefix = format!("https://github.com/epk/wayline/releases/download/v{tag}/");
@@ -125,14 +172,6 @@ fn metadata(folder: &Path) -> Result<(Manifest, Artifact, String)> {
             && data.version == tag,
         "The signed release identity does not match."
     );
-    let contract = digest(&read(
-        Path::new("/usr/lib/oui-httpd/rpc/vpn-client"),
-        131_072,
-    )?);
-    ensure!(
-        router::contract() && data.firmware_contracts.contains(&contract),
-        "The release does not support this firmware."
-    );
     ensure!(
         data.artifacts.len() == 1,
         "The release has an unexpected artifact set."
@@ -160,73 +199,61 @@ fn metadata(folder: &Path) -> Result<(Manifest, Artifact, String)> {
     Ok((data, artifact, prefix))
 }
 
-fn package_identity(path: &Path, expected: &str) -> Result<()> {
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(path)?));
-    let mut control = None;
-    for entry in archive.entries()? {
+fn member(reader: impl Read, name: &str, limit: u64) -> Result<Vec<u8>> {
+    for entry in tar::Archive::new(flate2::read::GzDecoder::new(reader)).entries()? {
         let entry = entry?;
-        if entry.path()?.as_ref() == Path::new("control.tar.gz")
-            || entry.path()?.as_ref() == Path::new("./control.tar.gz")
-        {
+        if entry.path()?.strip_prefix(".").unwrap_or(&entry.path()?) == Path::new(name) {
             let mut bytes = Vec::new();
-            entry.take(65_537).read_to_end(&mut bytes)?;
+            entry.take(limit + 1).read_to_end(&mut bytes)?;
             ensure!(
-                bytes.len() <= 65_536,
+                u64::try_from(bytes.len())? <= limit,
                 "Package control data exceeds its limit."
             );
-            control = Some(bytes);
-            break;
+            return Ok(bytes);
         }
     }
-    let control = control.context("Package control data is absent.")?;
-    let mut inner = tar::Archive::new(flate2::read::GzDecoder::new(control.as_slice()));
+    anyhow::bail!("Package control data is absent.")
+}
+
+fn package_identity(path: &Path, expected: &str) -> Result<()> {
+    let control = member(fs::File::open(path)?, "control.tar.gz", 65_536)?;
+    let data = String::from_utf8(member(control.as_slice(), "control", 16_384)?)?;
     let mut fields = std::collections::BTreeMap::new();
-    for entry in inner.entries()? {
-        let entry = entry?;
-        if [Path::new("control"), Path::new("./control")].contains(&entry.path()?.as_ref()) {
-            let mut data = String::new();
-            entry.take(16_385).read_to_string(&mut data)?;
+    for line in data.lines() {
+        if let Some((key, value)) = line.split_once(": ") {
             ensure!(
-                data.len() <= 16_384,
-                "Package control data exceeds its limit."
+                fields.insert(key, value).is_none(),
+                "Duplicate package control field."
             );
-            for line in data.lines() {
-                if let Some((key, value)) = line.split_once(": ") {
-                    ensure!(
-                        fields.insert(key.to_owned(), value.to_owned()).is_none(),
-                        "Duplicate package control field."
-                    );
-                }
-            }
-            break;
         }
     }
     ensure!(
         fields
             .get("Package")
-            .is_some_and(|value| value == "wayline")
-            && fields.get("Version").is_some_and(|value| value == expected)
+            .is_some_and(|value| *value == "wayline")
+            && fields
+                .get("Version")
+                .is_some_and(|value| *value == expected)
             && fields
                 .get("Architecture")
-                .is_some_and(|value| value == "aarch64_cortex-a53"),
+                .is_some_and(|value| *value == "aarch64_cortex-a53"),
         "The package identity does not match its signed manifest."
     );
     Ok(())
 }
 
-fn execute(install: bool) -> Result<Value> {
+fn execute(install: bool) -> Result<Status> {
     let folder = tempfile::tempdir_in(RUNTIME)?;
     let (manifest, artifact, prefix) = metadata(folder.path())?;
-    let current = Version::parse(&version())?;
-    if Version::parse(&manifest.version)? <= current {
-        return Ok(
-            json!({"message":"Wayline is current.","available":false,"version":version(),"checked_at":now()}),
-        );
+    if Version::parse(&manifest.version)? <= Version::parse(&version())? {
+        return Ok(Status::checked("Wayline is current.", false, version()));
     }
     if !install {
-        return Ok(
-            json!({"message":"A signed update is available.","available":true,"version":manifest.version,"checked_at":now()}),
-        );
+        return Ok(Status::checked(
+            "A signed update is available.",
+            true,
+            manifest.version,
+        ));
     }
     space(folder.path(), artifact.bytes.saturating_mul(2) + 1_048_576)?;
     space(Path::new("/etc/wayline"), 4_194_304)?;
@@ -244,20 +271,19 @@ fn execute(install: bool) -> Result<Value> {
     package_identity(&package, &manifest.version)?;
     let path = package.to_str().context("Invalid package path.")?;
     text("opkg", &["--noaction", "install", path], 16_384, 30)?;
-    atomic(
-        Path::new(&format!("{RUNTIME}/update.json")),
-        &serde_json::to_vec(
-            &json!({"message":"Installing the signed update.","installing":true,"checked_at":now()}),
-        )?,
-    )?;
+    Status {
+        message: "Installing the signed update.".into(),
+        installing: true,
+        checked_at: now(),
+        ..Status::default()
+    }
+    .write()?;
     text("opkg", &["install", path], 32_768, 120)?;
     ensure!(
         version() == manifest.version,
         "The installed version needs checking. Do not retry automatically."
     );
-    Ok(
-        json!({"message":"Wayline updated.","available":false,"version":manifest.version,"checked_at":now()}),
-    )
+    Ok(Status::checked("Wayline updated.", false, manifest.version))
 }
 
 fn space(path: &Path, minimum: u64) -> Result<()> {
@@ -273,34 +299,29 @@ pub fn scheduled(config: &Settings) -> Result<()> {
     locked("update", || {
         let request = PathBuf::from(format!("{RUNTIME}/update-request"));
         let requested = fs::read_to_string(&request).unwrap_or_default();
-        let status_path = PathBuf::from(format!("{RUNTIME}/update.json"));
-        let previous: Value = fs::read(&status_path)
-            .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or(Value::Null);
+        let previous = Status::read();
         ensure!(
-            previous["installing"] != true && previous["needs_attention"] != true,
+            previous
+                .as_ref()
+                .is_none_or(|status| !status.installing && !status.needs_attention),
             "A previous installation needs checking."
         );
         if requested.is_empty()
             && (!config.auto_updates
-                || now().saturating_sub(previous["checked_at"].as_u64().unwrap_or(0)) < 86_400)
+                || now().saturating_sub(previous.map_or(0, |status| status.checked_at)) < 86_400)
         {
             return Ok(());
         }
-        let result =
-            execute(requested == "install_update" || (requested.is_empty() && config.auto_updates));
-        let status = match result {
-            Ok(value) => value,
-            Err(error) => {
-                let installing = fs::read(&status_path)
-                    .ok()
-                    .and_then(|data| serde_json::from_slice::<Value>(&data).ok())
-                    .is_some_and(|value| value["installing"] == true);
-                json!({"message":format!("Update stopped. {error}"),"failed":true,"needs_attention":installing,"checked_at":now()})
-            }
-        };
-        atomic(&status_path, &serde_json::to_vec(&status)?)?;
+        let status =
+            execute(requested == "install_update" || (requested.is_empty() && config.auto_updates))
+                .unwrap_or_else(|error| Status {
+                    message: format!("Update stopped. {error}"),
+                    failed: true,
+                    needs_attention: Status::read().is_some_and(|status| status.installing),
+                    checked_at: now(),
+                    ..Status::default()
+                });
+        status.write()?;
         if request.exists() {
             fs::remove_file(request)?;
         }
