@@ -1174,16 +1174,27 @@ export default {
     },
     sortedRows() {
       const { key, dir } = this.sort;
-      const rows = this.tableRows.slice();
-      if (key === 'name') return rows.sort((a, b) => dir * a.name.localeCompare(b.name));
       const read = (row) =>
         key === 'cursor' ? valueAt(row.line, this.cursor.index) : row.stats[key];
-      return rows.sort((a, b) => {
-        const x = read(a);
-        const y = read(b);
-        if (x === null || y === null) return (x === null) - (y === null);
-        return dir * (x - y);
+      const groups = new Map();
+      this.tableRows.forEach((row) => {
+        if (!groups.has(row.owner)) groups.set(row.owner, []);
+        groups.get(row.owner).push(row);
       });
+      const lead = (rows) => rows.find((row) => !row.dashed) || rows[0];
+      const ordered = Array.from(groups.values()).map((rows) =>
+        rows.sort((a, b) => Number(a.dashed) - Number(b.dashed)),
+      );
+      ordered.sort((a, b) => {
+        const x = lead(a);
+        const y = lead(b);
+        if (key === 'name') return dir * x.name.localeCompare(y.name);
+        const u = read(x);
+        const v = read(y);
+        if (u === null || v === null) return (u === null) - (v === null);
+        return dir * (u - v);
+      });
+      return ordered.flat();
     },
   },
   watch: {
