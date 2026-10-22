@@ -6,9 +6,7 @@ use anyhow::{Context, Result, ensure};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     fs,
-    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -70,8 +68,8 @@ impl Phase {
     }
 }
 
-#[derive(Default, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Status {
     current: String,
     latest: Option<String>,
@@ -84,54 +82,9 @@ pub struct Status {
     updated_at: u64,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct Stored {
-    current: Option<String>,
-    #[serde(alias = "version")]
-    latest: Option<String>,
-    available: Option<bool>,
-    phase: Option<Phase>,
-    installing: bool,
-    message: String,
-    failed: bool,
-    #[serde(alias = "needs_attention")]
-    needs_attention: bool,
-    #[serde(alias = "checked_at")]
-    checked_at: u64,
-    updated_at: u64,
-}
-
-impl From<Stored> for Status {
-    fn from(stored: Stored) -> Self {
-        let phase = stored.phase.unwrap_or(if stored.installing {
-            Phase::Installing
-        } else if stored.failed {
-            Phase::Failed
-        } else {
-            Phase::Done
-        });
-        Self {
-            current: stored.current.unwrap_or_else(version),
-            latest: stored.latest,
-            available: stored.available.unwrap_or(false),
-            phase,
-            message: stored.message,
-            failed: stored.failed,
-            needs_attention: stored.needs_attention,
-            checked_at: stored.checked_at,
-            updated_at: stored.updated_at,
-        }
-    }
-}
-
 impl Status {
     pub fn read() -> Option<Self> {
-        Self::parse(&fs::read(Self::path()).ok()?)
-    }
-
-    fn parse(raw: &[u8]) -> Option<Self> {
-        serde_json::from_slice::<Stored>(raw).ok().map(Self::from)
+        serde_json::from_slice(&fs::read(Self::path()).ok()?).ok()
     }
 
     pub fn message(&self) -> &str {
@@ -331,50 +284,6 @@ fn metadata(folder: &Path, latest: &Version) -> Result<(Manifest, Artifact, Stri
     Ok((data, artifact, prefix))
 }
 
-fn member(reader: impl Read, name: &str, limit: u64) -> Result<Vec<u8>> {
-    for entry in tar::Archive::new(flate2::read::GzDecoder::new(reader)).entries()? {
-        let entry = entry?;
-        let path = entry.path()?;
-        if path.strip_prefix(".").unwrap_or(&path) == Path::new(name) {
-            let mut bytes = Vec::new();
-            entry.take(limit + 1).read_to_end(&mut bytes)?;
-            ensure!(
-                u64::try_from(bytes.len())? <= limit,
-                "Package control data exceeds its limit."
-            );
-            return Ok(bytes);
-        }
-    }
-    anyhow::bail!("Package control data is absent.")
-}
-
-fn package_identity(package: &[u8], expected: &str) -> Result<()> {
-    let control = member(package, "control.tar.gz", 65_536)?;
-    let data = String::from_utf8(member(control.as_slice(), "control", 16_384)?)?;
-    let mut fields = BTreeMap::new();
-    for line in data.lines() {
-        if let Some((key, value)) = line.split_once(": ") {
-            ensure!(
-                fields.insert(key, value).is_none(),
-                "Duplicate package control field."
-            );
-        }
-    }
-    ensure!(
-        fields
-            .get("Package")
-            .is_some_and(|value| *value == "wayline")
-            && fields
-                .get("Version")
-                .is_some_and(|value| *value == expected)
-            && fields
-                .get("Architecture")
-                .is_some_and(|value| *value == "aarch64_cortex-a53"),
-        "The package identity does not match its signed manifest."
-    );
-    Ok(())
-}
-
 fn execute(install: bool, report: &dyn Fn(Phase, &str) -> Result<()>) -> Result<Status> {
     report(Phase::Checking, "Checking for a newer release…")?;
     let folder = tempfile::tempdir_in(RUNTIME)?;
@@ -413,7 +322,6 @@ fn execute(install: bool, report: &dyn Fn(Phase, &str) -> Result<()>) -> Result<
         u64::try_from(bytes.len())? == artifact.bytes && digest(&bytes) == artifact.sha256,
         "The release size or digest does not match."
     );
-    package_identity(&bytes, &manifest.version)?;
     let path = package.to_str().context("Invalid package path.")?;
     text("opkg", &["--noaction", "install", path], 16_384, 30)?;
     report(Phase::Installing, "Installing the signed update.")?;
@@ -529,7 +437,7 @@ pub fn scheduled(config: &Settings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Phase, Release, Status, effective, newest};
-    use anyhow::{Context, Result, ensure};
+    use anyhow::{Result, ensure};
     use semver::Version;
 
     fn release(tag_name: &str, draft: bool) -> Release {
@@ -537,10 +445,6 @@ mod tests {
             tag_name: tag_name.into(),
             draft,
         }
-    }
-
-    fn parse(raw: &str) -> Result<Status> {
-        Status::parse(raw.as_bytes()).context("The status is unreadable.")
     }
 
     fn at(phase: Phase, updated_at: u64) -> Status {
@@ -594,37 +498,6 @@ mod tests {
     #[test]
     fn empty_list_has_no_release() -> Result<()> {
         ensure!(newest(&[]).is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_available_status() -> Result<()> {
-        let status = parse(
-            r#"{"message":"A signed update is available.","available":true,"version":"0.2.0","checked_at":5}"#,
-        )?;
-        ensure!(status.latest.as_deref() == Some("0.2.0"));
-        ensure!(status.available && status.phase == Phase::Done);
-        ensure!(status.checked_at == 5 && !status.needs_attention && !status.failed);
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_installing_status() -> Result<()> {
-        let status = parse(
-            r#"{"message":"Installing the signed update.","installing":true,"checked_at":7}"#,
-        )?;
-        ensure!(status.phase == Phase::Installing);
-        ensure!(!status.needs_attention && !status.available);
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_needs_attention_status() -> Result<()> {
-        let status = parse(
-            r#"{"message":"Update stopped. Refused.","failed":true,"needs_attention":true}"#,
-        )?;
-        ensure!(status.phase == Phase::Failed && status.failed && status.needs_attention);
-        ensure!(!super::settled(Some(&status)));
         Ok(())
     }
 
