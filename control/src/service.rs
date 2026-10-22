@@ -156,7 +156,11 @@ fn routine() -> Result<()> {
             resolved.refresh(&hosts)?;
         }
     }
-    if failure.is_none() {
+    if failure.is_none()
+        && !inventory
+            .as_ref()
+            .is_some_and(|inventory| inventory.partial)
+    {
         locked("reconcile", || {
             if Settings::read()? == config {
                 apply(&config, monitored)

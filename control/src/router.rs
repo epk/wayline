@@ -133,6 +133,7 @@ pub struct Inventory {
     pub wan_reason: String,
     pub uplinks: Vec<PathInfo>,
     pub rules: Arc<[(String, Rule)]>,
+    pub partial: bool,
 }
 
 impl Rule {
@@ -449,11 +450,6 @@ fn discover(endpoints: bool) -> Result<Inventory> {
     let dump = native::bus::<Dump>("network.interface", "dump", &json!({}));
     let interfaces = dump.as_ref().map_or(&[][..], |dump| &dump.interface);
     let (tunnels, found) = native_tunnels(&network, &rules, interfaces)?;
-    if let Err(error) = &dump
-        && tunnels.iter().any(|tunnel| tunnel.enabled)
-    {
-        anyhow::bail!("The interface list could not be read: {error}.");
-    }
     let (uplinks, wan, wan_reason) = match &dump {
         Ok(_) => {
             let uplinks = uplinks(interfaces);
@@ -478,6 +474,7 @@ fn discover(endpoints: bool) -> Result<Inventory> {
         wan_reason,
         uplinks,
         rules: rules.into(),
+        partial: dump.is_err(),
     })
 }
 
@@ -764,6 +761,7 @@ mod tests {
             wan_reason: String::new(),
             uplinks: vec![path("uplink:wwan", "wwan0", None)],
             rules: Vec::new().into(),
+            partial: false,
         }
     }
 
