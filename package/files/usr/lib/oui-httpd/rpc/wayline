@@ -18,12 +18,11 @@ local function invoke(method, args)
     end
     local input = json.encode(args or {})
     assert(#input <= 32768, 'The request exceeds its size limit.')
-    local process = assert(
-        ngx.pipe.spawn(
-            { '/usr/sbin/wayline-ctl', method, input },
-            { stdout_read_timeout = method == 'set_tunnel_enabled' and 45000 or 12000 }
-        )
-    )
+    local process = assert(ngx.pipe.spawn({ '/usr/sbin/wayline-ctl', method, input }, {
+        stdout_read_timeout = method == 'set_tunnel_enabled' and 75000
+            or method == 'select_tunnel' and 45000
+            or 12000,
+    }))
     local output = process:stdout_read_all()
     assert(output and #output <= 524288, 'The response exceeds its size limit.')
     local response = json.decode(output)

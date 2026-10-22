@@ -62,6 +62,20 @@ fn preview() -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    if std::env::args().next().is_some_and(|name| {
+        Path::new(&name)
+            .file_name()
+            .is_some_and(|file| file == "vpn-client")
+    }) {
+        return native::reload_probe();
+    }
+    if std::env::args().next().is_some_and(|name| {
+        Path::new(&name)
+            .file_name()
+            .is_some_and(|file| file == "ubus")
+    }) {
+        return native::bus_probe();
+    }
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("deps") => deps(),

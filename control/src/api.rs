@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, net::Ipv4Addr};
+use std::{collections::BTreeMap, net::Ipv4Addr, thread, time::Duration};
 use wayline_protocol::{Series, State as Measurement};
 
 const RECENT: usize = 8;
@@ -606,8 +606,10 @@ pub fn set_tunnel_enabled(request: &SetEnabled) -> Result<Value> {
             if config != stored {
                 store(SETTINGS, &config)?;
             }
+            auto::Record::touch(false)?;
             native::call::<Value>("set_tunnel", &json!({"tunnel_id":number,"enabled":enabled}))
                 .context(UNKNOWN)?;
+            thread::sleep(Duration::from_secs(5));
             let after = native::List::read().context(UNKNOWN)?;
             let actual = after
                 .tunnels
@@ -633,11 +635,7 @@ pub fn set_tunnel_enabled(request: &SetEnabled) -> Result<Value> {
 
 pub fn select(request: &Select) -> Result<Value> {
     locked("selection", || {
-        let result = apply(&request.section_id, &request.expected_revision, false)?;
-        if result["unchanged"] != true {
-            auto::Record::touch(true)?;
-        }
-        Ok(result)
+        apply(&request.section_id, &request.expected_revision, false)
     })
 }
 
@@ -651,6 +649,8 @@ pub fn apply(id: &str, expected_revision: &str, require_health: bool) -> Result<
         return Ok(json!({"applied":true,"unchanged":true}));
     }
     desired[..=index].rotate_right(1);
+    let mut desired_numbers: Vec<_> = list.tunnels.iter().map(|tunnel| tunnel.number).collect();
+    desired_numbers[..=index].rotate_right(1);
     ensure!(expected_revision == router::revision()?, STALE);
     if require_health {
         ensure!(
@@ -665,17 +665,36 @@ pub fn apply(id: &str, expected_revision: &str, require_health: bool) -> Result<
         expected_revision == router::revision()?,
         "State changed before selection. Refresh first."
     );
-    native::call::<Value>("order_tunnel", &json!({"id_list":desired}))?;
+    if !require_health {
+        auto::Record::touch(false)?;
+    }
+    let response = native::call::<Value>("order_tunnel", &json!({"id_list":desired}));
     let after = native::List::read().context("Selection outcome is unknown. Refresh first.")?;
     ensure!(
         after
             .tunnels
             .iter()
-            .map(|tunnel| tunnel.id.as_str())
-            .eq(desired.iter().copied()),
+            .map(|tunnel| tunnel.number)
+            .eq(desired_numbers),
         "Selection changed concurrently. Refresh first."
     );
-    Ok(json!({"applied":true}))
+    ensure!(
+        list.default_tunnels == after.default_tunnels
+            && list
+                .tunnels
+                .iter()
+                .all(|before| after.tunnels.iter().any(|after| {
+                    before.number == after.number && before.enabled == after.enabled
+                })),
+        "The VPN state changed concurrently. Refresh first."
+    );
+    router::forget();
+    ensure!(
+        inventory.same_traffic_rules(&router::inventory_with(false)?),
+        "The traffic rules changed during selection. Refresh first."
+    );
+    let auto_pending = !require_health && auto::Record::touch(true).is_err();
+    Ok(json!({"applied":true,"response_lost":response.is_err(),"auto_pending":auto_pending}))
 }
 
 pub fn start_update(method: &str) -> Result<Value> {

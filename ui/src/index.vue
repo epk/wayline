@@ -1253,6 +1253,7 @@ export default {
     },
   },
   created() {
+    this.stateRead = null;
     this.theme = {};
     this.plot = null;
     this.lossPlot = null;
@@ -1291,6 +1292,8 @@ export default {
     call(method, params) {
       return new Promise((resolve, reject) => {
         let request;
+        const timeout =
+          method === 'set_tunnel_enabled' ? 75000 : method === 'select_tunnel' ? 45000 : 12000;
         try {
           const read = method === 'get_state' || method === 'get_history';
           if (!read && this.staleBundle)
@@ -1302,7 +1305,7 @@ export default {
             request = this.$rpcRequest(
               'call',
               ['sid', read ? 'wayline' : rpcObject, method, params || {}],
-              { timeout: method === 'set_tunnel_enabled' ? 45000 : 12000 },
+              { timeout },
             );
         } catch (e) {
           reject(e);
@@ -1310,7 +1313,7 @@ export default {
         }
         const timer = setTimeout(
           () => reject(Error('The request timed out. Refresh its status before another change.')),
-          method === 'set_tunnel_enabled' ? 45000 : 12000,
+          timeout,
         );
         Promise.resolve(request).then(
           (value) => {
@@ -1324,8 +1327,13 @@ export default {
         );
       });
     },
-    async refresh() {
-      if (this.loading || this.stopped || document.hidden) return;
+    refresh() {
+      if (this.stopped || document.hidden) return Promise.resolve(false);
+      if (this.stateRead) return this.stateRead;
+      this.stateRead = this.refreshState().finally(() => (this.stateRead = null));
+      return this.stateRead;
+    },
+    async refreshState() {
       clearTimeout(this.timer);
       this.loading = true;
       try {
@@ -1351,6 +1359,19 @@ export default {
         next.events = Array.isArray(next.events) ? next.events : [];
         next.resolved = next.resolved || {};
         next.wan = Object.assign({ available: true, interface: null, reason: '' }, next.wan);
+        if (
+          next.tunnels.some(
+            (row) =>
+              row.monitorId &&
+              this.state.tunnels.some(
+                (previous) => previous.monitorId === row.monitorId && previous.id !== row.id,
+              ),
+          )
+        ) {
+          this.historyRequest++;
+          this.historyLoading = false;
+          this.historyAt = 0;
+        }
         this.state = next;
         this.ready = true;
         if (this.updateActive && !this.updateTimer) this.startUpdatePoll();
@@ -1367,6 +1388,7 @@ export default {
           (!this.historyLoaded || Date.now() - this.historyAt >= historyInterval)
         )
           await this.loadHistory();
+        return true;
       } catch (e) {
         this.readError = 'Wayline is unavailable. ' + this.describe(e, 'Try again shortly.');
       } finally {
@@ -1426,7 +1448,13 @@ export default {
     },
     changeFor(subject) {
       const cutoff = Date.now() - changeWindow;
-      return this.state.events.find((e) => e.subject === subject && e.at >= cutoff) || null;
+      const tunnel = this.state.tunnels.find((row) => row.id === subject);
+      return (
+        this.state.events.find(
+          (e) =>
+            (e.subject === subject || (tunnel && e.subject === tunnel.monitorId)) && e.at >= cutoff,
+        ) || null
+      );
     },
     uplinkName(u) {
       if (!u.active) return u.interface || u.id;
@@ -1630,9 +1658,18 @@ export default {
         await this.refresh();
       } catch {
         this.notice = '';
-        this.error =
-          'Could not confirm the exit change. Refresh, then check the active exit before trying again.';
-        await this.refresh();
+        if (this.stateRead) await this.stateRead;
+        const fresh = await this.refresh();
+        if (
+          fresh &&
+          this.state.tunnels.some(
+            (row) => t.monitorId && row.monitorId === t.monitorId && row.preferred,
+          )
+        )
+          this.notice = 'Now using ' + t.name + ' as the exit.';
+        else
+          this.error =
+            'Could not confirm the exit change. Refresh, then check the active exit before trying again.';
       } finally {
         this.busy = false;
         this.busyTunnel = '';

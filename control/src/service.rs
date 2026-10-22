@@ -169,12 +169,13 @@ fn routine() -> Result<()> {
             }
         })?;
     }
+    let refreshed = monitored.map_or(Ok(()), |inventory| {
+        egress::Cache::refresh(&config, inventory)
+    });
     let recorded = inventory
         .as_ref()
         .map_or(Ok(()), |inventory| changes::record(&config, inventory));
-    if let Some(inventory) = monitored {
-        egress::Cache::refresh(&config, inventory)?;
-    }
+    refreshed?;
     let collected = format!("{RUNTIME}/last-collect");
     let last = fs::read_to_string(&collected)
         .ok()

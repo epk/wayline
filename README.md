@@ -2,7 +2,7 @@
 
 Wayline compares VPN tunnels on GL.iNet routers. The **VPN → Wayline** page shows latency, loss, history, and exit addresses. It provides native tunnel Start and Stop controls and manual exit selection.
 
-Wayline is experimental. This README describes **0.1.0-alpha.14**, which fixes history purge after upgrades and missing graph lines on fresh loads. Install signed packages from [GitHub Releases](https://github.com/epk/wayline/releases).
+Wayline is experimental. This README describes **0.1.0-alpha.15**, which improves exit-change confirmation, compares native rule defaults, and records public exit IP changes. Install signed packages from [GitHub Releases](https://github.com/epk/wayline/releases).
 
 The screenshots use synthetic data. They contain no live router addresses, endpoints, locations, or tunnel names.
 
@@ -26,10 +26,10 @@ GL.iNet retains control of routes, DNS, tunnel lifecycle, and kill switches. Pri
 ## Requirements
 
 - A GL.iNet router with the `aarch64_cortex-a53` package architecture, such as Beryl 7 or Brume 3.
-- Firmware 4.9.0 or newer. Mutation controls require a tested native VPN module fingerprint.
+- Firmware 4.9.0 or newer. Wayline checks native replies before it confirms a change.
 - SSH access for the first installation.
 
-Unknown native modules permit monitoring and signed updates. Exit selection, automatic switching, and Start and Stop remain disabled until the module is verified.
+An unverified native module shows a firmware notice. An unknown reply format disables tunnel controls in the page.
 
 ## Install
 
@@ -41,15 +41,15 @@ curl -fsSL https://raw.githubusercontent.com/epk/wayline/main/install.sh | sh
 
 The installer downloads the newest published release, including prereleases. It checks the signing key fingerprint, manifest signature, and package hash before installation.
 
-To install a specific version, download `install.sh`. Run `WAYLINE_VERSION=0.1.0-alpha.14 sh install.sh`.
+To install a specific version, download `install.sh`. Run `WAYLINE_VERSION=0.1.0-alpha.15 sh install.sh`.
 
 Create your VPN profiles in the factory dashboard first. Open **VPN → Wayline → Settings**. Choose the tunnels and destinations to monitor, then enable monitoring.
 
 ## Choose an exit
 
-Select **Use as exit** beside a healthy tunnel. Wayline preserves the other tunnels' relative order and asks the native VPN manager to change priority.
+Select **Use as exit** beside a connected tunnel. Wayline preserves the other tunnels' relative order and asks the native VPN manager to change priority.
 
-Eligible tunnels need recent successful measurements without loss and equivalent native traffic rules. Different per-tunnel routing marks do not count as different traffic rules. A disabled button shows the specific failed check.
+Manual selection requires equivalent native traffic rules. Automatic selection also requires recent healthy measurements. Different per-tunnel routing marks do not count as different traffic rules. Omitted native defaults match their explicit values. A disabled button identifies the failed check or differing rule field.
 
 ## Automatic switching
 

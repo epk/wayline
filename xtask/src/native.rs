@@ -6,13 +6,53 @@ use std::{
     path::Path,
     process::{Child, Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use wayline_support::{FIRMWARE_CONTRACT as CONTRACT, digest};
 use xshell::{Shell, cmd};
 
 const ROOT: &str = "artifacts/local/firmware-root";
 const NATIVE_PATH: &str = "PATH=/usr/sbin:/usr/bin:/sbin:/bin";
+
+pub fn reload_probe() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("restart") {
+        fs::write("/tmp/wayline-reload-started", b"started")?;
+        thread::sleep(Duration::from_secs(2));
+        fs::write("/tmp/wayline-reload-completed", b"completed")?;
+    }
+    Ok(())
+}
+
+pub fn bus_probe() -> Result<()> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args
+        .windows(3)
+        .any(|args| args == ["call", "network.interface", "dump"])
+    {
+        println!("{}", fs::read_to_string("/tmp/wayline-interfaces.json")?);
+        return Ok(());
+    }
+    let ordering = args
+        .last()
+        .is_some_and(|arg| arg.contains("\"func\":\"order_tunnel\""));
+    let fault = fs::read_to_string("/tmp/wayline-order-fault").unwrap_or_default();
+    if ordering && fault == "delay" {
+        thread::sleep(Duration::from_secs(4));
+    }
+    let output = Command::new("/bin/ubus-wayline-original")
+        .args(args)
+        .output()?;
+    ensure!(output.status.success(), "The native bus failed.");
+    if ordering {
+        fs::write("/tmp/wayline-order-reply", &output.stdout)?;
+    }
+    if ordering && fault == "lost" {
+        println!("lost response");
+    } else {
+        print!("{}", String::from_utf8(output.stdout)?);
+    }
+    Ok(())
+}
 
 fn contract(root: &Path) -> Result<String> {
     Ok(digest(&fs::read(
@@ -592,6 +632,124 @@ fn purge_checks(sid: &str) -> Result<()> {
 }
 
 fn tunnel_controls() -> Result<()> {
+    let init = Path::new(ROOT).join("etc/init.d/vpn-client");
+    let original_init = init.with_file_name("vpn-client-wayline-original");
+    fs::rename(&init, &original_init)?;
+    fs::copy(
+        "target/aarch64-unknown-linux-musl/release/wayline-dev",
+        &init,
+    )?;
+    let result = tunnel_control_checks();
+    let result = result.and_then(|()| selection_checks());
+    let restored = fs::rename(original_init, init);
+    result?;
+    restored?;
+    Ok(())
+}
+
+fn selection_checks() -> Result<()> {
+    let root = Path::new(ROOT);
+    let policy = root.join("etc/config/route_policy");
+    let network = root.join("etc/config/network");
+    let saved_policy = fs::read(&policy)?;
+    let saved_network = fs::read(&network)?;
+    let bus = root.join("bin/ubus");
+    let original_bus = root.join("bin/ubus-wayline-original");
+    fs::rename(&bus, &original_bus)?;
+    fs::copy(
+        "target/aarch64-unknown-linux-musl/release/wayline-dev",
+        &bus,
+    )?;
+    let result = selection_scenarios();
+    if result.is_err() {
+        println!(
+            "Native order after failure: {}",
+            native("get_tunnel", &json!({}))?
+        );
+        println!(
+            "Native ordering reply: {}",
+            fs::read_to_string(root.join("tmp/wayline-order-reply")).unwrap_or_default()
+        );
+    }
+    fs::rename(original_bus, bus)?;
+    fs::write(policy, saved_policy)?;
+    fs::write(network, saved_network)?;
+    result
+}
+
+fn selection_scenarios() -> Result<()> {
+    let root = Path::new(ROOT);
+    let before = native("get_tunnel", &json!({}))?;
+    let tunnels = before["tunnels"].as_array().context("Missing tunnels.")?;
+    let mut interfaces = Vec::new();
+    for (index, tunnel) in tunnels.iter().enumerate() {
+        let id = tunnel["id"].as_str().context("Missing tunnel ID.")?;
+        let interface = format!("wgclient{}", index + 1);
+        for assignment in [
+            format!("route_policy.{id}.enabled=1"),
+            format!("route_policy.{id}.via={interface}"),
+            format!("network.{interface}=interface"),
+            format!("network.{interface}.proto=wgclient"),
+            format!("network.{interface}.config=peer_991"),
+            format!("network.rt_{interface}=rule"),
+            format!("network.rt_{interface}.mark=0x1000/0xf000"),
+        ] {
+            call("/sbin/uci", &["set", &assignment])?;
+        }
+        interfaces.push(json!({"interface":interface,"up":true,"l3_device":interface,"ipv4-address":[{"address":format!("10.88.{}.2", index + 1)}]}));
+    }
+    call("/sbin/uci", &["commit"])?;
+    fs::write(
+        root.join("tmp/wayline-interfaces.json"),
+        serde_json::to_vec(&json!({"interface":interfaces}))?,
+    )?;
+    let fault = root.join("tmp/wayline-order-fault");
+    for (mode, target) in [("delay", &tunnels[1]), ("lost", &tunnels[0])] {
+        fs::write(&fault, mode)?;
+        let state = request("get_state", &json!({}))?;
+        println!("Selection fixture: {}", state["tunnels"]);
+        let selected = state["tunnels"]
+            .as_array()
+            .context("Missing tunnel state.")?
+            .iter()
+            .find(|row| row["monitorId"] == format!("vpn:{}", target["tunnel_id"]))
+            .context("Missing stable tunnel identity.")?;
+        let response = request(
+            "select_tunnel",
+            &json!({"section_id":selected["id"],"expected_revision":state["revision"]}),
+        )?;
+        ensure!(
+            response["applied"] == true,
+            "The exit change was not confirmed."
+        );
+        ensure!(
+            response["response_lost"] == (mode == "lost"),
+            "The response fault was not observed."
+        );
+        let after = native("get_tunnel", &json!({}))?;
+        ensure!(
+            after["tunnels"][0]["tunnel_id"] == target["tunnel_id"]
+                && after["default_tunnels"] == before["default_tunnels"],
+            "The selected exit or fallback policy differs."
+        );
+        let state = request("get_state", &json!({}))?;
+        ensure!(
+            request(
+                "select_tunnel",
+                &json!({"section_id":after["tunnels"][0]["id"],"expected_revision":state["revision"]})
+            )?["unchanged"]
+                == true,
+            "A repeated exit selection changed the policy."
+        );
+    }
+    fs::remove_file(fault)?;
+    println!(
+        "Native exit selection, delayed response, lost response, and repetition checks passed."
+    );
+    Ok(())
+}
+
+fn tunnel_control_checks() -> Result<()> {
     let state = request("get_state", &json!({}))?;
     let path = Path::new(ROOT).join("etc/config/route_policy");
     let saved = fs::read(&path)?;
@@ -642,6 +800,9 @@ fn tunnel_controls() -> Result<()> {
     )?;
     for enabled in [true, true, false, false] {
         let current = request("get_state", &json!({}))?;
+        let changed = tunnel_row(&current)?["enabled"] != enabled;
+        let completed = Path::new(ROOT).join("tmp/wayline-reload-completed");
+        let _ = fs::remove_file(&completed);
         let id = tunnel_row(&current)?["id"].clone();
         let result = request(
             "set_tunnel_enabled",
@@ -668,6 +829,18 @@ fn tunnel_controls() -> Result<()> {
             observed["config"]["tunnels"] == json!(["vpn:2001"]),
             "A tunnel state change lost its monitoring choice."
         );
+        if changed {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while !completed.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(100));
+            }
+            ensure!(completed.exists(), "The native VPN restart did not finish.");
+        } else {
+            ensure!(
+                !completed.exists(),
+                "An unchanged tunnel restarted the VPN service."
+            );
+        }
     }
     println!("Native tunnel control checks passed.");
     Ok(())

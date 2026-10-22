@@ -13,7 +13,7 @@
     : 'full';
   const wanDown = query.get('wan') === 'unavailable';
   const updateFailed = query.get('update') === 'failed';
-  const release = '0.1.0-alpha.14';
+  const release = '0.1.0-alpha.15';
   const installed = query.get('stale') === '1' ? '0.0.0' : release;
   const directExit = query.get('exit') === 'direct';
   const wanMs = wanDown ? null : 14.37;
@@ -178,8 +178,8 @@
       {
         at: Date.now() - 20 * 60000,
         subject: 'home',
-        kind: 'server',
-        text: 'VPN server address changed to 203.0.113.10',
+        kind: 'egress',
+        text: 'Tunnel A public exit IP changed from 203.0.113.4 to 203.0.113.5.',
       },
       {
         at: Date.now() - 3 * 3600000,
@@ -387,6 +387,7 @@
   let stateReads = 0;
   window.previewApi = {
     get_state: async () => {
+      if (query.get('switch') === 'lost-busy') await later(2500);
       if (query.get('slow') === '1' && stateReads++ === 0) await later(8000);
       if (query.get('fail') === '1') throw Error('RPC error: Object not found');
       return level === 'unsupported'
@@ -413,12 +414,20 @@
     },
     select_tunnel: async ({ section_id, expected_revision }) => {
       if (expected_revision !== state.revision) throw Error('State changed. Refresh first.');
+      if (query.get('switch') === 'rejected') throw Error('Selection was rejected.');
       const t = state.tunnels.find((t) => t.id === section_id);
       if (!t || !t.selectable) throw Error(t ? t.selectReason : 'Unknown tunnel.');
       if (!t.preferred) {
         state.tunnels.forEach((t) => (t.preferred = t.id === section_id));
         state.revision = String(++revision);
       }
+      if (query.get('switch') === 'lost-renamed') {
+        t.id += '-renamed';
+        names[t.id] = t.name;
+      }
+      if (query.get('switch') === 'lost-busy') await later(6000);
+      if (['lost', 'lost-busy', 'lost-renamed'].includes(query.get('switch')))
+        throw Error('The response was lost.');
       return delay({ applied: true });
     },
     set_tunnel_enabled: async ({ section_id, enabled, expected_revision }) => {

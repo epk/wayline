@@ -233,7 +233,7 @@ pub fn bus<T: DeserializeOwned>(object: &str, method: &str, params: &Value) -> R
 
 pub fn call<T: DeserializeOwned>(method: &str, params: &Value) -> Result<T> {
     let params = json!({"module":"vpn-client","func":method,"params":params}).to_string();
-    let (timeout, deadline) = if method == "set_tunnel" {
+    let (timeout, deadline) = if matches!(method, "set_tunnel" | "order_tunnel") {
         ("30", 35)
     } else {
         ("3", 4)

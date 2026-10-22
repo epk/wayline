@@ -1,4 +1,5 @@
 use crate::{
+    egress::Cache,
     history,
     router::{Inventory, PathInfo},
     runtime::{directory, load, locked, now, store},
@@ -27,7 +28,16 @@ pub struct Fact<'a> {
 }
 
 pub fn read(config: &Settings) -> Vec<Event> {
-    load(history::database(config).with_file_name("events.json"))
+    let mut events: Vec<Event> = load(history::database(config).with_file_name("events.json"));
+    for event in &mut events {
+        if event.kind == "server" {
+            event.text =
+                event
+                    .text
+                    .replacen("Server address changed", "VPN server endpoint changed", 1);
+        }
+    }
+    events
 }
 
 fn fact<'a, const N: usize>(
@@ -46,8 +56,8 @@ fn fact<'a, const N: usize>(
 
 fn tunnel_facts(path: &PathInfo) -> impl Iterator<Item = Fact<'_>> {
     let tunnel = fact(
-        format!("tunnel:{}", path.id),
-        &path.id,
+        format!("tunnel:{}", path.key),
+        &path.key,
         "Tunnel",
         [
             ("interface", path.interface.clone()),
@@ -57,9 +67,9 @@ fn tunnel_facts(path: &PathInfo) -> impl Iterator<Item = Fact<'_>> {
     );
     let server = path.endpoint.as_ref().map(|server| {
         fact(
-            format!("server:{}", path.id),
-            &path.id,
-            "Server",
+            format!("server:{}", path.key),
+            &path.key,
+            "VPN server",
             [("server", server.to_string())],
         )
     });
@@ -102,7 +112,9 @@ fn facts(inventory: &Inventory) -> Vec<Fact<'_>> {
 fn describe(label: &str, field: &str, before: &str, after: &str) -> String {
     match field {
         "uplink" => format!("{label} moved from {before} to {after}."),
-        "server" | "address" => format!("{label} address changed from {before} to {after}."),
+        "server" => format!("{label} endpoint changed from {before} to {after}."),
+        "egress" => format!("{label} public exit IP changed from {before} to {after}."),
+        "address" => format!("{label} address changed from {before} to {after}."),
         _ => format!("{label} {field} changed from {before} to {after}."),
     }
 }
@@ -147,7 +159,24 @@ fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
     let facts_path = database.with_file_name("facts.json");
     directory(facts_path.parent().context("Invalid history directory.")?)?;
     let mut stored: BTreeMap<String, String> = load(&facts_path);
-    let (added, changed) = diff(now() * 1000, &mut stored, &facts(inventory));
+    let cache = Cache::view(config, inventory);
+    let mut current = facts(inventory);
+    current.extend(cache.paths.iter().filter_map(|path| {
+        let ip = path.ip.as_ref()?;
+        let key = &inventory
+            .paths
+            .iter()
+            .chain(inventory.wan.iter())
+            .find(|item| item.id == path.id)?
+            .key;
+        Some(fact(
+            format!("egress:{key}"),
+            key,
+            &path.name,
+            [("egress", ip.clone())],
+        ))
+    }));
+    let (added, changed) = diff(now() * 1000, &mut stored, &current);
     if changed {
         store(&facts_path, &stored)?;
     }
@@ -176,7 +205,7 @@ mod tests {
         vec![fact(
             "server:a".into(),
             "a",
-            "Server",
+            "VPN server",
             [("server", address.into())],
         )]
     }
@@ -190,7 +219,7 @@ mod tests {
         ensure!(changed && events.len() == 1, "Expected one server event.");
         ensure!(events[0].kind == "server" && events[0].subject == "a");
         ensure!(
-            events[0].text == "Server address changed from 184.147.43.41 to 184.147.43.99.",
+            events[0].text == "VPN server endpoint changed from 184.147.43.41 to 184.147.43.99.",
             "Unexpected text: {}",
             events[0].text
         );
@@ -198,6 +227,21 @@ mod tests {
         ensure!(
             events.is_empty() && !changed,
             "An unchanged fact is silent."
+        );
+        let exit = |ip: &str| {
+            vec![fact(
+                "egress:a".into(),
+                "a",
+                "Tunnel A",
+                [("egress", ip.into())],
+            )]
+        };
+        ensure!(diff(4, &mut stored, &exit("203.0.113.1")).0.is_empty());
+        ensure!(diff(5, &mut stored, &[]).0.is_empty());
+        let (events, _) = diff(6, &mut stored, &exit("203.0.113.2"));
+        ensure!(events.len() == 1 && events[0].kind == "egress");
+        ensure!(
+            events[0].text == "Tunnel A public exit IP changed from 203.0.113.1 to 203.0.113.2."
         );
         Ok(())
     }

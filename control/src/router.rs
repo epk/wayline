@@ -141,6 +141,15 @@ impl Rule {
             .rest
             .iter()
             .filter(|(key, _)| !IGNORED.contains(&key.as_str()))
+            .filter(|(key, value)| {
+                let default = match key.as_str() {
+                    "killswitch" | "local_access" | "service_policy" => Some("0"),
+                    "masq" => Some("1"),
+                    "from_type" | "to_type" => Some("default"),
+                    _ => None,
+                };
+                default.is_none_or(|default| value.as_str() != Some(default))
+            })
             .map(|(key, value)| (key.as_str(), value))
             .collect();
         fields
@@ -225,6 +234,22 @@ impl Inventory {
 
     pub fn has_path(&self, id: &str) -> bool {
         self.paths.iter().any(|path| path.id == id)
+    }
+
+    pub fn same_traffic_rules(&self, after: &Self) -> bool {
+        self.rules.len() == after.rules.len()
+            && self.rules.iter().all(|(id, before)| {
+                after
+                    .rules
+                    .iter()
+                    .find(|(after_id, after)| {
+                        before.tunnel_id.as_ref().map_or_else(
+                            || id == after_id,
+                            |number| after.tunnel_id.as_ref() == Some(number),
+                        )
+                    })
+                    .is_some_and(|(_, after)| before.signature() == after.signature())
+            })
     }
 }
 
@@ -682,7 +707,7 @@ pub fn native_order<'a>(native: &'a List, inventory: &Inventory) -> Result<Vec<&
         "The tunnel group is not eligible."
     );
     unambiguous(native)?;
-    let mut signature = None;
+    let mut signature: Option<BTreeMap<&str, &Value>> = None;
     for tunnel in &native.tunnels {
         consistent(tunnel, inventory)?;
         let fields = inventory
@@ -690,10 +715,17 @@ pub fn native_order<'a>(native: &'a List, inventory: &Inventory) -> Result<Vec<&
             .signature()
             .context("Unsupported rule fields prevent selection.")?;
         match &signature {
-            Some(previous) => ensure!(
-                &fields == previous,
-                "Different traffic rules prevent selection."
-            ),
+            Some(previous) => {
+                let different = previous
+                    .keys()
+                    .chain(fields.keys())
+                    .find(|key| previous.get(*key) != fields.get(*key));
+                ensure!(
+                    different.is_none(),
+                    "Different traffic rules prevent selection: {} differs.",
+                    different.unwrap_or(&"unknown")
+                );
+            }
             None => signature = Some(fields),
         }
     }
@@ -850,6 +882,11 @@ mod tests {
         let right: Rule =
             serde_json::from_str(r#"{"mark":"0x2000","killswitch":"1","from":["client-a"]}"#)?;
         assert_eq!(left.signature(), right.signature());
+        let omitted: Rule = serde_json::from_str(r#"{"mark":"0x1000","from":["client-a"]}"#)?;
+        let defaults: Rule = serde_json::from_str(
+            r#"{"killswitch":"0","masq":"1","local_access":"0","service_policy":"0","from":["client-a"]}"#,
+        )?;
+        assert_eq!(omitted.signature(), defaults.signature());
         for changed in [
             r#"{"mark":"0x2000","killswitch":"0","from":["client-a"]}"#,
             r#"{"mark":"0x2000","killswitch":"1","from":["client-b"]}"#,
