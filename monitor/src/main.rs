@@ -8,19 +8,15 @@ mod probe;
 mod route;
 
 use probe::Probe;
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::event::{self, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
-use std::{
-    fmt::Write as _,
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
-    os::unix::{
-        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-        net::{UnixListener, UnixStream},
-    },
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::fmt::Write as _;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use wayline_protocol::{Config, MAX_STATUS, Status};
 
 const MAX_CLIENTS: usize = 4;
@@ -108,17 +104,17 @@ struct Client {
     deadline: Instant,
 }
 
-struct Monitor<'a> {
-    config: &'a Config,
-    probes: Vec<Probe<'a>>,
+struct Monitor<'config> {
+    config: &'config Config,
+    probes: Vec<Probe<'config>>,
     started: Instant,
     nonce: [u8; 16],
     run_id: String,
     reply_hint: usize,
 }
 
-impl<'a> Monitor<'a> {
-    fn new(config: &'a Config) -> io::Result<Self> {
+impl<'config> Monitor<'config> {
+    fn try_new(config: &'config Config) -> io::Result<Self> {
         let started = Instant::now();
         let interval = Duration::from_millis(config.interval_ms);
         let timeout = Duration::from_millis(config.timeout_ms);
@@ -286,7 +282,7 @@ fn wait_ready(
         tv_sec: i64::try_from(wait.as_secs()).unwrap_or(i64::MAX),
         tv_nsec: i64::from(wait.subsec_nanos()),
     };
-    match poll(&mut fds, Some(&timeout)) {
+    match event::poll(&mut fds, Some(&timeout)) {
         Ok(_) => (),
         Err(Errno::INTR) => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
@@ -326,8 +322,8 @@ fn accept_clients(endpoint: &Endpoint, clients: &mut Vec<Client>, now: Instant) 
 
 fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>) -> io::Result<()> {
     let endpoint = Endpoint::bind(socket_path)?;
-    let routes = route::RouteLookup::new()?;
-    let mut monitor = Monitor::new(config)?;
+    let routes = route::RouteLookup::try_new()?;
+    let mut monitor = Monitor::try_new(config)?;
     let stop_at = run_for.map(|duration| monitor.started + duration);
     let mut clients: Vec<Client> = Vec::with_capacity(MAX_CLIENTS);
     let mut sequence = 0_u64;

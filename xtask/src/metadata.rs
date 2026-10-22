@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use cargo_metadata::{Metadata, MetadataCommand};
-use std::{fs, io::Write};
+use std::fs;
+use std::io::Write;
 use xshell::{Shell, cmd};
 
 pub fn workspace() -> Result<Metadata> {

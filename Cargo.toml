@@ -23,6 +23,8 @@ tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+unstable_features = "forbid"
+unused_must_use = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
@@ -33,6 +35,8 @@ expect_used = "deny"
 panic = "deny"
 todo = "deny"
 unimplemented = "deny"
+allow_attributes_without_reason = "deny"
+disallowed_methods = "deny"
 
 [profile.release]
 opt-level = "s"

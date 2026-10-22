@@ -1,8 +1,11 @@
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{fs, path::Path, sync::OnceLock};
-use wayline_support::{FIRMWARE_CONTRACT, digest, read, text};
+use std::fs;
+use std::path::Path;
+use std::sync::OnceLock;
+use wayline_support::FIRMWARE_CONTRACT;
 
 pub const MAX_TUNNELS: usize = 8;
 
@@ -174,9 +177,9 @@ fn decide(firmware: &str, digest: Option<&str>) -> (Level, bool, String) {
 fn assess() -> Compat {
     let firmware = fs::read_to_string("/etc/glversion").unwrap_or_default();
     let firmware = firmware.trim();
-    let digest = read(Path::new(VPN_MODULE), 131_072)
+    let digest = wayline_support::read(Path::new(VPN_MODULE), 131_072)
         .ok()
-        .map(|data| digest(&data));
+        .map(|data| wayline_support::digest(&data));
     let (level, verified, message) = decide(firmware, digest.as_deref());
     Compat {
         features: features(level),
@@ -216,7 +219,7 @@ pub fn supported() -> bool {
 
 pub fn bus<T: DeserializeOwned>(object: &str, method: &str, params: &Value) -> Result<T> {
     let encoded = serde_json::to_string(params)?;
-    let reply = text(
+    let reply = wayline_support::text(
         "ubus",
         &["-t", "3", "call", object, method, &encoded],
         262_144,
@@ -238,7 +241,7 @@ pub fn call<T: DeserializeOwned>(method: &str, params: &Value) -> Result<T> {
     } else {
         ("3", 4)
     };
-    let reply: Reply<T> = serde_json::from_str(&text(
+    let reply: Reply<T> = serde_json::from_str(&wayline_support::text(
         "ubus",
         &["-t", timeout, "call", "gl-session", "call", &params],
         262_144,

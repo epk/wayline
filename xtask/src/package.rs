@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, ensure};
-use flate2::{Compression, write::GzEncoder};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use serde_json::json;
-use std::{fs, io::Write, path::Path};
+use std::fs;
+use std::io::Write;
+use std::path::Path;
 use tar::{Builder, EntryType, Header};
 use walkdir::WalkDir;
-use wayline_support::digest;
 use xshell::{Shell, cmd};
 
 pub fn rpc_object(version: &str) -> String {
@@ -120,10 +122,9 @@ fn wrap_bundle(bundle: &[u8]) -> Result<Vec<u8>> {
     let mut file = tempfile::NamedTempFile::new()?;
     file.write_all(&wrapped)?;
     let path = file.path().to_str().context("Invalid bundle path.")?;
-    let (success, output) =
-        wayline_support::output_status("node", &["-e", LOADER_CHECK, path], 65536, 20)?;
+    let output = wayline_support::output_status("node", &["-e", LOADER_CHECK, path], 65536, 20)?;
     ensure!(
-        success && String::from_utf8_lossy(&output).trim() == "ok",
+        output.success && String::from_utf8_lossy(&output.bytes).trim() == "ok",
         "The UI bundle does not evaluate to a Wayline component, so the page would stay empty. Rebuild the UI bundle."
     );
     Ok(wrapped)
@@ -271,7 +272,7 @@ pub fn release(version: &str) -> Result<()> {
     let bytes = fs::read(Path::new("dist").join(&name))?;
     let manifest = json!({"schema":1,"repository":"epk/wayline","package":"wayline","version":version,
         "firmware_contracts":[wayline_support::FIRMWARE_CONTRACT],
-        "artifacts":[{"name":name,"architecture":"aarch64_cortex-a53","bytes":bytes.len(),"sha256":digest(&bytes)}]});
+        "artifacts":[{"name":name,"architecture":"aarch64_cortex-a53","bytes":bytes.len(),"sha256":wayline_support::digest(&bytes)}]});
     fs::write("dist/manifest.json", serde_json::to_vec_pretty(&manifest)?)?;
     let mut key = tempfile::NamedTempFile::new()?;
     let secret = std::env::var("RELEASE_SIGNING_KEY")

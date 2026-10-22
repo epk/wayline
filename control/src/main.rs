@@ -15,7 +15,8 @@ mod settings;
 mod update;
 
 use anyhow::{Context, Result, ensure};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -59,8 +60,8 @@ fn run() -> Result<Value> {
         "tick" => applied(service::tick()),
         "restart" => applied(service::restart()),
         "boot" | "start" | "reload" | "reconcile" => applied(service::reconcile()),
-        "install" | "enable" => applied(service::lifecycle(true)),
-        "remove" | "disable" => applied(service::lifecycle(false)),
+        "install" | "enable" => applied(service::lifecycle(service::Lifecycle::Enable)),
+        "remove" | "disable" => applied(service::lifecycle(service::Lifecycle::Disable)),
         "stop" => applied(service::stop()),
         "running" | "status" => applied(service::running()),
         "enabled" => applied(service::enabled()),
@@ -92,7 +93,14 @@ fn human(command: &str, option: Option<&str>) -> Option<Result<bool>> {
         ("update-job", None) => Some(privileged().and_then(|()| update::job()).map(|()| true)),
         ("update", None | Some("--check")) => Some(
             privileged()
-                .and_then(|()| update::run_now(option.is_none()))
+                .and_then(|()| {
+                    let operation = if option.is_none() {
+                        update::Operation::Install
+                    } else {
+                        update::Operation::Check
+                    };
+                    update::run_now(operation)
+                })
                 .map(|status| {
                     println!("{}", status.message());
                     true

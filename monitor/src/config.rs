@@ -1,5 +1,8 @@
+use std::error::Error;
+use std::fs::File;
+use std::io::Read;
 use std::net::Ipv4Addr;
-use std::{error::Error, fs::File, io::Read, path::Path};
+use std::path::Path;
 use wayline_protocol::{Config, MAX_SERIES};
 
 const MAX_CONFIG: usize = 32 * 1024;

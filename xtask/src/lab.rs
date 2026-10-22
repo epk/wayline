@@ -1,16 +1,14 @@
 use crate::stop_child;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::{
-    fs,
-    io::Read,
-    os::unix::{fs::PermissionsExt, net::UnixStream},
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
-use wayline_support::{atomic, digest, input, output, text};
+use std::fs;
+use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use xshell::{Shell, cmd};
 
 const PROFILE: &str = "wayline-lab";
@@ -51,7 +49,7 @@ pub fn start() -> Result<()> {
 pub fn inside() -> Result<()> {
     ensure!(cfg!(target_os = "linux"), "The closed lab requires Linux.");
     ensure!(
-        text("id", &["-u"], 64, 1)?.trim() == "0",
+        wayline_support::text("id", &["-u"], 64, 1)?.trim() == "0",
         "The isolated namespace lab requires root access."
     );
     let root = std::env::var("WAYLINE_ROOT").unwrap_or_else(|_| ".".into());
@@ -174,9 +172,9 @@ fn policy(sh: &Shell, index: u32) -> Result<()> {
 }
 
 fn key(name: &str) -> Result<String> {
-    let private = output("wg", &["genkey"], 128, 2)?;
-    let public = input("wg", &["pubkey"], &private, 128, 2)?;
-    atomic(&Path::new("/run/wayline-lab/keys").join(name), &private)?;
+    let private = wayline_support::output("wg", &["genkey"], 128, 2)?;
+    let public = wayline_support::input("wg", &["pubkey"], &private, 128, 2)?;
+    wayline_support::atomic(&Path::new("/run/wayline-lab/keys").join(name), &private)?;
     Ok(String::from_utf8(public)?.trim().into())
 }
 
@@ -187,7 +185,7 @@ fn monitor() -> Result<PathBuf> {
 }
 
 fn routes() -> Result<String> {
-    text(
+    wayline_support::text(
         "ip",
         &["-n", "router", "-j", "route", "show", "table", "all"],
         65_536,
@@ -335,11 +333,11 @@ fn failures(child: &mut Child) -> Result<()> {
     fs::create_dir_all(output)?;
     results.insert(
         "binary_sha256".into(),
-        json!(digest(&fs::read(monitor()?)?)),
+        json!(wayline_support::digest(&fs::read(monitor()?)?)),
     );
     results.insert(
         "kernel".into(),
-        json!(text("uname", &["-r"], 128, 2)?.trim()),
+        json!(wayline_support::text("uname", &["-r"], 128, 2)?.trim()),
     );
     fs::write(
         output.join("scenarios.json"),
@@ -364,7 +362,7 @@ fn rejection_checks() -> Result<()> {
             serde_json::to_vec(&config)?,
         )?;
         ensure!(
-            text(
+            wayline_support::text(
                 binary,
                 &[
                     "monitor",
@@ -383,7 +381,7 @@ fn rejection_checks() -> Result<()> {
         );
     }
     ensure!(
-        text(
+        wayline_support::text(
             binary,
             &[
                 "monitor",
@@ -402,7 +400,7 @@ fn rejection_checks() -> Result<()> {
     );
     fs::write("/run/wayline/ordinary.sock", b"preserve")?;
     ensure!(
-        text(
+        wayline_support::text(
             binary,
             &[
                 "monitor",
@@ -477,7 +475,7 @@ fn route_failures(results: &mut serde_json::Map<String, Value>) -> Result<()> {
 }
 
 fn cpu_percent(start: &Value, end: &Value, seconds: f64) -> Result<f64> {
-    let ticks = text("getconf", &["CLK_TCK"], 32, 2)?
+    let ticks = wayline_support::text("getconf", &["CLK_TCK"], 32, 2)?
         .trim()
         .parse::<f64>()?;
     Ok(
@@ -492,7 +490,7 @@ fn status(since: u64) -> Result<Value> {
     let binary = monitor()?;
     let binary = binary.to_str().context("Invalid monitor path.")?;
     let since = since.to_string();
-    let data = text(
+    let data = wayline_support::text(
         binary,
         &[
             "status",

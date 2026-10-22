@@ -1,21 +1,17 @@
-use crate::{
-    native::{self, List, MAX_TUNNELS},
-    resolve::Resolved,
-    runtime::SETTINGS,
-    settings::{self, Settings, Target},
-};
+use crate::native::{self, List, MAX_TUNNELS};
+use crate::resolve::Resolved;
+use crate::runtime::SETTINGS;
+use crate::settings::{self, Settings, Target};
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, de::IgnoredAny};
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 use serde_json::{Map, Value, json};
-use std::{
-    cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashSet},
-    net::Ipv4Addr,
-    path::Path,
-    sync::Arc,
-};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::net::Ipv4Addr;
+use std::path::Path;
+use std::sync::Arc;
 use wayline_protocol::{Config, MAX_SERIES, Tunnel};
-use wayline_support::{digest, read, text};
 
 const VPN_PROTOCOLS: [&str; 4] = ["wgclient", "ovpnclient", "wireguard", "openvpn"];
 const NO_PEER: &str = "The tunnel has no active WireGuard peer endpoint yet.";
@@ -34,7 +30,16 @@ const IGNORED: [&str; 8] = [
     "mark",
 ];
 
-type Found = (PathInfo, bool);
+struct Found {
+    path: PathInfo,
+    wireguard: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Endpoints {
+    Include,
+    Omit,
+}
 
 thread_local! {
     static CACHE: RefCell<Option<Inventory>> = const { RefCell::new(None) };
@@ -198,7 +203,7 @@ impl PathInfo {
 }
 
 fn digest_prefix(seed: &str) -> String {
-    digest(seed.as_bytes())[..48].to_owned()
+    wayline_support::digest(seed.as_bytes())[..48].to_owned()
 }
 
 pub fn tunnel_prefix(key: &str) -> String {
@@ -208,7 +213,7 @@ pub fn tunnel_prefix(key: &str) -> String {
 pub fn series_id(prefix: &str, target: &Target) -> String {
     let label = match target {
         Target::Address(address) => address.to_string().replace('.', "_"),
-        Target::Host(host) => digest(host.as_bytes())[..14].to_owned(),
+        Target::Host(host) => wayline_support::digest(host.as_bytes())[..14].to_owned(),
     };
     format!("{prefix}_{label}")
 }
@@ -389,26 +394,34 @@ fn native_tunnels(
         let wireguard =
             rule.via_type.as_deref() == Some("wireguard") || interface.proto == Some("wgclient");
         if let Some(item) = path((id, &key, label), name, network, interfaces) {
-            found.push((item, wireguard));
+            found.push(Found {
+                path: item,
+                wireguard,
+            });
         }
     }
     ensure!(tunnels.len() <= MAX_TUNNELS, TOO_MANY);
     Ok((tunnels, found))
 }
 
-fn with_endpoints(found: Vec<Found>, wanted: bool) -> Vec<PathInfo> {
-    let listing = (wanted && found.iter().any(|(_, wireguard)| *wireguard))
-        .then(|| text("wg", &["show", "all", "endpoints"], 16_384, 2));
+fn with_endpoints(found: Vec<Found>, endpoints: Endpoints) -> Vec<PathInfo> {
+    let listing = (endpoints == Endpoints::Include && found.iter().any(|item| item.wireguard))
+        .then(|| wayline_support::text("wg", &["show", "all", "endpoints"], 16_384, 2));
     found
         .into_iter()
-        .map(|(mut path, wireguard)| {
-            (path.endpoint, path.endpoint_reason) = match (wireguard, &listing) {
-                (false, _) => (None, OPENVPN.into()),
-                (true, None) => (None, String::new()),
-                (true, Some(listing)) => endpoint(listing, &path.interface),
-            };
-            path
-        })
+        .map(
+            |Found {
+                 mut path,
+                 wireguard,
+             }| {
+                (path.endpoint, path.endpoint_reason) = match (wireguard, &listing) {
+                    (false, _) => (None, OPENVPN.into()),
+                    (true, None) => (None, String::new()),
+                    (true, Some(listing)) => endpoint(listing, &path.interface),
+                };
+                path
+            },
+        )
         .collect()
 }
 
@@ -455,7 +468,7 @@ fn direct(uplink: &PathInfo) -> PathInfo {
     }
 }
 
-fn discover(endpoints: bool) -> Result<Inventory> {
+fn discover(endpoints: Endpoints) -> Result<Inventory> {
     let network = uci("network")?;
     let mut rules = uci("route_policy")?
         .into_iter()
@@ -495,15 +508,15 @@ fn discover(endpoints: bool) -> Result<Inventory> {
 }
 
 pub fn inventory() -> Result<Inventory> {
-    inventory_with(true)
+    inventory_with(Endpoints::Include)
 }
 
-pub fn inventory_with(endpoints: bool) -> Result<Inventory> {
+pub fn inventory_with(endpoints: Endpoints) -> Result<Inventory> {
     if let Some(cached) = CACHE.with_borrow(Clone::clone) {
         return Ok(cached);
     }
     let fresh = discover(endpoints)?;
-    if endpoints {
+    if endpoints == Endpoints::Include {
         CACHE.set(Some(fresh.clone()));
     }
     Ok(fresh)
@@ -514,11 +527,11 @@ pub fn forget() {
 }
 
 pub fn normalize(settings: &mut Settings, inventory: &Inventory) {
-    for id in settings
+    let ids = settings
         .tunnels
         .iter_mut()
-        .chain(&mut settings.auto_tunnels)
-    {
+        .chain(&mut settings.auto_tunnels);
+    for id in ids {
         if let Some(tunnel) = inventory.tunnels.iter().find(|item| item.id == *id) {
             id.clone_from(&tunnel.key);
         }
@@ -694,11 +707,11 @@ fn measurement(path: &PathInfo, id: String, address: Ipv4Addr) -> Tunnel {
 }
 
 pub fn revision() -> Result<String> {
-    let mut data = read(Path::new(SETTINGS), 32_768).unwrap_or_default();
+    let mut data = wayline_support::read(Path::new(SETTINGS), 32_768).unwrap_or_default();
     for path in ["/etc/config/route_policy", "/etc/config/network"] {
-        data.extend(read(Path::new(path), 131_072)?);
+        data.extend(wayline_support::read(Path::new(path), 131_072)?);
     }
-    Ok(digest(&data))
+    Ok(wayline_support::digest(&data))
 }
 
 pub fn native_order<'a>(native: &'a List, inventory: &Inventory) -> Result<Vec<&'a str>> {
@@ -753,10 +766,8 @@ mod tests {
         Inventory, PathInfo, Rule, TunnelInfo, check_capacity, endpoint, endpoint_series, mark,
         monitor, native_order, position, series_id,
     };
-    use crate::{
-        resolve::Resolved,
-        settings::{Settings, Target},
-    };
+    use crate::resolve::Resolved;
+    use crate::settings::{Settings, Target};
     use anyhow::Result;
     use std::net::Ipv4Addr;
 

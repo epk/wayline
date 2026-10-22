@@ -1,13 +1,13 @@
-use crate::{
-    egress::Cache,
-    history,
-    router::{Inventory, PathInfo},
-    runtime::{directory, load, locked, now, store},
-    settings::Settings,
-};
+use crate::egress::Cache;
+use crate::history;
+use crate::router::{Inventory, PathInfo};
+use crate::runtime;
+use crate::settings::Settings;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, iter, path::Path};
+use std::collections::BTreeMap;
+use std::iter;
+use std::path::Path;
 
 pub const RECENT: usize = 50;
 const MAX_EVENTS: usize = 100;
@@ -20,15 +20,16 @@ pub struct Event {
     pub text: String,
 }
 
-pub struct Fact<'a> {
+pub struct Fact<'subject> {
     key: String,
-    subject: &'a str,
-    label: &'a str,
+    subject: &'subject str,
+    label: &'subject str,
     fields: BTreeMap<&'static str, String>,
 }
 
 pub fn read(config: &Settings) -> Vec<Event> {
-    let mut events: Vec<Event> = load(history::database(config).with_file_name("events.json"));
+    let mut events: Vec<Event> =
+        runtime::load(history::database(config).with_file_name("events.json"));
     for event in &mut events {
         if event.kind == "server" {
             event.text =
@@ -151,14 +152,14 @@ pub fn diff(at: u64, stored: &mut BTreeMap<String, String>, facts: &[Fact]) -> (
 }
 
 pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
-    locked("history", || record_inner(config, inventory))
+    runtime::locked("history", || record_inner(config, inventory))
 }
 
 fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
     let database = history::database(config);
     let facts_path = database.with_file_name("facts.json");
-    directory(facts_path.parent().context("Invalid history directory.")?)?;
-    let mut stored: BTreeMap<String, String> = load(&facts_path);
+    runtime::directory(facts_path.parent().context("Invalid history directory.")?)?;
+    let mut stored: BTreeMap<String, String> = runtime::load(&facts_path);
     let cache = Cache::view(config, inventory);
     let mut current = facts(inventory);
     current.extend(cache.paths.iter().filter_map(|path| {
@@ -176,9 +177,9 @@ fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
             [("egress", ip.clone())],
         ))
     }));
-    let (added, changed) = diff(now() * 1000, &mut stored, &current);
+    let (added, changed) = diff(runtime::now() * 1000, &mut stored, &current);
     if changed {
-        store(&facts_path, &stored)?;
+        runtime::store(&facts_path, &stored)?;
     }
     if !added.is_empty() {
         append(&database, added)?;
@@ -188,11 +189,11 @@ fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
 
 pub fn append(database: &Path, added: impl IntoIterator<Item = Event>) -> Result<()> {
     let path = database.with_file_name("events.json");
-    let mut events: Vec<Event> = load(&path);
+    let mut events: Vec<Event> = runtime::load(&path);
     events.extend(added);
     let excess = events.len().saturating_sub(MAX_EVENTS);
     events.drain(..excess);
-    store(&path, &events)
+    runtime::store(&path, &events)
 }
 
 #[cfg(test)]

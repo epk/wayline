@@ -1,9 +1,7 @@
-use netlink_packet_core::{NLM_F_REQUEST, NetlinkBuffer, NlaBuffer, NlasIterator, parse_u32};
+use netlink_packet_core::{NLM_F_REQUEST, NetlinkBuffer, NlaBuffer, NlasIterator};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::{
-    io::{self, Read},
-    net::Ipv4Addr,
-};
+use std::io::{self, Read};
+use std::net::Ipv4Addr;
 
 const SIZE: usize = 60;
 const REPLY_READS: usize = 16;
@@ -27,7 +25,7 @@ struct Reply {
 }
 
 impl RouteLookup {
-    pub fn new() -> io::Result<Self> {
+    pub fn try_new() -> io::Result<Self> {
         let socket = Socket::new(Domain::from(16), Type::RAW, Some(Protocol::from(0)))?;
         socket.set_nonblocking(true)?;
         socket.set_recv_buffer_size(8192)?;
@@ -114,7 +112,7 @@ fn route_interface(message: &NetlinkBuffer<&[u8]>) -> Option<u32> {
             {
                 return None;
             }
-            interface = Some(parse_u32(attribute.value()).ok()?);
+            interface = Some(netlink_packet_core::parse_u32(attribute.value()).ok()?);
         }
     }
     interface

@@ -1,5 +1,6 @@
 use anyhow::{Result, ensure};
-use std::{fs, path::Path};
+use std::fs;
+use std::path::Path;
 use walkdir::WalkDir;
 use xshell::{Shell, cmd};
 

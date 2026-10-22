@@ -1,17 +1,14 @@
-use crate::{
-    router::{Inventory, PathInfo, monitored},
-    runtime::{RUNTIME, load, now, store},
-    settings::Settings,
-};
+use crate::router;
+use crate::router::{Inventory, PathInfo};
+use crate::runtime;
+use crate::runtime::RUNTIME;
+use crate::settings::Settings;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    convert::identity,
-    net::{IpAddr, Ipv4Addr},
-    time::Duration,
-};
-use wayline_support::within;
+use std::collections::HashMap;
+use std::convert;
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
 
 const LIMIT: Duration = Duration::from_secs(6);
 const MAX_AGE: u64 = 300;
@@ -29,7 +26,7 @@ impl Cache {
     }
 
     pub fn read() -> Self {
-        load(Self::path())
+        runtime::load(Self::path())
     }
 
     pub fn view(config: &Settings, inventory: &Inventory) -> Self {
@@ -53,14 +50,14 @@ impl Cache {
     pub fn refresh(config: &Settings, inventory: &Inventory) -> Result<()> {
         let cache = Self::read();
         let paths = scheduled_paths(config, inventory);
-        if now().saturating_sub(cache.checked_at) < MAX_AGE && cache.matches(&paths) {
+        if runtime::now().saturating_sub(cache.checked_at) < MAX_AGE && cache.matches(&paths) {
             return Ok(());
         }
         let fresh = Self {
-            checked_at: now(),
+            checked_at: runtime::now(),
             paths: probe_paths(&paths),
         };
-        store(Self::path(), &fresh)
+        runtime::store(Self::path(), &fresh)
     }
 }
 
@@ -68,7 +65,7 @@ pub fn scheduled_paths<'a>(config: &'a Settings, inventory: &'a Inventory) -> Ve
     if !config.enabled {
         return Vec::new();
     }
-    monitored(config, inventory)
+    router::monitored(config, inventory)
         .chain(inventory.wan.iter().filter(|_| config.direct_wan))
         .collect()
 }
@@ -107,7 +104,7 @@ fn probe_paths(paths: &[&PathInfo]) -> Vec<Egress> {
     });
     paths
         .iter()
-        .zip(within(LIMIT, jobs))
+        .zip(wayline_support::within(LIMIT, jobs))
         .map(|(path, outcome)| {
             let base = Egress {
                 id: path.id.clone(),
@@ -120,7 +117,7 @@ fn probe_paths(paths: &[&PathInfo]) -> Vec<Egress> {
             };
             match outcome
                 .context("The egress probe timed out.")
-                .and_then(identity)
+                .and_then(convert::identity)
             {
                 Ok(trace) => Egress {
                     ip: Some(trace.ip),
@@ -174,10 +171,8 @@ fn trace(interface: &str, source: Ipv4Addr, mark: u32) -> Result<Trace> {
 #[cfg(target_os = "linux")]
 fn fetch(interface: &str, source: Ipv4Addr, mark: u32) -> Result<Vec<u8>> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-    use std::{
-        io::{Read, Write},
-        net::{SocketAddrV4, TcpStream},
-    };
+    use std::io::{Read, Write};
+    use std::net::{SocketAddrV4, TcpStream};
 
     const TARGET: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 80);
     const STEP: Duration = Duration::from_secs(4);

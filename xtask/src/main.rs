@@ -7,7 +7,9 @@ mod package;
 mod quality;
 
 use anyhow::{Context, Result};
-use std::{fs, path::Path, process::Child};
+use std::fs;
+use std::path::Path;
+use std::process::Child;
 use xshell::{Shell, cmd};
 
 fn stop_child(child: &mut Child) {

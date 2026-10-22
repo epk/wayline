@@ -1,15 +1,11 @@
-use crate::{
-    runtime::{RUNTIME, load, now, store},
-    settings::Target,
-};
+use crate::runtime;
+use crate::runtime::RUNTIME;
+use crate::settings::Target;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    net::{IpAddr, Ipv4Addr, ToSocketAddrs},
-    time::Duration,
-};
-use wayline_support::within;
+use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::time::Duration;
 
 const DEADLINE: Duration = Duration::from_secs(4);
 const MAX_AGE: u64 = 300;
@@ -26,7 +22,7 @@ impl Resolved {
     }
 
     pub fn read() -> Self {
-        load(Self::path())
+        runtime::load(Self::path())
     }
 
     pub fn host(&self, host: &str) -> Option<Ipv4Addr> {
@@ -42,7 +38,7 @@ impl Resolved {
 
     pub fn stale(&self, hosts: &[String]) -> bool {
         !hosts.is_empty()
-            && (now().saturating_sub(self.at) >= MAX_AGE
+            && (runtime::now().saturating_sub(self.at) >= MAX_AGE
                 || hosts.iter().any(|host| !self.hosts.contains_key(host)))
     }
 
@@ -62,12 +58,15 @@ impl Resolved {
             }
         });
         self.hosts.retain(|host, _| hosts.contains(host));
-        for (host, found) in within(DEADLINE, jobs).into_iter().flatten() {
+        let resolved = wayline_support::within(DEADLINE, jobs)
+            .into_iter()
+            .flatten();
+        for (host, found) in resolved {
             if !found.is_empty() || !self.hosts.contains_key(&host) {
                 self.hosts.insert(host, found);
             }
         }
-        self.at = now();
-        store(Self::path(), self)
+        self.at = runtime::now();
+        runtime::store(Self::path(), self)
     }
 }

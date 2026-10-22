@@ -1,16 +1,12 @@
-use crate::{
-    runtime::{RUNTIME, load, locked, now, store, version},
-    settings::Settings,
-};
+use crate::runtime;
+use crate::runtime::RUNTIME;
+use crate::settings::Settings;
 use anyhow::{Context, Result, ensure};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-};
-use wayline_support::{atomic, digest, read, text};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 const RELEASES: &str = "https://api.github.com/repos/epk/wayline/releases?per_page=30";
 const STALE_AFTER: u64 = 240;
@@ -84,7 +80,7 @@ pub struct Status {
 
 impl Status {
     pub fn read() -> Option<Self> {
-        load(Self::path())
+        runtime::load(Self::path())
     }
 
     pub fn message(&self) -> &str {
@@ -96,12 +92,12 @@ impl Status {
     }
 
     fn write(&self) -> Result<()> {
-        store(Self::path(), self)
+        runtime::store(Self::path(), self)
     }
 
     fn working(previous: Option<&Self>, phase: Phase, message: &str) -> Self {
         Self {
-            current: version(),
+            current: runtime::version(),
             latest: previous.and_then(|status| status.latest.clone()),
             available: previous.is_some_and(|status| status.available),
             phase,
@@ -109,14 +105,14 @@ impl Status {
             failed: false,
             needs_attention: previous.is_some_and(|status| status.needs_attention),
             checked_at: previous.map_or(0, |status| status.checked_at),
-            updated_at: now(),
+            updated_at: runtime::now(),
         }
     }
 
     fn finished(message: String, latest: String, available: bool, phase: Phase) -> Self {
-        let at = now();
+        let at = runtime::now();
         Self {
-            current: version(),
+            current: runtime::version(),
             latest: Some(latest),
             available,
             phase,
@@ -130,9 +126,9 @@ impl Status {
 
     fn stopped(error: &anyhow::Error) -> Self {
         let previous = Self::read().unwrap_or_default();
-        let at = now();
+        let at = runtime::now();
         Self {
-            current: version(),
+            current: runtime::version(),
             latest: previous.latest,
             available: previous.available,
             phase: Phase::Failed,
@@ -163,10 +159,10 @@ fn effective(mut status: Status, at: u64) -> Status {
 pub fn view() -> Status {
     effective(
         Status::read().unwrap_or_else(|| Status {
-            current: version(),
+            current: runtime::version(),
             ..Status::default()
         }),
-        now(),
+        runtime::now(),
     )
 }
 
@@ -175,7 +171,7 @@ fn download(url: &str, path: &Path, limit: u64) -> Result<()> {
         url == RELEASES || url.starts_with("https://github.com/epk/wayline/releases/download/v"),
         "Invalid release URL."
     );
-    let status = text(
+    let status = wayline_support::text(
         "curl",
         &[
             "--silent",
@@ -223,8 +219,8 @@ fn newest(releases: &[Release]) -> Option<Version> {
 fn newer(folder: &Path) -> Result<Option<Version>> {
     let path = folder.join("releases.json");
     download(RELEASES, &path, 262_144)?;
-    let releases: Vec<Release> = serde_json::from_slice(&read(&path, 262_144)?)?;
-    let installed = Version::parse(&version())?;
+    let releases: Vec<Release> = serde_json::from_slice(&wayline_support::read(&path, 262_144)?)?;
+    let installed = Version::parse(&runtime::version())?;
     Ok(newest(&releases).filter(|latest| *latest > installed))
 }
 
@@ -235,7 +231,7 @@ fn metadata(folder: &Path, latest: &Version) -> Result<(Manifest, Artifact, Stri
     let signature = folder.join("manifest.json.sig");
     download(&format!("{prefix}manifest.json"), &manifest, 16_384)?;
     download(&format!("{prefix}manifest.json.sig"), &signature, 1024)?;
-    text(
+    wayline_support::text(
         "usign",
         &[
             "-V",
@@ -249,7 +245,7 @@ fn metadata(folder: &Path, latest: &Version) -> Result<(Manifest, Artifact, Stri
         1024,
         5,
     )?;
-    let mut data: Manifest = serde_json::from_slice(&read(&manifest, 16_384)?)?;
+    let mut data: Manifest = serde_json::from_slice(&wayline_support::read(&manifest, 16_384)?)?;
     ensure!(
         data.schema == 1
             && data.repository == "epk/wayline"
@@ -274,7 +270,7 @@ fn metadata(folder: &Path, latest: &Version) -> Result<(Manifest, Artifact, Stri
             && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "The release artifact is invalid."
     );
-    let architectures = text("opkg", &["print-architecture"], 8192, 5)?;
+    let architectures = wayline_support::text("opkg", &["print-architecture"], 8192, 5)?;
     ensure!(
         architectures
             .lines()
@@ -284,22 +280,28 @@ fn metadata(folder: &Path, latest: &Version) -> Result<(Manifest, Artifact, Stri
     Ok((data, artifact, prefix))
 }
 
-fn execute(install: bool, report: &dyn Fn(Phase, &str) -> Result<()>) -> Result<Status> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+    Check,
+    Install,
+}
+
+fn execute(operation: Operation, report: &dyn Fn(Phase, &str) -> Result<()>) -> Result<Status> {
     report(Phase::Checking, "Checking for a newer release…")?;
     let folder = tempfile::tempdir_in(RUNTIME)?;
     let Some(latest) = newer(folder.path())? else {
         return Ok(Status::finished(
             "Wayline is up to date.".into(),
-            version(),
+            runtime::version(),
             false,
             Phase::Idle,
         ));
     };
-    if install {
+    if operation == Operation::Install {
         report(Phase::Downloading, "Downloading the signed update.")?;
     }
     let (manifest, artifact, prefix) = metadata(folder.path(), &latest)?;
-    if !install {
+    if operation == Operation::Check {
         let message = format!("Version {} is available.", manifest.version);
         return Ok(Status::finished(
             message,
@@ -317,17 +319,18 @@ fn execute(install: bool, report: &dyn Fn(Phase, &str) -> Result<()>) -> Result<
         artifact.bytes,
     )?;
     report(Phase::Verifying, "Verifying the signed package.")?;
-    let bytes = read(&package, 4_194_304)?;
+    let bytes = wayline_support::read(&package, 4_194_304)?;
     ensure!(
-        u64::try_from(bytes.len())? == artifact.bytes && digest(&bytes) == artifact.sha256,
+        u64::try_from(bytes.len())? == artifact.bytes
+            && wayline_support::digest(&bytes) == artifact.sha256,
         "The release size or digest does not match."
     );
     let path = package.to_str().context("Invalid package path.")?;
-    text("opkg", &["--noaction", "install", path], 16_384, 30)?;
+    wayline_support::text("opkg", &["--noaction", "install", path], 16_384, 30)?;
     report(Phase::Installing, "Installing the signed update.")?;
-    text("opkg", &["install", path], 32_768, 120)?;
+    wayline_support::text("opkg", &["install", path], 32_768, 120)?;
     ensure!(
-        version() == manifest.version,
+        runtime::version() == manifest.version,
         "The installed version needs checking. Do not retry automatically."
     );
     let message = format!("Updated to {}.", manifest.version);
@@ -339,11 +342,11 @@ fn execute(install: bool, report: &dyn Fn(Phase, &str) -> Result<()>) -> Result<
     ))
 }
 
-fn attempt(install: bool, previous: Option<&Status>) -> Result<Status> {
+fn attempt(operation: Operation, previous: Option<&Status>) -> Result<Status> {
     let status = if settled(previous) {
         let report =
             |phase: Phase, message: &str| Status::working(previous, phase, message).write();
-        execute(install, &report).unwrap_or_else(|error| Status::stopped(&error))
+        execute(operation, &report).unwrap_or_else(|error| Status::stopped(&error))
     } else {
         Status::stopped(&anyhow::anyhow!("A previous installation needs checking."))
     };
@@ -369,14 +372,14 @@ fn request_path() -> PathBuf {
 }
 
 fn idle() -> bool {
-    locked("update", || Ok(())).is_ok()
+    runtime::locked("update", || Ok(())).is_ok()
 }
 
 pub fn start(method: &str) -> Result<bool> {
     if !idle() {
         return Ok(false);
     }
-    atomic(&request_path(), method.as_bytes())?;
+    wayline_support::atomic(&request_path(), method.as_bytes())?;
     Command::new(std::env::current_exe()?)
         .arg("update-job")
         .stdin(Stdio::null())
@@ -387,22 +390,26 @@ pub fn start(method: &str) -> Result<bool> {
 }
 
 pub fn job() -> Result<()> {
-    locked("update", || {
+    runtime::locked("update", || {
         let request = request_path();
-        let install = fs::read_to_string(&request).unwrap_or_default() == "install_update";
+        let operation = if fs::read_to_string(&request).unwrap_or_default() == "install_update" {
+            Operation::Install
+        } else {
+            Operation::Check
+        };
         let _ = fs::remove_file(&request);
-        attempt(install, Status::read().as_ref()).map(drop)
+        attempt(operation, Status::read().as_ref()).map(drop)
     })
 }
 
-pub fn run_now(install: bool) -> Result<Status> {
-    locked("update", || {
+pub fn run_now(operation: Operation) -> Result<Status> {
+    runtime::locked("update", || {
         let previous = Status::read();
         ensure!(
             settled(previous.as_ref()),
             "A previous installation needs checking."
         );
-        attempt(install, previous.as_ref())
+        attempt(operation, previous.as_ref())
     })
 }
 
@@ -410,7 +417,7 @@ pub fn scheduled(config: &Settings) -> Result<()> {
     if !idle() {
         return Ok(());
     }
-    locked("update", || {
+    runtime::locked("update", || {
         let request = request_path();
         let requested = fs::read_to_string(&request).unwrap_or_default();
         let previous = Status::read();
@@ -420,13 +427,17 @@ pub fn scheduled(config: &Settings) -> Result<()> {
         );
         let checked_at = previous.as_ref().map_or(0, |status| status.checked_at);
         if requested.is_empty()
-            && (!config.auto_updates || now().saturating_sub(checked_at) < 86_400)
+            && (!config.auto_updates || runtime::now().saturating_sub(checked_at) < 86_400)
         {
             return Ok(());
         }
-        let install =
-            requested == "install_update" || (requested.is_empty() && config.auto_updates);
-        attempt(install, previous.as_ref())?;
+        let operation =
+            if requested == "install_update" || (requested.is_empty() && config.auto_updates) {
+                Operation::Install
+            } else {
+                Operation::Check
+            };
+        attempt(operation, previous.as_ref())?;
         if request.exists() {
             fs::remove_file(request)?;
         }

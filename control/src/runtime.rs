@@ -1,17 +1,13 @@
 use anyhow::{Context, Result, ensure};
-use serde::{Serialize, de::DeserializeOwned};
-use std::{
-    fs,
-    io::{Read, Write},
-    os::unix::{
-        fs::{MetadataExt, PermissionsExt},
-        net::UnixStream,
-    },
-    path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wayline_protocol::{MAX_STATUS, Series, Status};
-use wayline_support::atomic;
 
 pub const RUNTIME: &str = "/var/run/wayline";
 pub const MONITOR_CONFIG: &str = "/var/run/wayline/monitor.json";
@@ -34,7 +30,7 @@ pub fn load<T: Default + DeserializeOwned>(path: impl AsRef<Path>) -> T {
 }
 
 pub fn store(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
-    atomic(path.as_ref(), &serde_json::to_vec(value)?)
+    wayline_support::atomic(path.as_ref(), &serde_json::to_vec(value)?)
 }
 
 pub fn version() -> String {
@@ -108,11 +104,9 @@ pub fn milliseconds(micros: u32) -> f64 {
 mod tests {
     use super::{fetch, status};
     use anyhow::{Result, ensure};
-    use std::{
-        io::{BufRead, BufReader, Write},
-        os::unix::net::UnixListener,
-        thread,
-    };
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
 
     const REPLY: &str = r#"{"schema":1,"run_id":"r","target":"1.1.1.1","uptime_ms":0,"interval_ms":5000,"tunnels":[]}"#;
 

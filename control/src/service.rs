@@ -1,15 +1,14 @@
-use crate::{
-    auto, changes, egress, history, native,
-    resolve::Resolved,
-    router::{self, Inventory},
-    runtime::{DAEMON, MONITOR_CONFIG, RUNTIME, STATUS_SOCKET, locked, now},
-    settings::Settings,
-    update,
-};
+use crate::resolve::Resolved;
+use crate::router::{self, Inventory};
+use crate::runtime;
+use crate::runtime::{DAEMON, MONITOR_CONFIG, RUNTIME, STATUS_SOCKET};
+use crate::settings::Settings;
+use crate::{auto, changes, egress, history, native, update};
 use anyhow::Result;
 use serde_json::{Value, json};
-use std::{fs, os::unix::fs::symlink, path::Path};
-use wayline_support::{atomic, text};
+use std::fs;
+use std::os::unix::fs as unix_fs;
+use std::path::Path;
 
 fn flush() {
     if let Ok(config) = Settings::read()
@@ -56,7 +55,7 @@ pub fn enabled() -> Result<()> {
 }
 
 pub fn reconcile() -> Result<()> {
-    locked("reconcile", reconcile_inner)
+    runtime::locked("reconcile", reconcile_inner)
 }
 
 fn reconcile_inner() -> Result<()> {
@@ -68,7 +67,7 @@ fn reconcile_inner() -> Result<()> {
 }
 
 pub fn restart() -> Result<()> {
-    locked("reconcile", || {
+    runtime::locked("reconcile", || {
         delete()?;
         reconcile_inner()
     })
@@ -91,7 +90,7 @@ fn apply(config: &Settings, inventory: Option<&Inventory>) -> Result<()> {
             if running {
                 flush();
             }
-            atomic(path, &encoded)?;
+            wayline_support::atomic(path, &encoded)?;
         }
         native::bus::<Value>(
             "service",
@@ -104,7 +103,13 @@ fn apply(config: &Settings, inventory: Option<&Inventory>) -> Result<()> {
     Ok(())
 }
 
-pub fn lifecycle(install: bool) -> Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    Enable,
+    Disable,
+}
+
+pub fn lifecycle(lifecycle: Lifecycle) -> Result<()> {
     let cron = Path::new("/etc/crontabs/root");
     let mut lines: Vec<_> = fs::read_to_string(cron)
         .unwrap_or_default()
@@ -113,19 +118,19 @@ pub fn lifecycle(install: bool) -> Result<()> {
         .map(str::to_owned)
         .collect();
     let startup = Path::new("/etc/rc.d/S95wayline");
-    if install {
+    if lifecycle == Lifecycle::Enable {
         lines.push("* * * * * /usr/sbin/wayline-ctl tick >/dev/null 2>&1".into());
         if !startup.exists() {
-            symlink("/usr/sbin/wayline-ctl", startup)?;
+            unix_fs::symlink("/usr/sbin/wayline-ctl", startup)?;
         }
     } else {
         let _ = fs::remove_file(startup);
         let _ = delete();
     }
     fs::create_dir_all("/etc/crontabs")?;
-    atomic(cron, format!("{}\n", lines.join("\n")).as_bytes())?;
-    let _ = text("/etc/init.d/cron", &["reload"], 8192, 10);
-    if install {
+    wayline_support::atomic(cron, format!("{}\n", lines.join("\n")).as_bytes())?;
+    let _ = wayline_support::text("/etc/init.d/cron", &["reload"], 8192, 10);
+    if lifecycle == Lifecycle::Enable {
         let _ = delete();
         reconcile()?;
     }
@@ -133,7 +138,7 @@ pub fn lifecycle(install: bool) -> Result<()> {
 }
 
 pub fn tick() -> Result<()> {
-    locked("tick", || {
+    runtime::locked("tick", || {
         let routine = routine();
         let config = Settings::read().unwrap_or_default();
         let updated = update::scheduled(&config);
@@ -161,7 +166,7 @@ fn routine() -> Result<()> {
             .as_ref()
             .is_some_and(|inventory| inventory.partial)
     {
-        locked("reconcile", || {
+        runtime::locked("reconcile", || {
             if Settings::read()? == config {
                 apply(&config, monitored)
             } else {
@@ -181,10 +186,10 @@ fn routine() -> Result<()> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    let now = now();
+    let now = runtime::now();
     if config.enabled && (now.saturating_sub(last) >= 300 || now < last) {
         let result = history::collect(&config);
-        atomic(Path::new(&collected), now.to_string().as_bytes())?;
+        wayline_support::atomic(Path::new(&collected), now.to_string().as_bytes())?;
         result?;
     }
     let _ = auto::step(&config);

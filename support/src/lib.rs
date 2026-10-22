@@ -6,17 +6,15 @@
 
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
-use std::{
-    fmt::Write as _,
-    fs,
-    io::{Read, Seek, Write},
-    path::Path,
-    process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
-    thread,
-    time::{Duration, Instant},
-};
-use tempfile::{NamedTempFile, tempfile};
+use std::fmt::Write as _;
+use std::fs;
+use std::io::{Read, Seek, Write};
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
 
 pub const FIRMWARE_CONTRACT: &str =
     "9c8a9102c046ff12ba95e4c9a03b4e5392c461584c5d4d8ab9c5591ab6ec9237";
@@ -31,6 +29,7 @@ pub fn digest(data: &[u8]) -> String {
         })
 }
 
+#[must_use]
 pub fn within<T: Send + 'static, F: FnOnce() -> T + Send + 'static>(
     limit: Duration,
     jobs: impl IntoIterator<Item = F>,
@@ -83,17 +82,17 @@ pub fn atomic(path: &Path, data: &[u8]) -> Result<()> {
 const MAX_INPUT: usize = 2 * 1024 * 1024;
 
 pub fn output(program: &str, args: &[&str], limit: usize, seconds: u64) -> Result<Vec<u8>> {
-    let (success, bytes) = output_status(program, args, limit, seconds)?;
-    ensure!(success, "{program} failed.");
-    Ok(bytes)
+    let output = output_status(program, args, limit, seconds)?;
+    ensure!(output.success, "{program} failed.");
+    Ok(output.bytes)
 }
 
-pub fn output_status(
-    program: &str,
-    args: &[&str],
-    limit: usize,
-    seconds: u64,
-) -> Result<(bool, Vec<u8>)> {
+pub struct Output {
+    pub success: bool,
+    pub bytes: Vec<u8>,
+}
+
+pub fn output_status(program: &str, args: &[&str], limit: usize, seconds: u64) -> Result<Output> {
     run(program, args, None, limit, seconds)
 }
 
@@ -113,9 +112,9 @@ pub fn input(
         input.len() <= MAX_INPUT,
         "Helper input exceeds its size limit."
     );
-    let (success, bytes) = run(program, args, Some(input), limit, seconds)?;
-    ensure!(success, "{program} failed.");
-    Ok(bytes)
+    let output = run(program, args, Some(input), limit, seconds)?;
+    ensure!(output.success, "{program} failed.");
+    Ok(output.bytes)
 }
 
 fn run(
@@ -124,17 +123,17 @@ fn run(
     input: Option<&[u8]>,
     limit: usize,
     seconds: u64,
-) -> Result<(bool, Vec<u8>)> {
+) -> Result<Output> {
     let stdin = match input {
         Some(bytes) => {
-            let mut source = tempfile()?;
+            let mut source = tempfile::tempfile()?;
             source.write_all(bytes)?;
             source.rewind()?;
             Stdio::from(source)
         }
         None => Stdio::null(),
     };
-    let mut data = tempfile()?;
+    let mut data = tempfile::tempfile()?;
     let mut child = Command::new(program)
         .args(args)
         .env("LC_ALL", "C")
@@ -155,7 +154,10 @@ fn run(
     data.rewind()?;
     let mut bytes = Vec::new();
     data.read_to_end(&mut bytes)?;
-    Ok((status.success(), bytes))
+    Ok(Output {
+        success: status.success(),
+        bytes,
+    })
 }
 
 fn wait(child: &mut Child, limit: Duration) -> Result<Option<ExitStatus>> {

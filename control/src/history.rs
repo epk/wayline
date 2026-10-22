@@ -1,23 +1,18 @@
-use crate::{
-    changes::{self, Event},
-    router::{Inventory, endpoint_series, endpoints_enabled, series_id, tunnel_prefix},
-    runtime::{RUNTIME, directory, locked, milliseconds, now, ring},
-    settings::{Settings, Target},
-};
+use crate::changes::{self, Event};
+use crate::router;
+use crate::router::Inventory;
+use crate::runtime;
+use crate::runtime::RUNTIME;
+use crate::settings::{Settings, Target};
 use anyhow::{Context, Error, Result, ensure};
-use rusqlite::{
-    Connection, OpenFlags, TransactionBehavior, params,
-    types::{FromSql, ToSql},
-};
+use rusqlite::types::{FromSql, ToSql};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use wayline_protocol::{BUCKET_SECONDS, MAX_SERIES, Series};
-use wayline_support::atomic;
 
 const HOUR: u64 = 3_600;
 const DAY: u64 = 86_400;
@@ -127,7 +122,7 @@ fn fresh_ring() -> Result<Vec<Series>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(error) => return Err(error.into()),
     };
-    let mut samples = ring();
+    let mut samples = runtime::ring();
     discard_before(&mut samples, cutoff);
     Ok(samples)
 }
@@ -139,19 +134,19 @@ fn discard_before(samples: &mut [Series], cutoff: u64) {
 }
 
 pub fn purge() -> Result<()> {
-    locked("history", || {
+    runtime::locked("history", || {
         let roots = [
             PathBuf::from("/etc/wayline/history"),
             Path::new(RUNTIME).join("history"),
         ];
         for root in &roots {
             if root.try_exists()? {
-                directory(root)?;
+                runtime::directory(root)?;
             }
         }
-        atomic(
+        wayline_support::atomic(
             &Path::new(RUNTIME).join("history-cutoff"),
-            now().to_string().as_bytes(),
+            runtime::now().to_string().as_bytes(),
         )?;
         for root in roots {
             for name in [
@@ -193,7 +188,7 @@ fn publish(cache: &Path, prefixes: &BTreeSet<String>) -> Result<()> {
     if fs::read(cache).is_ok_and(|current| current == encoded) {
         return Ok(());
     }
-    atomic(cache, &encoded)
+    wayline_support::atomic(cache, &encoded)
 }
 
 const fn retained(days: u32, step: u64) -> u64 {
@@ -271,8 +266,14 @@ fn schema() -> String {
     )
 }
 
-fn open(path: &Path, readonly: bool) -> Result<Connection> {
-    let connection = if readonly {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    ReadOnly,
+    ReadWrite,
+}
+
+fn open(path: &Path, access: Access) -> Result<Connection> {
+    let connection = if access == Access::ReadOnly {
         Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -284,7 +285,7 @@ fn open(path: &Path, readonly: bool) -> Result<Connection> {
     connection.pragma_update(None, "cache_size", -128)?;
     connection.pragma_update(None, "mmap_size", 0)?;
     connection.pragma_update(None, "temp_store", "MEMORY")?;
-    if !readonly {
+    if access == Access::ReadWrite {
         connection.pragma_update(None, "page_size", PAGE_BYTES)?;
         connection.pragma_update(None, "max_page_count", cap(path))?;
         connection.pragma_update(None, "journal_mode", "TRUNCATE")?;
@@ -294,7 +295,7 @@ fn open(path: &Path, readonly: bool) -> Result<Connection> {
 }
 
 fn pragma<T: FromSql>(path: &Path, name: &str) -> Option<T> {
-    open(path, true)
+    open(path, Access::ReadOnly)
         .ok()?
         .pragma_query_value(None, name, |row| row.get(0))
         .ok()
@@ -309,19 +310,22 @@ fn pages(path: &Path) -> u64 {
 }
 
 fn convert(path: &Path) -> Result<bool> {
-    let mut connection = open(path, false)?;
+    let mut connection = open(path, Access::ReadWrite)?;
     let current: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if current >= VERSION {
         return Ok(false);
     }
-    ensure!(now() >= MIN_CLOCK, "The clock is not synchronized.");
+    ensure!(
+        runtime::now() >= MIN_CLOCK,
+        "The clock is not synchronized."
+    );
     let upgrade = current == 3;
     let tables: u32 =
         connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
     if !upgrade && tables > 0 {
         drop(connection);
         quarantine(path)?;
-        connection = open(path, false)?;
+        connection = open(path, Access::ReadWrite)?;
     }
     connection.pragma_update(None, "max_page_count", 2 * cap(path))?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -335,7 +339,7 @@ fn convert(path: &Path) -> Result<bool> {
     if upgrade {
         transaction.execute(
             "INSERT INTO series SELECT id,name,?1 FROM old_series",
-            [now() / HOUR],
+            [runtime::now() / HOUR],
         )?;
         transaction.execute_batch(&format!(
             "DROP TABLE old_series;{}DROP TABLE meta;",
@@ -400,7 +404,7 @@ fn append(path: &Path, days: u32, now: u64, ring: &[Series]) -> Result<BTreeSet<
         .take(MAX_SERIES)
         .filter(|series| !series.buckets.is_empty())
         .collect();
-    let mut connection = open(path, false)?;
+    let mut connection = open(path, Access::ReadWrite)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     fill(&transaction, &live)?;
     if let Some(mut range) = span(&live) {
@@ -464,7 +468,7 @@ fn quarantine(path: &Path) -> Result<()> {
     changes::append(
         path,
         [Event {
-            at: now() * 1000,
+            at: runtime::now() * 1000,
             subject: "history".into(),
             kind: "history".into(),
             text: "The history database was damaged and was reset.".into(),
@@ -473,7 +477,7 @@ fn quarantine(path: &Path) -> Result<()> {
 }
 
 fn shrink(path: &Path) -> Result<()> {
-    let mut connection = open(path, false)?;
+    let mut connection = open(path, Access::ReadWrite)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for (_, table) in LEVELS.iter().rev() {
         transaction.execute(
@@ -500,7 +504,7 @@ fn recover(path: &Path, error: Error) -> Result<()> {
 }
 
 fn store(path: &Path, days: u32, ring: &[Series]) -> Result<BTreeSet<String>> {
-    let now = now();
+    let now = runtime::now();
     append(path, days, now, ring).or_else(|error| {
         recover(path, error)?;
         append(path, days, now, ring)
@@ -513,16 +517,16 @@ fn collect_at(path: &Path, days: u32, ring: &[Series]) -> Result<()> {
 }
 
 pub fn collect(config: &Settings) -> Result<()> {
-    locked("history", || collect_inner(config))
+    runtime::locked("history", || collect_inner(config))
 }
 
 fn collect_inner(config: &Settings) -> Result<()> {
     let path = database(config);
-    directory(path.parent().context("Invalid history directory.")?)?;
+    runtime::directory(path.parent().context("Invalid history directory.")?)?;
     let cache = known_cache();
     let ring = fresh_ring()?;
     let idle = ring.iter().all(|series| series.buckets.is_empty());
-    if now() < MIN_CLOCK || (idle && cache.exists()) {
+    if runtime::now() < MIN_CLOCK || (idle && cache.exists()) {
         return Ok(());
     }
     publish(&cache, &store(&path, config.history_days, &ring)?)
@@ -533,7 +537,7 @@ pub fn report(config: &Settings) -> Result<Report> {
     let bytes = fs::metadata(&path).map_or(0, |meta| meta.len());
     let mut lines = Vec::new();
     if path.exists() {
-        let connection = open(&path, true)?;
+        let connection = open(&path, Access::ReadOnly)?;
         let show = |value: Option<u64>| value.map_or_else(String::new, |value| value.to_string());
         for (_, table) in LEVELS {
             let (rows, oldest, newest): (u64, Option<u64>, Option<u64>) = connection.query_row(
@@ -557,7 +561,7 @@ pub fn report(config: &Settings) -> Result<Report> {
 
 fn reader(path: &Path) -> Result<Connection> {
     if path.exists() {
-        let connection = open(path, true)?;
+        let connection = open(path, Access::ReadOnly)?;
         if connection.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))? >= 3 {
             return Ok(connection);
         }
@@ -639,9 +643,9 @@ fn lines(
             {
                 *slot = Point {
                     at: period * step * 1_000,
-                    min: row.get::<_, Option<u32>>(2)?.map(milliseconds),
-                    median: row.get::<_, Option<u32>>(3)?.map(milliseconds),
-                    max: row.get::<_, Option<u32>>(4)?.map(milliseconds),
+                    min: row.get::<_, Option<u32>>(2)?.map(runtime::milliseconds),
+                    median: row.get::<_, Option<u32>>(3)?.map(runtime::milliseconds),
+                    max: row.get::<_, Option<u32>>(4)?.map(runtime::milliseconds),
                     sent: row.get(5)?,
                     lost: row.get(6)?,
                 };
@@ -659,7 +663,7 @@ fn lines(
 }
 
 pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {
-    locked("history", || query_inner(config, inventory, query))
+    runtime::locked("history", || query_inner(config, inventory, query))
 }
 
 fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {
@@ -668,7 +672,7 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
         query.step,
         query.start,
         query.end,
-        now() * 1_000,
+        runtime::now() * 1_000,
     )?;
     let known = known_prefixes();
     let target = query.target.as_ref().unwrap_or_else(|| config.primary());
@@ -677,12 +681,12 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
         .tunnels
         .iter()
         .filter_map(|tunnel| {
-            let prefix = tunnel_prefix(&tunnel.key);
+            let prefix = router::tunnel_prefix(&tunnel.key);
             (selected(&tunnel.id) && (inventory.has_path(&tunnel.id) || known.contains(&prefix)))
                 .then(|| Subject {
                     id: tunnel.id.clone(),
                     name: tunnel.name.clone(),
-                    identity: series_id(&prefix, target),
+                    identity: router::series_id(&prefix, target),
                 })
         })
         .collect();
@@ -690,7 +694,7 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
         query.all || !subjects.is_empty(),
         "No history exists for this tunnel."
     );
-    if query.endpoints && endpoints_enabled(config) {
+    if query.endpoints && router::endpoints_enabled(config) {
         subjects.extend(
             inventory
                 .tunnels
@@ -699,7 +703,7 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
                 .map(|tunnel| Subject {
                     id: format!("endpoint:{}", tunnel.id),
                     name: format!("{} server", tunnel.name),
-                    identity: endpoint_series(&tunnel.key),
+                    identity: router::endpoint_series(&tunnel.key),
                 }),
         );
     }
@@ -707,7 +711,7 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
         subjects.extend(inventory.standby_uplinks().map(|uplink| Subject {
             id: uplink.id.clone(),
             name: format!("{} uplink", uplink.name),
-            identity: series_id(uplink.prefix(), target),
+            identity: router::series_id(uplink.prefix(), target),
         }));
     }
     if query.include_wan
@@ -717,7 +721,7 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
         subjects.push(Subject {
             id: wan.id.clone(),
             name: wan.name.clone(),
-            identity: series_id(wan.prefix(), target),
+            identity: router::series_id(wan.prefix(), target),
         });
     }
     let series = lines(&database(config), step, query, &fresh_ring()?, subjects)?;
@@ -731,11 +735,15 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        DAY, HOUR, LEVELS, Query, Subject, append, collect_at, convert, lines, open, resolution,
+        Access, DAY, HOUR, LEVELS, Query, Subject, append, collect_at, convert, lines, open,
+        resolution,
     };
-    use crate::runtime::now;
+    use crate::runtime;
     use anyhow::{Result, ensure};
-    use std::{fmt::Write, fs, net::Ipv4Addr, path::Path};
+    use std::fmt::Write;
+    use std::fs;
+    use std::net::Ipv4Addr;
+    use std::path::Path;
     use wayline_protocol::{Bucket, Series, State};
 
     fn identity(index: u8) -> String {
@@ -820,11 +828,11 @@ mod tests {
     }
 
     fn scalar(path: &Path, statement: &str) -> Result<i64> {
-        Ok(open(path, true)?.query_row(statement, [], |row| row.get(0))?)
+        Ok(open(path, Access::ReadOnly)?.query_row(statement, [], |row| row.get(0))?)
     }
 
     fn edit(path: &Path, statement: &str) -> Result<()> {
-        Ok(open(path, false)?.execute_batch(statement)?)
+        Ok(open(path, Access::ReadWrite)?.execute_batch(statement)?)
     }
 
     fn counts(path: &Path) -> Result<Vec<i64>> {
@@ -871,9 +879,9 @@ mod tests {
     fn buckets_roll_up_exactly() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("latency.sqlite");
-        let start = now() / HOUR * HOUR - 2 * HOUR;
+        let start = runtime::now() / HOUR * HOUR - 2 * HOUR;
         collect_at(&database, 30, &[series(&identity(1), hour(start))])?;
-        let row = open(&database, true)?.query_row(
+        let row = open(&database, Access::ReadOnly)?.query_row(
             "SELECT sent,lost,min_us,median_us,max_us FROM s1h WHERE period=?1",
             [start / HOUR],
             |row| {
@@ -896,7 +904,7 @@ mod tests {
     fn repeated_collection_never_double_counts() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("latency.sqlite");
-        let start = now() / HOUR * HOUR - 2 * HOUR;
+        let start = runtime::now() / HOUR * HOUR - 2 * HOUR;
         let buckets = hour(start);
         collect_at(
             &database,
@@ -914,7 +922,7 @@ mod tests {
 
     #[test]
     fn tiers_prune_to_their_retention() -> Result<()> {
-        let now = now();
+        let now = runtime::now();
         let minute = now / 60 * 60 - 120;
         for (days, expected) in [(1_u32, [2, 1, 0, 0]), (7, [2, 2, 1, 0])] {
             let directory = tempfile::tempdir()?;
@@ -948,7 +956,7 @@ mod tests {
     fn idle_series_expire_with_their_rows() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("latency.sqlite");
-        let minute = now() / 60 * 60 - 120;
+        let minute = runtime::now() / 60 * 60 - 120;
         collect_at(
             &database,
             1,
@@ -961,7 +969,7 @@ mod tests {
             &database,
             &format!(
                 "UPDATE series SET seen={} WHERE name='{}';",
-                now() / HOUR - 49,
+                runtime::now() / HOUR - 49,
                 identity(2)
             ),
         )?;
@@ -984,14 +992,17 @@ mod tests {
     fn retiring_many_series_leaves_no_orphans() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("latency.sqlite");
-        let minute = now() / 60 * 60 - 120;
+        let minute = runtime::now() / 60 * 60 - 120;
         let all: Vec<Series> = (1..=80)
             .map(|index| series(&identity(index), vec![bucket(minute, 20_000, 0)]))
             .collect();
         collect_at(&database, 30, &all)?;
         edit(
             &database,
-            &format!("UPDATE series SET seen={} WHERE id>1;", now() / HOUR - 721),
+            &format!(
+                "UPDATE series SET seen={} WHERE id>1;",
+                runtime::now() / HOUR - 721
+            ),
         )?;
         collect_at(
             &database,
@@ -1017,7 +1028,7 @@ mod tests {
     fn series_cap_keeps_live_series_over_newer_ids() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("latency.sqlite");
-        let minute = now() / 60 * 60 - 120;
+        let minute = runtime::now() / 60 * 60 - 120;
         let all: Vec<Series> = (1..=90)
             .map(|index| series(&identity(index), vec![bucket(minute, 20_000, 0)]))
             .collect();
@@ -1084,7 +1095,7 @@ mod tests {
         );
         edit(&database, &script)?;
         ensure!(
-            append(&database, 30, now(), &[]).is_err(),
+            append(&database, 30, runtime::now(), &[]).is_err(),
             "A stale schema must fail the write so that it is converted."
         );
         ensure!(convert(&database)?, "Expected a conversion.");
@@ -1108,7 +1119,7 @@ mod tests {
             )? == 0
         );
         ensure!(scalar(&database, "SELECT count(*) FROM series WHERE seen>0")? == 1);
-        append(&database, 30, now() + 60 * DAY, &[])?;
+        append(&database, 30, runtime::now() + 60 * DAY, &[])?;
         ensure!(
             scalar(&database, "SELECT count(*) FROM s1m")? == 0,
             "Rows outlived their series."
@@ -1122,7 +1133,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let full = directory.path().join("full.sqlite");
         let half = directory.path().join("half.sqlite");
-        let start = now() / HOUR * HOUR - 2 * HOUR;
+        let start = runtime::now() / HOUR * HOUR - 2 * HOUR;
         let buckets = hour(start);
         let id = identity(1);
         collect_at(&full, 30, &[series(&id, buckets.clone())])?;
@@ -1169,7 +1180,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("latency.sqlite");
         fs::write(&database, [0x5a_u8; 8192])?;
-        let fresh = now() / 15 * 15 - 60;
+        let fresh = runtime::now() / 15 * 15 - 60;
         collect_at(
             &database,
             7,
@@ -1192,7 +1203,7 @@ mod tests {
     fn eleven_series_for_a_week_stay_small() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("latency.sqlite");
-        let start = now() / HOUR * HOUR - 168 * HOUR;
+        let start = runtime::now() / HOUR * HOUR - 168 * HOUR;
         let identities: Vec<String> = (1..=11).map(identity).collect();
         for hours in 0..168 {
             let snapshot: Vec<Series> = identities
@@ -1203,7 +1214,7 @@ mod tests {
         }
         let size = fs::metadata(&database)?.len();
         ensure!(size < 4 * 1024 * 1024, "Database is {size} bytes.");
-        let query = request(now() - DAY, now(), 60);
+        let query = request(runtime::now() - DAY, runtime::now(), 60);
         let line = lines(&database, 60, &query, &[], vec![subject(1)])?.remove(0);
         ensure!(line.points.len() <= 1_441, "Too many points.");
         ensure!(

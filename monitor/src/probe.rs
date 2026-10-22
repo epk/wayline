@@ -1,18 +1,15 @@
 use crate::route::RouteLookup;
-use pnet_packet::{
-    Packet,
-    icmp::{self, IcmpCode, IcmpPacket, IcmpTypes, echo_request::MutableEchoRequestPacket},
-    ipv4::Ipv4Packet,
-};
+use pnet_packet::Packet;
+use pnet_packet::icmp::echo_request::MutableEchoRequestPacket;
+use pnet_packet::icmp::{self, IcmpCode, IcmpPacket, IcmpTypes};
+use pnet_packet::ipv4::Ipv4Packet;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::{
-    collections::VecDeque,
-    fs::File,
-    io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddrV4},
-    num::NonZeroU32,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::num::NonZeroU32;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wayline_protocol::{BUCKET_SECONDS, Bucket, HISTORY, Sample, Series, State, Tunnel};
 
 const LATENCY_WINDOW: usize = 5;
@@ -97,8 +94,8 @@ fn is_up(interface: &str) -> bool {
     sysfs_number(interface, "flags", 16).is_some_and(|flags| flags & 1 != 0)
 }
 
-pub struct Probe<'a> {
-    tunnel: &'a Tunnel,
+pub struct Probe<'tunnel> {
+    tunnel: &'tunnel Tunnel,
     target: Ipv4Addr,
     interval: Duration,
     timeout: Duration,
@@ -117,9 +114,9 @@ pub struct Probe<'a> {
     closed: VecDeque<Bucket>,
 }
 
-impl<'a> Probe<'a> {
+impl<'tunnel> Probe<'tunnel> {
     pub fn new(
-        tunnel: &'a Tunnel,
+        tunnel: &'tunnel Tunnel,
         default_target: Ipv4Addr,
         next_due: Instant,
         interval: Duration,

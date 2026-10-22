@@ -1,14 +1,12 @@
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::{
-    fmt::Write,
-    fs,
-    path::Path,
-    process::{Child, Command, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
-use wayline_support::{FIRMWARE_CONTRACT as CONTRACT, digest};
+use std::fmt::Write;
+use std::fs;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+use wayline_support::FIRMWARE_CONTRACT as CONTRACT;
 use xshell::{Shell, cmd};
 
 const ROOT: &str = "artifacts/local/firmware-root";
@@ -55,7 +53,7 @@ pub fn bus_probe() -> Result<()> {
 }
 
 fn contract(root: &Path) -> Result<String> {
-    Ok(digest(&fs::read(
+    Ok(wayline_support::digest(&fs::read(
         root.join("usr/lib/oui-httpd/rpc/vpn-client"),
     )?))
 }
@@ -78,9 +76,9 @@ pub fn prepare(source: &Path) -> Result<()> {
 fn call(program: &str, arguments: &[&str]) -> Result<String> {
     let mut args = vec![ROOT, "/usr/bin/env", NATIVE_PATH, program];
     args.extend_from_slice(arguments);
-    let (success, output) = wayline_support::output_status("chroot", &args, 524_288, 50)?;
-    let output = String::from_utf8(output)?;
-    ensure!(success, "Native {program} failed: {output}");
+    let response = wayline_support::output_status("chroot", &args, 524_288, 50)?;
+    let output = String::from_utf8(response.bytes)?;
+    ensure!(response.success, "Native {program} failed: {output}");
     Ok(output)
 }
 
@@ -467,7 +465,7 @@ fn bridge_checks() -> Result<()> {
         let nonce = challenge["data"]["nonce"]
             .as_str()
             .context("The lab login challenge failed.")?;
-        let hash = digest(format!("root:{}:{nonce}", crypt.trim()).as_bytes());
+        let hash = wayline_support::digest(format!("root:{}:{nonce}", crypt.trim()).as_bytes());
         let login = session("login", &json!({"username":"root","hash":hash}))?;
         Ok(login["data"]["sid"]
             .as_str()

@@ -1,14 +1,12 @@
-use crate::{
-    changes, history,
-    native::{self, Level},
-    router,
-    runtime::{MONITOR_CONFIG, SETTINGS, STATUS_SOCKET, snapshot, version},
-    settings::Settings,
-    update,
-};
+use crate::native::{self, Level};
+use crate::runtime;
+use crate::runtime::{MONITOR_CONFIG, SETTINGS, STATUS_SOCKET};
+use crate::settings::Settings;
+use crate::{changes, history, router, update};
 use anyhow::Result;
 use serde_json::{Value, json};
-use std::{fs, path::Path};
+use std::fs;
+use std::path::Path;
 
 const FILES: [&str; 6] = [
     "/www/views/gl-sdk4-ui-wayline.common.js.gz",
@@ -119,7 +117,7 @@ pub fn run() -> bool {
     let mut healthy = true;
     let mut warnings = 0;
     println!("Wayline doctor. Send this output when you report a problem.");
-    println!("package version: {}", version());
+    println!("package version: {}", runtime::version());
     let compat = native::compat();
     println!("firmware: {}", compat.firmware);
     let level = match compat.level {
@@ -195,7 +193,7 @@ pub fn run() -> bool {
         size(MONITOR_CONFIG),
         size(STATUS_SOCKET)
     );
-    println!("measurement series: {}", snapshot().len());
+    println!("measurement series: {}", runtime::snapshot().len());
     if let Some(status) = update::Status::read() {
         let value = serde_json::to_value(&status).unwrap_or_default();
         println!("last update check: {value}");

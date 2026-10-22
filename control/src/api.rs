@@ -1,16 +1,17 @@
-use crate::{
-    auto, changes, egress, history, native,
-    resolve::Resolved,
-    router::{self, Inventory, PathInfo, TunnelInfo},
-    runtime::{SETTINGS, locked, milliseconds, snapshot, store, version},
-    service::reconcile,
-    settings::{self, Settings, Target},
-    update,
-};
+use crate::resolve::Resolved;
+use crate::router::{self, Inventory, PathInfo, TunnelInfo};
+use crate::runtime;
+use crate::runtime::SETTINGS;
+use crate::service;
+use crate::settings::{self, Settings, Target};
+use crate::{auto, changes, egress, history, native, update};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, net::Ipv4Addr, thread, time::Duration};
+use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
+use std::thread;
+use std::time::Duration;
 use wayline_protocol::{Series, State as Measurement};
 
 const RECENT: usize = 8;
@@ -151,12 +152,17 @@ struct Discovery {
 }
 
 impl Discovery {
-    fn read(mut compat: native::Compat, endpoints: bool) -> Result<Self> {
+    fn read(mut compat: native::Compat, endpoints: router::Endpoints) -> Result<Self> {
         let revision = router::revision()?;
         let mut config = Settings::read()?;
-        let inventory = router::inventory_with(endpoints && config.endpoint_diagnostics)?;
+        let endpoints = if config.endpoint_diagnostics {
+            endpoints
+        } else {
+            router::Endpoints::Omit
+        };
+        let inventory = router::inventory_with(endpoints)?;
         router::normalize(&mut config, &inventory);
-        let snapshot = snapshot();
+        let snapshot = runtime::snapshot();
         let native = native::List::read();
         if compat.level == native::Level::Full && native.is_err() {
             compat.monitoring_only();
@@ -243,7 +249,9 @@ impl Discovery {
                     age: item
                         .and_then(|item| item.success_age_ms)
                         .map_or_else(|| "unknown".into(), |age| format!("{}s", age / 1000)),
-                    median: item.and_then(|item| item.median_us).map(milliseconds),
+                    median: item
+                        .and_then(|item| item.median_us)
+                        .map(runtime::milliseconds),
                     samples: item.map_or(0, |item| item.history.len()),
                     lost: item.map_or(0, Series::lost),
                 }
@@ -319,7 +327,7 @@ fn diagnostics(
                 .map(|path| {
                     let latency = measurement(snapshot, path, target)
                         .and_then(|item| item.median_us)
-                        .map(milliseconds);
+                        .map(runtime::milliseconds);
                     (path.id.clone(), latency)
                 })
                 .collect();
@@ -335,7 +343,7 @@ fn diagnostics(
                     .find(|series| series.id == id)
                     .or_else(|| measurement(snapshot, wan, target))
                     .and_then(|item| item.median_us)
-                    .map(milliseconds);
+                    .map(runtime::milliseconds);
                 BTreeMap::from([(wan.id.clone(), latency)])
             });
         }
@@ -390,7 +398,9 @@ fn uplink_views(config: &Settings, inventory: &Inventory, snapshot: &[Series]) -
                 address: uplink.source,
                 active,
                 state: item.map(|item| item.state),
-                median: item.and_then(|item| item.median_us).map(milliseconds),
+                median: item
+                    .and_then(|item| item.median_us)
+                    .map(runtime::milliseconds),
             }
         })
         .collect()
@@ -407,7 +417,7 @@ fn wan_view(inventory: &Inventory) -> WanView {
 fn unsupported(compat: native::Compat) -> State {
     let config = Settings::read().unwrap_or_default();
     State {
-        version: version(),
+        version: runtime::version(),
         history: history::availability(&config),
         config,
         tunnels: Vec::new(),
@@ -448,7 +458,7 @@ pub fn state() -> Result<State> {
     if compat.level == native::Level::Unsupported {
         return Ok(unsupported(compat));
     }
-    let discovery = Discovery::read(compat, true)?;
+    let discovery = Discovery::read(compat, router::Endpoints::Include)?;
     let mut tunnels = discovery.tunnels();
     let compatible = discovery.compatible();
     let Discovery {
@@ -460,10 +470,10 @@ pub fn state() -> Result<State> {
         ..
     } = discovery;
     let known = history::known_prefixes();
-    for tunnel in tunnels
+    let without_history = tunnels
         .iter_mut()
-        .filter(|tunnel| !tunnel.history_available)
-    {
+        .filter(|tunnel| !tunnel.history_available);
+    for tunnel in without_history {
         tunnel.history_available = known.contains(&router::tunnel_prefix(&tunnel.monitor_id));
     }
     let auto_paused = config.auto_exit
@@ -477,7 +487,7 @@ pub fn state() -> Result<State> {
         .take(changes::RECENT)
         .collect();
     let state = State {
-        version: version(),
+        version: runtime::version(),
         history: history::availability(&config),
         diagnostics: diagnostics(&config, &inventory, &snapshot),
         resolved: resolved(&config, &inventory),
@@ -517,7 +527,7 @@ pub fn state() -> Result<State> {
 }
 
 pub fn exits() -> Result<Exits> {
-    let discovery = Discovery::read(native::compat(), false)?;
+    let discovery = Discovery::read(native::compat(), router::Endpoints::Omit)?;
     let tunnels = discovery.tunnels();
     discovery.confirm()?;
     Ok(Exits {
@@ -527,7 +537,11 @@ pub fn exits() -> Result<Exits> {
 }
 
 pub fn history(query: &history::Query) -> Result<history::Response> {
-    history::query(&Settings::read()?, &router::inventory_with(false)?, query)
+    history::query(
+        &Settings::read()?,
+        &router::inventory_with(router::Endpoints::Omit)?,
+        query,
+    )
 }
 
 #[derive(Deserialize)]
@@ -544,8 +558,8 @@ pub fn purge_history(request: &PurgeHistory) -> Result<Value> {
 }
 
 pub fn set_config(request: SetConfig) -> Result<Value> {
-    locked("selection", || {
-        locked("settings", || {
+    runtime::locked("selection", || {
+        runtime::locked("settings", || {
             native::require(native::Level::Monitoring)?;
             ensure!(request.expected_revision == router::revision()?, STALE);
             let mut config = request.config;
@@ -562,14 +576,19 @@ pub fn set_config(request: SetConfig) -> Result<Value> {
             );
             let previous = Settings::read()?;
             if previous != config {
-                auto::Record::touch(previous.auto_exit != config.auto_exit)?;
-                store(SETTINGS, &config)?;
+                let attention = if previous.auto_exit == config.auto_exit {
+                    auto::Attention::Preserve
+                } else {
+                    auto::Attention::Clear
+                };
+                auto::Record::touch(attention)?;
+                runtime::store(SETTINGS, &config)?;
                 let hosts = router::hosts(&config, &inventory);
                 let mut resolved = Resolved::read();
                 if resolved.stale(&hosts) {
                     resolved.refresh(&hosts)?;
                 }
-                reconcile()?;
+                service::reconcile()?;
             }
             Ok(json!({"applied":true}))
         })
@@ -579,13 +598,13 @@ pub fn set_config(request: SetConfig) -> Result<Value> {
 pub fn set_tunnel_enabled(request: &SetEnabled) -> Result<Value> {
     const UNKNOWN: &str = "Tunnel outcome is unknown. Refresh before another change.";
     let enabled = request.enabled;
-    locked("selection", || {
-        locked("settings", || {
+    runtime::locked("selection", || {
+        runtime::locked("settings", || {
             native::require(native::Level::Full)?;
             ensure!(settings::id(&request.section_id), "Invalid tunnel section.");
             let revision = router::revision()?;
             ensure!(request.expected_revision == revision, STALE);
-            let inventory = router::inventory_with(false)?;
+            let inventory = router::inventory_with(router::Endpoints::Omit)?;
             let before = native::List::read()?;
             let tunnel = router::native_tunnel(&before, &inventory, &request.section_id)?;
             if tunnel.enabled == enabled {
@@ -604,9 +623,9 @@ pub fn set_tunnel_enabled(request: &SetEnabled) -> Result<Value> {
             let mut config = stored.clone();
             router::normalize(&mut config, &inventory);
             if config != stored {
-                store(SETTINGS, &config)?;
+                runtime::store(SETTINGS, &config)?;
             }
-            auto::Record::touch(false)?;
+            auto::Record::touch(auto::Attention::Preserve)?;
             native::call::<Value>("set_tunnel", &json!({"tunnel_id":number,"enabled":enabled}))
                 .context(UNKNOWN)?;
             thread::sleep(Duration::from_secs(5));
@@ -617,8 +636,11 @@ pub fn set_tunnel_enabled(request: &SetEnabled) -> Result<Value> {
                 .find(|item| item.number == number)
                 .context("Tunnel outcome is unknown. Refresh first.")?;
             router::forget();
-            let actual =
-                router::native_tunnel(&after, &router::inventory_with(false)?, &actual.id)?;
+            let actual = router::native_tunnel(
+                &after,
+                &router::inventory_with(router::Endpoints::Omit)?,
+                &actual.id,
+            )?;
             ensure!(
                 actual.number == number && actual.enabled == enabled,
                 "Tunnel outcome differs from the request. Refresh first."
@@ -627,21 +649,31 @@ pub fn set_tunnel_enabled(request: &SetEnabled) -> Result<Value> {
                 before.only_changed(&after, number),
                 "The VPN state changed concurrently. Refresh first."
             );
-            let monitor_pending = reconcile().is_err();
+            let monitor_pending = service::reconcile().is_err();
             Ok(json!({"applied":true,"enabled":enabled,"monitor_pending":monitor_pending}))
         })
     })
 }
 
 pub fn select(request: &Select) -> Result<Value> {
-    locked("selection", || {
-        apply(&request.section_id, &request.expected_revision, false)
+    runtime::locked("selection", || {
+        apply(
+            &request.section_id,
+            &request.expected_revision,
+            Selection::Manual,
+        )
     })
 }
 
-pub fn apply(id: &str, expected_revision: &str, require_health: bool) -> Result<Value> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    Manual,
+    Automatic,
+}
+
+pub fn apply(id: &str, expected_revision: &str, selection: Selection) -> Result<Value> {
     native::require(native::Level::Full)?;
-    let inventory = router::inventory_with(false)?;
+    let inventory = router::inventory_with(router::Endpoints::Omit)?;
     let list = native::List::read()?;
     let mut desired = router::native_order(&list, &inventory)?;
     let index = router::position(&desired, &inventory, id)?;
@@ -652,7 +684,7 @@ pub fn apply(id: &str, expected_revision: &str, require_health: bool) -> Result<
     let mut desired_numbers: Vec<_> = list.tunnels.iter().map(|tunnel| tunnel.number).collect();
     desired_numbers[..=index].rotate_right(1);
     ensure!(expected_revision == router::revision()?, STALE);
-    if require_health {
+    if selection == Selection::Automatic {
         ensure!(
             exits()?
                 .tunnels
@@ -665,8 +697,8 @@ pub fn apply(id: &str, expected_revision: &str, require_health: bool) -> Result<
         expected_revision == router::revision()?,
         "State changed before selection. Refresh first."
     );
-    if !require_health {
-        auto::Record::touch(false)?;
+    if selection == Selection::Manual {
+        auto::Record::touch(auto::Attention::Preserve)?;
     }
     let response = native::call::<Value>("order_tunnel", &json!({"id_list":desired}));
     let after = native::List::read().context("Selection outcome is unknown. Refresh first.")?;
@@ -690,10 +722,11 @@ pub fn apply(id: &str, expected_revision: &str, require_health: bool) -> Result<
     );
     router::forget();
     ensure!(
-        inventory.same_traffic_rules(&router::inventory_with(false)?),
+        inventory.same_traffic_rules(&router::inventory_with(router::Endpoints::Omit)?),
         "The traffic rules changed during selection. Refresh first."
     );
-    let auto_pending = !require_health && auto::Record::touch(true).is_err();
+    let auto_pending =
+        selection == Selection::Manual && auto::Record::touch(auto::Attention::Clear).is_err();
     Ok(json!({"applied":true,"response_lost":response.is_err(),"auto_pending":auto_pending}))
 }
 

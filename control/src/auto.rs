@@ -1,9 +1,8 @@
-use crate::{
-    api::{self, Exits},
-    native, router,
-    runtime::{RUNTIME, locked, now, store},
-    settings::Settings,
-};
+use crate::api::{self, Exits};
+use crate::runtime;
+use crate::runtime::RUNTIME;
+use crate::settings::Settings;
+use crate::{native, router};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -36,9 +35,9 @@ pub struct Switch {
     pub reason: String,
 }
 
-pub struct View<'a> {
-    pub id: &'a str,
-    pub key: &'a str,
+pub struct View<'tunnel> {
+    pub id: &'tunnel str,
+    pub key: &'tunnel str,
     pub eligible: bool,
     pub median_ms: Option<f64>,
 }
@@ -46,6 +45,12 @@ pub struct View<'a> {
 pub enum Reason {
     Faster,
     Unhealthy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Attention {
+    Preserve,
+    Clear,
 }
 
 impl Reason {
@@ -64,7 +69,7 @@ impl Record {
 
     pub fn read() -> Self {
         let fresh = |needs_attention| Self {
-            at: now(),
+            at: runtime::now(),
             needs_attention,
             ..Self::default()
         };
@@ -75,14 +80,14 @@ impl Record {
     }
 
     fn write(&self) -> Result<()> {
-        store(Self::path(), self)
+        runtime::store(Self::path(), self)
     }
 
-    pub fn touch(clear_attention: bool) -> Result<()> {
+    pub fn touch(attention: Attention) -> Result<()> {
         let previous = Self::read();
         Self {
-            at: now(),
-            needs_attention: previous.needs_attention && !clear_attention,
+            at: runtime::now(),
+            needs_attention: previous.needs_attention && attention == Attention::Preserve,
             observed_exit: None,
             unhealthy_since: None,
             observed_at: 0,
@@ -149,7 +154,7 @@ pub fn step(config: &Settings) -> Result<()> {
     if !config.enabled || !config.auto_exit || !native::contract() {
         return Ok(());
     }
-    locked("selection", || {
+    runtime::locked("selection", || {
         if Settings::read()? != *config {
             return Ok(());
         }
@@ -177,7 +182,7 @@ pub fn step(config: &Settings) -> Result<()> {
                 median_ms: tunnel.median,
             })
             .collect();
-        let at = now();
+        let at = runtime::now();
         let unhealthy_for = record.observe(
             &current.monitor_id,
             current.eligible && current.median.is_some(),
@@ -195,7 +200,7 @@ pub fn step(config: &Settings) -> Result<()> {
             return Ok(());
         };
         let switch = Switch {
-            at: now() * 1000,
+            at: runtime::now() * 1000,
             from: current.name.clone(),
             to: tunnels
                 .iter()
@@ -203,12 +208,12 @@ pub fn step(config: &Settings) -> Result<()> {
                 .map_or_else(|| target.clone(), |tunnel| tunnel.name.clone()),
             reason: reason.text().into(),
         };
-        record.at = now();
+        record.at = runtime::now();
         record.needs_attention = true;
         record.write()?;
-        api::apply(&target, &revision, true)?;
+        api::apply(&target, &revision, api::Selection::Automatic)?;
         Record {
-            at: now(),
+            at: runtime::now(),
             last: Some(switch),
             ..Record::default()
         }

@@ -1,7 +1,10 @@
 use crate::runtime::SETTINGS;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{fmt, io, net::Ipv4Addr, path::Path, str::FromStr};
+use std::net::Ipv4Addr;
+use std::path::Path;
+use std::str::FromStr;
+use std::{fmt, io};
 
 const MAX_TARGETS: usize = 5;
 static FALLBACK: Target = Target::Address(Ipv4Addr::new(1, 1, 1, 1));
