@@ -577,8 +577,7 @@
         <div>
           <h2>Latency to {{ selectedTarget }}</h2>
           <p class="vph-muted">
-            {{ range > 360 ? 'Five-minute' : 'One-minute' }} medians. Gaps mean no measurement. Drag
-            across the graph to zoom.
+            {{ resolutionLabel }} medians. Gaps mean no measurement. Drag across the graph to zoom.
           </p>
         </div>
         <div class="vph-chart-controls">
@@ -622,6 +621,7 @@
         ref="chart"
         tabindex="0"
         role="img"
+        :aria-busy="historyLoading || !ready ? 'true' : 'false'"
         :aria-label="
           'Latency to ' +
           selectedTarget +
@@ -796,6 +796,7 @@ const palette = [
   '#a6761d',
 ];
 const historyInterval = 30000;
+const rpcObject = 'wayline_' + WAYLINE_VERSION.replace(/\./g, '_');
 const endpointPrefix = 'endpoint:';
 const uplinkPrefix = 'uplink:';
 const changeWindow = 60 * 60000;
@@ -934,6 +935,7 @@ export default {
       stopped: false,
       historyRequest: 0,
       historyLoaded: false,
+      historyLoading: false,
       tableRows: [],
       cursor: { index: -1 },
       sort: { key: 'last', dir: -1 },
@@ -1164,14 +1166,23 @@ export default {
       return 'No configured VPN tunnels available.';
     },
     chartNote() {
+      if (!this.ready)
+        return this.readError ? 'Tunnel state could not be read.' : 'Reading tunnel state…';
       if (this.historyError) return this.historyError;
       if (!this.selectedTunnel) return 'No tunnels to show.';
       if (
         !this.history.length ||
         this.history.every((s) => s.points.every((p) => !isNumber(p.median)))
       )
-        return this.historyLoaded ? 'No measurements in this range.' : 'Loading history…';
+        return this.historyLoaded && !this.historyLoading
+          ? 'No measurements in this range.'
+          : 'Loading history…';
       return '';
+    },
+    resolutionLabel() {
+      return { 15: '15-second', 60: 'One-minute', 300: 'Five-minute', 3600: 'One-hour' }[
+        this.stepSeconds(this.range)
+      ];
     },
     destinations() {
       return this.state.config.targets;
@@ -1268,6 +1279,7 @@ export default {
   },
   beforeDestroy() {
     this.stopped = true;
+    this.historyRequest++;
     clearTimeout(this.timer);
     clearTimeout(this.noticeTimer);
     this.stopUpdatePoll();
@@ -1280,13 +1292,18 @@ export default {
       return new Promise((resolve, reject) => {
         let request;
         try {
+          const read = method === 'get_state' || method === 'get_history';
+          if (!read && this.staleBundle)
+            throw Error('The Wayline version changed. Reload the page before another change.');
           if (this.api) request = this.api[method](params || {});
           else if (typeof this.$rpcRequest !== 'function')
             throw Error('The router page API is missing. Reload the page or update the firmware.');
           else
-            request = this.$rpcRequest('call', ['sid', 'wayline', method, params || {}], {
-              timeout: method === 'set_tunnel_enabled' ? 45000 : 12000,
-            });
+            request = this.$rpcRequest(
+              'call',
+              ['sid', read ? 'wayline' : rpcObject, method, params || {}],
+              { timeout: method === 'set_tunnel_enabled' ? 45000 : 12000 },
+            );
         } catch (e) {
           reject(e);
           return;
@@ -1345,7 +1362,11 @@ export default {
           this.selectedTunnel =
             (next.tunnels.find((t) => t.preferred) || next.tunnels[0] || {}).id || '';
         this.readError = '';
-        if (Date.now() - this.historyAt >= historyInterval) await this.loadHistory();
+        if (
+          !this.historyLoading &&
+          (!this.historyLoaded || Date.now() - this.historyAt >= historyInterval)
+        )
+          await this.loadHistory();
       } catch (e) {
         this.readError = 'Wayline is unavailable. ' + this.describe(e, 'Try again shortly.');
       } finally {
@@ -1523,6 +1544,7 @@ export default {
       this.busyAction = 'purge';
       this.error = '';
       this.historyRequest++;
+      this.historyLoading = false;
       try {
         await this.call('purge_history', { confirm: true });
         this.historyRequest++;
@@ -1710,10 +1732,11 @@ export default {
       this.loadHistory();
     },
     async loadHistory() {
+      if (!this.selectedTunnel || this.stopped) return;
       if (this.offset === 0) this.anchor = Math.floor(Date.now() / 60000) * 60000;
       const request = ++this.historyRequest;
-      this.historyAt = Date.now();
-      if (!this.selectedTunnel) return;
+      this.historyLoading = true;
+      this.historyAt = 0;
       try {
         const endpoints = this.endpointHistory;
         const r = await this.call('get_history', {
@@ -1746,6 +1769,7 @@ export default {
           this.historyMarkers = Array.isArray(r.events) ? r.events : [];
           this.historyError = '';
           this.historyLoaded = true;
+          this.historyAt = Date.now();
           this.syncPlot();
           this.$nextTick(() => {
             if (this.$refs.chart && this.resize) this.resize.observe(this.$refs.chart);
@@ -1758,6 +1782,8 @@ export default {
           this.historyError = e.message || 'History unavailable.';
           this.syncPlot();
         }
+      } finally {
+        if (request === this.historyRequest) this.historyLoading = false;
       }
     },
     stepSeconds(minutes) {
@@ -1867,7 +1893,6 @@ export default {
             max: column(s.points, 'max'),
             index: data.length,
           };
-          const solo = soloIndexes(median);
           data.push(median);
           series.push({
             label: line.name,
@@ -1881,7 +1906,7 @@ export default {
               space: 0,
               stroke: color,
               fill: color,
-              filter: () => solo,
+              filter: (u, seriesIndex) => soloIndexes(u.data[seriesIndex]),
             },
           });
           if (!muted && !server) {
@@ -1957,7 +1982,6 @@ export default {
       };
     },
     createPlot(built) {
-      this.readTheme();
       this.plotLines = built.lines;
       this.plotKey = built.key;
       const UPlot = require('uplot').default;
@@ -2025,6 +2049,7 @@ export default {
         this.destroyPlot();
         return;
       }
+      this.readTheme();
       const built = this.buildChart();
       if (this.plot && this.plotKey === built.key) {
         this.plotLines = built.lines;

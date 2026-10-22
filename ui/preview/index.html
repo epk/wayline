@@ -109,8 +109,9 @@
     <script src="../dist/gl-sdk4-ui-wayline.common.js"></script>
     <script src="demo.js"></script>
     <script>
+      Vue.prototype.$rpcRequest = window.previewRpc;
       new Vue({
-        render: (h) => h(module.exports, { props: { api: window.previewApi, preview: true } }),
+        render: (h) => h(module.exports, { props: { preview: true } }),
       }).$mount('#app');
     </script>
   </body>

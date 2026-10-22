@@ -7,6 +7,10 @@ use walkdir::WalkDir;
 use wayline_support::digest;
 use xshell::{Shell, cmd};
 
+pub fn rpc_object(version: &str) -> String {
+    format!("wayline_{}", version.replace('.', "_"))
+}
+
 fn header(mode: u32, size: u64) -> Header {
     let mut header = Header::new_gnu();
     header.set_size(size);
@@ -137,6 +141,17 @@ pub fn build(version: &str) -> Result<()> {
     fs::create_dir(&root)?;
     let sh = Shell::new()?;
     cmd!(sh, "cp -a package/files/. {root}").run()?;
+    let object = rpc_object(version);
+    for (directory, source, alias) in [
+        ("usr/lib/oui-httpd/rpc", "wayline", object.clone()),
+        (
+            "usr/share/gl-validator.d",
+            "wayline.lua",
+            format!("{object}.lua"),
+        ),
+    ] {
+        std::os::unix::fs::symlink(source, root.join(directory).join(alias))?;
+    }
     let binaries = root.join("usr/sbin");
     fs::create_dir_all(&binaries)?;
     for name in ["waylined", "wayline-ctl"] {

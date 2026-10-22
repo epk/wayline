@@ -13,7 +13,8 @@
     : 'full';
   const wanDown = query.get('wan') === 'unavailable';
   const updateFailed = query.get('update') === 'failed';
-  const release = '0.1.0-alpha.13';
+  const release = '0.1.0-alpha.14';
+  const installed = query.get('stale') === '1' ? '0.0.0' : release;
   const directExit = query.get('exit') === 'direct';
   const wanMs = wanDown ? null : 14.37;
   const compatMessages = {
@@ -32,10 +33,10 @@
   const features = { full: 4, newer: 2, monitoring: 2, unsupported: 0 };
   let revision = 1;
   const state = {
-    version: '0.1.0-alpha.13',
+    version: installed,
     update: updateFailed
       ? {
-          current: '0.1.0-alpha.13',
+          current: installed,
           latest: release,
           available: true,
           phase: 'failed',
@@ -46,7 +47,7 @@
           updatedAt: Math.floor(Date.now() / 1000) - 120,
         }
       : {
-          current: '0.1.0-alpha.13',
+          current: installed,
           latest: null,
           available: false,
           phase: 'idle',
@@ -383,24 +384,24 @@
     runUpdate(steps);
     return Promise.resolve({ started: true, update: copy(state.update) });
   }
+  let stateReads = 0;
   window.previewApi = {
-    get_state: () =>
-      query.get('fail') === '1'
-        ? Promise.reject(Error('RPC error: Object not found'))
-        : Promise.resolve(
-            level === 'unsupported'
-              ? {
-                  ...copy(state),
-                  tunnels: [],
-                  endpoints: [],
-                  diagnostics: {},
-                  resolved: {},
-                  uplinks: [],
-                  events: [],
-                  auto: { enabled: false, last: null },
-                }
-              : copy(state),
-          ),
+    get_state: async () => {
+      if (query.get('slow') === '1' && stateReads++ === 0) await later(8000);
+      if (query.get('fail') === '1') throw Error('RPC error: Object not found');
+      return level === 'unsupported'
+        ? {
+            ...copy(state),
+            tunnels: [],
+            endpoints: [],
+            diagnostics: {},
+            resolved: {},
+            uplinks: [],
+            events: [],
+            auto: { enabled: false, last: null },
+          }
+        : copy(state);
+    },
     set_config: async ({ config, expected_revision }) => {
       if (expected_revision !== state.revision) throw Error('State changed. Refresh first.');
       const known = Object.keys(state.config);
@@ -449,13 +450,24 @@
       state.events = [];
       return delay({ applied: true });
     },
-    get_history: ({ tunnel, target, start, end, step, include_wan, all, endpoints, uplinks }) => {
+    get_history: async ({
+      tunnel,
+      target,
+      start,
+      end,
+      step,
+      include_wan,
+      all,
+      endpoints,
+      uplinks,
+    }) => {
+      if (query.get('slow') === '1') await later(step > 15 ? 2000 : 700);
       const ids = all
         ? state.tunnels.filter((t) => t.connected || t.historyAvailable).map((t) => t.id)
         : [tunnel];
       const withServers = all && endpoints && state.config.endpointDiagnostics;
       const events = state.events.filter((e) => e.at >= start && e.at <= end);
-      return Promise.resolve({
+      return {
         series: [
           ...ids.map((id) => series(id, target, start, end, step)),
           ...(include_wan && !wanDown ? [series('wan', target, start, end, step)] : []),
@@ -466,7 +478,7 @@
           points: line.points.filter((point) => point.at > historyCutoff),
         })),
         events,
-      });
+      };
     },
     check_update: () =>
       startUpdate('checking', [
@@ -496,5 +508,19 @@
               ],
             ]),
       ]),
+  };
+  window.previewRpc = (method, params) => {
+    const [sid, object, operation, request] = params;
+    const expected = ['get_state', 'get_history'].includes(operation)
+      ? 'wayline'
+      : 'wayline_' + release.replace(/\./g, '_');
+    if (
+      method !== 'call' ||
+      sid !== 'sid' ||
+      object !== expected ||
+      !Object.prototype.hasOwnProperty.call(window.previewApi, operation)
+    )
+      return Promise.reject(Error('RPC error: Method not found'));
+    return window.previewApi[operation](request);
   };
 })();

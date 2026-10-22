@@ -376,10 +376,15 @@ fn session(method: &str, params: &Value) -> Result<Value> {
 }
 
 fn http(sid: &str, method: &str, params: &Value) -> Result<Value> {
+    let object = crate::package::rpc_object(&crate::metadata::version()?.to_string());
+    http_object(sid, &object, method, params)
+}
+
+fn http_object(sid: &str, object: &str, method: &str, params: &Value) -> Result<Value> {
     wayline_support::atomic(
         &Path::new(ROOT).join("tmp/wayline-http.json"),
         &serde_json::to_vec(
-            &json!({"jsonrpc":"2.0","id":1,"method":"call","params":[sid,"wayline",method,params]}),
+            &json!({"jsonrpc":"2.0","id":1,"method":"call","params":[sid,object,method,params]}),
         )?,
     )?;
     Ok(serde_json::from_str(&call(
@@ -431,6 +436,7 @@ fn bridge_checks() -> Result<()> {
     })();
     fs::write(shadow, original)?;
     let sid = result?;
+    cached_bridge_check(&sid)?;
     let response = http(&sid, "get_state", &json!({}))?;
     ensure!(
         response["error"].is_null() && response["result"]["capabilities"]["control"] == true,
@@ -471,6 +477,27 @@ fn bridge_checks() -> Result<()> {
     Ok(())
 }
 
+fn cached_bridge_check(sid: &str) -> Result<()> {
+    let bridge = Path::new(ROOT).join("usr/lib/oui-httpd/rpc/wayline");
+    let current = fs::read_to_string(&bridge)?;
+    let legacy = current.replace("    'purge_history',\n", "");
+    ensure!(current != legacy, "The legacy bridge fixture is unchanged.");
+    fs::write(&bridge, legacy)?;
+    let loaded = http_object(sid, "wayline", "get_state", &json!({}));
+    fs::write(bridge, current)?;
+    ensure!(
+        loaded?["result"]["version"].is_string(),
+        "The previous bridge did not load."
+    );
+    ensure!(
+        http_object(sid, "wayline", "purge_history", &json!({"confirm":true}))?["error"]["code"]
+            == -32601,
+        "The previous bridge did not retain its cached methods."
+    );
+    println!("Reproduced the cached bridge failure without restarting the HTTP worker.");
+    Ok(())
+}
+
 fn purge_checks(sid: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let root = Path::new(ROOT);
@@ -504,6 +531,10 @@ fn purge_checks(sid: &str) -> Result<()> {
     ensure!(
         request("purge_history", &json!({"confirm":false})).is_err(),
         "An unconfirmed purge succeeded."
+    );
+    ensure!(
+        http(sid, "purge_history", &json!({"confirm":"true"}))?["error"]["code"] == -32602,
+        "The versioned bridge accepted invalid confirmation."
     );
     ensure!(
         files.iter().all(|path| path.is_file()),
