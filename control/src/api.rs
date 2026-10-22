@@ -2,7 +2,7 @@ use crate::{
     auto, changes, egress, history, native,
     resolve::Resolved,
     router::{self, Inventory, PathInfo, TunnelInfo},
-    runtime::{SETTINGS, locked, milliseconds, snapshot, version},
+    runtime::{SETTINGS, locked, milliseconds, snapshot, store, version},
     service::reconcile,
     settings::{self, Settings, Target},
     update,
@@ -10,9 +10,8 @@ use crate::{
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, net::Ipv4Addr, path::Path};
+use std::{collections::BTreeMap, net::Ipv4Addr};
 use wayline_protocol::{Series, State as Measurement};
-use wayline_support::atomic;
 
 const RECENT: usize = 8;
 const MAX_RECENT_LOSS: usize = 2;
@@ -551,7 +550,7 @@ pub fn set_config(request: SetConfig) -> Result<Value> {
             let previous = Settings::read()?;
             if previous != config {
                 auto::Record::touch(previous.auto_exit != config.auto_exit)?;
-                atomic(Path::new(SETTINGS), &serde_json::to_vec(&config)?)?;
+                store(SETTINGS, &config)?;
                 let hosts = router::hosts(&config, &inventory);
                 let mut resolved = Resolved::read();
                 if resolved.stale(&hosts) {
@@ -592,7 +591,7 @@ pub fn set_tunnel_enabled(request: &SetEnabled) -> Result<Value> {
             let mut config = stored.clone();
             router::normalize(&mut config, &inventory);
             if config != stored {
-                atomic(Path::new(SETTINGS), &serde_json::to_vec(&config)?)?;
+                store(SETTINGS, &config)?;
             }
             native::call::<Value>("set_tunnel", &json!({"tunnel_id":number,"enabled":enabled}))
                 .context(UNKNOWN)?;

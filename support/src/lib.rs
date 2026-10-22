@@ -12,6 +12,7 @@ use std::{
     io::{Read, Seek, Write},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -28,6 +29,34 @@ pub fn digest(data: &[u8]) -> String {
             let _ = write!(hex, "{byte:02x}");
             hex
         })
+}
+
+pub fn within<T: Send + 'static, F: FnOnce() -> T + Send + 'static>(
+    limit: Duration,
+    jobs: impl IntoIterator<Item = F>,
+) -> Vec<Option<T>> {
+    let deadline = Instant::now() + limit;
+    let pending: Vec<_> = jobs
+        .into_iter()
+        .map(|job| {
+            let (sender, receiver) = mpsc::channel();
+            thread::Builder::new()
+                .spawn(move || {
+                    let _ = sender.send(job());
+                })
+                .ok()
+                .map(|_| receiver)
+        })
+        .collect();
+    pending
+        .iter()
+        .map(|receiver| {
+            receiver
+                .as_ref()?
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .ok()
+        })
+        .collect()
 }
 
 pub fn read(path: &Path, limit: usize) -> Result<Vec<u8>> {

@@ -1,13 +1,12 @@
 use crate::{
     api::{self, Exits},
     native, router,
-    runtime::{RUNTIME, locked, now},
+    runtime::{RUNTIME, locked, now, store},
     settings::Settings,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
-use wayline_support::atomic;
+use std::fs;
 
 const HOLD_SECONDS: u64 = 300;
 const RECOVERY_SECONDS: u64 = 60;
@@ -64,22 +63,19 @@ impl Record {
     }
 
     pub fn read() -> Self {
+        let fresh = |needs_attention| Self {
+            at: now(),
+            needs_attention,
+            ..Self::default()
+        };
         match fs::read(Self::path()) {
-            Ok(data) => serde_json::from_slice(&data).unwrap_or_else(|_| Self {
-                at: now(),
-                needs_attention: true,
-                ..Self::default()
-            }),
-            Err(error) => Self {
-                at: now(),
-                needs_attention: error.kind() != std::io::ErrorKind::NotFound,
-                ..Self::default()
-            },
+            Ok(data) => serde_json::from_slice(&data).unwrap_or_else(|_| fresh(true)),
+            Err(error) => fresh(error.kind() != std::io::ErrorKind::NotFound),
         }
     }
 
     fn write(&self) -> Result<()> {
-        atomic(Path::new(&Self::path()), &serde_json::to_vec(self)?)
+        store(Self::path(), self)
     }
 
     pub fn touch(clear_attention: bool) -> Result<()> {

@@ -1,19 +1,17 @@
 use crate::{
     router::{Inventory, PathInfo, monitored},
-    runtime::{RUNTIME, now},
+    runtime::{RUNTIME, load, now, store},
     settings::Settings,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    convert::identity,
     net::{IpAddr, Ipv4Addr},
-    path::Path,
-    sync::mpsc::{self, Receiver},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
-use wayline_support::atomic;
+use wayline_support::within;
 
 const LIMIT: Duration = Duration::from_secs(6);
 const MAX_AGE: u64 = 300;
@@ -31,10 +29,7 @@ impl Cache {
     }
 
     pub fn read() -> Self {
-        std::fs::read(Self::path())
-            .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or_default()
+        load(Self::path())
     }
 
     pub fn view(config: &Settings, inventory: &Inventory) -> Self {
@@ -65,7 +60,7 @@ impl Cache {
             checked_at: now(),
             paths: probe_paths(&paths),
         };
-        atomic(Path::new(&Self::path()), &serde_json::to_vec(&fresh)?)
+        store(Self::path(), &fresh)
     }
 }
 
@@ -106,13 +101,15 @@ pub fn probe(inventory: &Inventory) -> Vec<Egress> {
 }
 
 fn probe_paths(paths: &[&PathInfo]) -> Vec<Egress> {
-    let deadline = Instant::now() + LIMIT;
-    let pending: Vec<_> = paths.iter().map(|path| start(path)).collect();
+    let jobs = paths.iter().map(|path| {
+        let (interface, source, mark) = (path.interface.clone(), path.source, path.mark);
+        move || trace(&interface, source, mark)
+    });
     paths
         .iter()
-        .zip(pending)
-        .map(|(path, pending)| {
-            let mut egress = Egress {
+        .zip(within(LIMIT, jobs))
+        .map(|(path, outcome)| {
+            let base = Egress {
                 id: path.id.clone(),
                 name: path.name.clone(),
                 interface: path.interface.clone(),
@@ -121,35 +118,23 @@ fn probe_paths(paths: &[&PathInfo]) -> Vec<Egress> {
                 colo: None,
                 error: None,
             };
-            match pending.and_then(|receiver| receive(&receiver, deadline)) {
-                Ok(trace) => {
-                    egress.ip = Some(trace.ip);
-                    egress.location = trace.location;
-                    egress.colo = trace.colo;
-                }
-                Err(error) => egress.error = Some(format!("{error:#}")),
+            match outcome
+                .context("The egress probe timed out.")
+                .and_then(identity)
+            {
+                Ok(trace) => Egress {
+                    ip: Some(trace.ip),
+                    location: trace.location,
+                    colo: trace.colo,
+                    ..base
+                },
+                Err(error) => Egress {
+                    error: Some(format!("{error:#}")),
+                    ..base
+                },
             }
-            egress
         })
         .collect()
-}
-
-fn start(path: &PathInfo) -> Result<Receiver<Result<Trace>>> {
-    let (sender, receiver) = mpsc::channel();
-    let (interface, source, mark) = (path.interface.clone(), path.source, path.mark);
-    thread::Builder::new()
-        .name("egress-probe".into())
-        .spawn(move || {
-            sender.send(trace(&interface, source, mark)).ok();
-        })
-        .context("Could not start the egress probe.")?;
-    Ok(receiver)
-}
-
-fn receive(receiver: &Receiver<Result<Trace>>, deadline: Instant) -> Result<Trace> {
-    receiver
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .context("The egress probe timed out.")?
 }
 
 fn trace(interface: &str, source: Ipv4Addr, mark: u32) -> Result<Trace> {

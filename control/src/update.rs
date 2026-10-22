@@ -1,5 +1,5 @@
 use crate::{
-    runtime::{RUNTIME, locked, now, version},
+    runtime::{RUNTIME, load, locked, now, store, version},
     settings::Settings,
 };
 use anyhow::{Context, Result, ensure};
@@ -84,7 +84,7 @@ pub struct Status {
 
 impl Status {
     pub fn read() -> Option<Self> {
-        serde_json::from_slice(&fs::read(Self::path()).ok()?).ok()
+        load(Self::path())
     }
 
     pub fn message(&self) -> &str {
@@ -96,7 +96,7 @@ impl Status {
     }
 
     fn write(&self) -> Result<()> {
-        atomic(&Self::path(), &serde_json::to_vec(self)?)
+        store(Self::path(), self)
     }
 
     fn working(previous: Option<&Self>, phase: Phase, message: &str) -> Self {

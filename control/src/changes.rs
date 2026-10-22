@@ -1,13 +1,12 @@
 use crate::{
     history,
     router::{Inventory, PathInfo},
-    runtime::{directory, now},
+    runtime::{directory, load, now, store},
     settings::Settings,
 };
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::BTreeMap, fs, iter, path::Path};
-use wayline_support::atomic;
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, iter, path::Path};
 
 pub const RECENT: usize = 50;
 const MAX_EVENTS: usize = 100;
@@ -27,15 +26,8 @@ pub struct Fact<'a> {
     fields: BTreeMap<&'static str, String>,
 }
 
-fn load<T: Default + DeserializeOwned>(path: &Path) -> T {
-    fs::read(path)
-        .ok()
-        .and_then(|data| serde_json::from_slice(&data).ok())
-        .unwrap_or_default()
-}
-
 pub fn read(config: &Settings) -> Vec<Event> {
-    load(&history::database(config).with_file_name("events.json"))
+    load(history::database(config).with_file_name("events.json"))
 }
 
 fn fact<'a, const N: usize>(
@@ -153,7 +145,7 @@ pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
     let mut stored: BTreeMap<String, String> = load(&facts_path);
     let (added, changed) = diff(now() * 1000, &mut stored, &facts(inventory));
     if changed {
-        atomic(&facts_path, &serde_json::to_vec(&stored)?)?;
+        store(&facts_path, &stored)?;
     }
     if !added.is_empty() {
         append(&database, added)?;
@@ -167,7 +159,7 @@ pub fn append(database: &Path, added: impl IntoIterator<Item = Event>) -> Result
     events.extend(added);
     let excess = events.len().saturating_sub(MAX_EVENTS);
     events.drain(..excess);
-    atomic(&path, &serde_json::to_vec(&events)?)
+    store(&path, &events)
 }
 
 #[cfg(test)]

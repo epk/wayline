@@ -1,19 +1,15 @@
 use crate::{
-    runtime::{RUNTIME, now},
+    runtime::{RUNTIME, load, now, store},
     settings::Target,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs,
     net::{IpAddr, Ipv4Addr, ToSocketAddrs},
-    path::Path,
-    sync::mpsc,
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
-use wayline_support::atomic;
+use wayline_support::within;
 
 const DEADLINE: Duration = Duration::from_secs(4);
 const MAX_AGE: u64 = 300;
@@ -30,10 +26,7 @@ impl Resolved {
     }
 
     pub fn read() -> Self {
-        fs::read(Self::path())
-            .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or_default()
+        load(Self::path())
     }
 
     pub fn host(&self, host: &str) -> Option<Ipv4Addr> {
@@ -54,36 +47,27 @@ impl Resolved {
     }
 
     pub fn refresh(&mut self, hosts: &[String]) -> Result<()> {
-        let (sender, receiver) = mpsc::channel();
-        for host in hosts {
-            let (sender, host) = (sender.clone(), host.clone());
-            thread::spawn(move || {
+        let jobs = hosts.iter().cloned().map(|host| {
+            move || {
                 let found = (host.as_str(), 0)
                     .to_socket_addrs()
-                    .map(|found| {
-                        found
-                            .filter_map(|address| match address.ip() {
-                                IpAddr::V4(address) => Some(address),
-                                IpAddr::V6(_) => None,
-                            })
-                            .collect::<Vec<_>>()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|address| match address.ip() {
+                        IpAddr::V4(address) => Some(address),
+                        IpAddr::V6(_) => None,
                     })
-                    .unwrap_or_default();
-                let _ = sender.send((host, found));
-            });
-        }
-        drop(sender);
+                    .collect::<Vec<_>>();
+                (host, found)
+            }
+        });
         self.hosts.retain(|host, _| hosts.contains(host));
-        let started = Instant::now();
-        while let Some(left) = DEADLINE.checked_sub(started.elapsed()) {
-            let Ok((host, found)) = receiver.recv_timeout(left) else {
-                break;
-            };
+        for (host, found) in within(DEADLINE, jobs).into_iter().flatten() {
             if !found.is_empty() || !self.hosts.contains_key(&host) {
                 self.hosts.insert(host, found);
             }
         }
         self.at = now();
-        atomic(Path::new(&Self::path()), &serde_json::to_vec(self)?)
+        store(Self::path(), self)
     }
 }

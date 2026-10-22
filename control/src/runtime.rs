@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use serde::{Serialize, de::DeserializeOwned};
 use std::{
     fs,
     io::{Read, Write},
@@ -10,6 +11,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use wayline_protocol::{MAX_STATUS, Series, Status};
+use wayline_support::atomic;
 
 pub const RUNTIME: &str = "/var/run/wayline";
 pub const MONITOR_CONFIG: &str = "/var/run/wayline/monitor.json";
@@ -22,6 +24,17 @@ pub fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+pub fn load<T: Default + DeserializeOwned>(path: impl AsRef<Path>) -> T {
+    fs::read(path)
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok())
+        .unwrap_or_default()
+}
+
+pub fn store(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
+    atomic(path.as_ref(), &serde_json::to_vec(value)?)
 }
 
 pub fn version() -> String {
