@@ -580,13 +580,11 @@ name = "wayline-control"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "flate2",
  "rustix",
  "semver",
  "serde",
  "serde_json",
  "socket2 0.6.5",
- "tar",
  "tempfile",
  "wayline-protocol",
  "wayline-support",

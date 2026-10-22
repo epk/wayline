@@ -6,14 +6,15 @@ use std::{fmt, io, net::Ipv4Addr, path::Path, str::FromStr};
 const MAX_TARGETS: usize = 5;
 static FALLBACK: Target = Target::Address(Ipv4Addr::new(1, 1, 1, 1));
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum Target {
     Address(Ipv4Addr),
     Host(String),
 }
 
-#[derive(Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "Each field represents an independent UI switch."
@@ -21,40 +22,16 @@ pub enum Target {
 pub struct Settings {
     pub enabled: bool,
     pub interval: u32,
+    #[serde(deserialize_with = "tunnel_list")]
     pub tunnels: Vec<String>,
     pub targets: Vec<Target>,
     pub direct_wan: bool,
     pub history_days: u32,
     pub auto_updates: bool,
     pub auto_exit: bool,
+    #[serde(deserialize_with = "tunnel_list")]
     pub auto_tunnels: Vec<String>,
     pub endpoint_diagnostics: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "Stored files mirror the independent UI switches."
-)]
-struct Stored {
-    enabled: bool,
-    interval: u32,
-    #[serde(deserialize_with = "tunnel_list")]
-    tunnels: Vec<String>,
-    targets: Vec<Target>,
-    target: Option<Target>,
-    diagnostics: Option<bool>,
-    direct_wan: bool,
-    history_hours: Option<u32>,
-    history_days: Option<u32>,
-    auto_updates: bool,
-    #[serde(default)]
-    auto_exit: bool,
-    #[serde(default, deserialize_with = "optional_tunnels")]
-    auto_tunnels: Option<Vec<String>>,
-    #[serde(default)]
-    endpoint_diagnostics: bool,
 }
 
 fn tunnel_list<'de, D: serde::Deserializer<'de>>(
@@ -65,64 +42,6 @@ fn tunnel_list<'de, D: serde::Deserializer<'de>>(
         return Ok(Vec::new());
     }
     serde_json::from_value(value).map_err(serde::de::Error::custom)
-}
-
-fn optional_tunnels<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<Vec<String>>, D::Error> {
-    tunnel_list(deserializer).map(Some)
-}
-
-impl TryFrom<Stored> for Settings {
-    type Error = anyhow::Error;
-
-    fn try_from(stored: Stored) -> Result<Self> {
-        ensure!(
-            stored
-                .history_hours
-                .is_none_or(|hours| [0, 24].contains(&hours)),
-            "Invalid history retention."
-        );
-        let history_days = stored.history_days.unwrap_or(match stored.history_hours {
-            Some(0) => 0,
-            _ => 7,
-        });
-        let targets = if let Some(primary) = stored.target {
-            let mut targets = vec![primary];
-            if stored.diagnostics.unwrap_or(false) {
-                for target in stored.targets {
-                    if !targets.contains(&target) {
-                        targets.push(target);
-                    }
-                }
-            }
-            targets.truncate(MAX_TARGETS);
-            targets
-        } else {
-            ensure!(stored.diagnostics.is_none(), "Unknown field diagnostics.");
-            stored.targets
-        };
-        Ok(Self {
-            enabled: stored.enabled,
-            interval: stored.interval,
-            tunnels: stored.tunnels,
-            targets,
-            direct_wan: stored.direct_wan,
-            history_days,
-            auto_updates: stored.auto_updates,
-            auto_exit: stored.auto_exit && stored.auto_tunnels.is_some(),
-            auto_tunnels: stored.auto_tunnels.unwrap_or_default(),
-            endpoint_diagnostics: stored.endpoint_diagnostics,
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for Settings {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        Self::try_from(Stored::deserialize(deserializer)?).map_err(serde::de::Error::custom)
-    }
 }
 
 impl Default for Settings {
@@ -198,22 +117,17 @@ impl fmt::Display for Target {
     }
 }
 
-impl Serialize for Target {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
+impl TryFrom<String> for Target {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
     }
 }
 
-impl<'de> Deserialize<'de> for Target {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
+impl From<Target> for String {
+    fn from(target: Target) -> Self {
+        target.to_string()
     }
 }
 
@@ -294,10 +208,6 @@ mod tests {
         values.iter().map(|value| value.parse::<Target>()).collect()
     }
 
-    fn listed(settings: &Settings) -> Vec<String> {
-        settings.targets.iter().map(ToString::to_string).collect()
-    }
-
     #[test]
     fn targets_parse() -> Result<()> {
         assert!(matches!("1.1.1.1".parse::<Target>()?, Target::Address(_)));
@@ -318,42 +228,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_with_diagnostics_merges_targets() -> Result<()> {
-        let old = r#"{"enabled":false,"target":"1.1.1.1","interval":15,"tunnels":{},"diagnostics":true,"targets":["8.8.8.8","1.1.1.1","9.9.9.9"],"directWan":false,"historyHours":24,"autoUpdates":false}"#;
-        let settings: Settings = serde_json::from_str(old)?;
-        settings.validate()?;
-        assert_eq!(listed(&settings), ["1.1.1.1", "8.8.8.8", "9.9.9.9"]);
-        assert!(!settings.auto_exit && !settings.endpoint_diagnostics);
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_without_diagnostics_keeps_only_target() -> Result<()> {
-        let old = r#"{"enabled":false,"target":"1.1.1.1","interval":15,"tunnels":{},"diagnostics":false,"targets":["8.8.8.8"],"directWan":false,"historyHours":24,"autoUpdates":false}"#;
-        let settings: Settings = serde_json::from_str(old)?;
-        settings.validate()?;
-        assert_eq!(listed(&settings), ["1.1.1.1"]);
-        assert_eq!(settings.primary().to_string(), "1.1.1.1");
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_merge_is_capped_at_five() -> Result<()> {
-        let old = r#"{"enabled":false,"target":"9.9.9.9","interval":15,"tunnels":{},"diagnostics":true,"targets":["1.1.1.1","8.8.8.8","4.4.4.4","5.5.5.5","6.6.6.6"],"directWan":false,"historyHours":24,"autoUpdates":false}"#;
-        let settings: Settings = serde_json::from_str(old)?;
-        settings.validate()?;
-        assert_eq!(
-            listed(&settings),
-            ["9.9.9.9", "1.1.1.1", "8.8.8.8", "4.4.4.4", "5.5.5.5"]
-        );
-        Ok(())
-    }
-
-    #[test]
     fn new_format_round_trips() -> Result<()> {
         let settings = Settings::default();
         let json = serde_json::to_string(&settings)?;
-        ensure!(!json.contains("\"target\"") && !json.contains("diagnostics"));
         let loaded: Settings = serde_json::from_str(&json)?;
         ensure!(loaded == settings, "The round trip changed settings.");
         loaded.validate()?;
@@ -374,13 +251,6 @@ mod tests {
             ..Settings::default()
         };
         settings.validate()?;
-        let mut old = serde_json::to_value(&settings)?;
-        old.as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("Missing settings object."))?
-            .remove("autoTunnels");
-        let migrated: Settings = serde_json::from_value(old)?;
-        assert!(!migrated.auto_exit && migrated.auto_tunnels.is_empty());
-        migrated.validate()?;
         for pool in [
             vec!["vpn:1"],
             vec!["vpn:1", "vpn:1"],
@@ -420,18 +290,18 @@ mod tests {
     }
 
     #[test]
-    fn history_retention_maps_legacy_hours() -> Result<()> {
-        let legacy = |hours: u32| {
-            format!(
-                r#"{{"enabled":false,"interval":5,"tunnels":[],"targets":["1.1.1.1"],"directWan":false,"historyHours":{hours},"autoUpdates":false}}"#
-            )
-        };
-        ensure!(serde_json::from_str::<Settings>(&legacy(24))?.history_days == 7);
-        ensure!(serde_json::from_str::<Settings>(&legacy(0))?.history_days == 0);
-        ensure!(serde_json::from_str::<Settings>(&legacy(12)).is_err());
+    fn stored_files_ignore_unknown_keys() -> Result<()> {
+        let old = r#"{"target":"1.1.1.1","diagnostics":true,"historyHours":24,"tunnels":{},"autoTunnels":{}}"#;
+        let settings: Settings = serde_json::from_str(old)?;
+        settings.validate()?;
+        ensure!(settings == Settings::default());
+        Ok(())
+    }
+
+    #[test]
+    fn history_retention_is_validated() -> Result<()> {
         let json = serde_json::to_string(&Settings::default())?;
-        ensure!(json.contains("\"historyDays\":7") && !json.contains("historyHours"));
-        ensure!(Settings::default().interval == 5);
+        ensure!(json.contains("\"historyDays\":7"));
         Settings {
             history_days: 30,
             interval: 1,

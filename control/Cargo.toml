@@ -17,13 +17,11 @@ bench = false
 wayline-protocol.workspace = true
 wayline-support.workspace = true
 anyhow.workspace = true
-flate2.workspace = true
 rustix = { workspace = true, features = ["process", "fs"] }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 socket2.workspace = true
-tar.workspace = true
 tempfile.workspace = true
 
 [lints]
