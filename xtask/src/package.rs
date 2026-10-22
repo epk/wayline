@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, write::GzEncoder};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{fs, io::Write, path::Path};
 use tar::{Builder, EntryType, Header};
 use walkdir::WalkDir;
@@ -198,44 +198,31 @@ pub fn build(version: &str) -> Result<()> {
 }
 
 fn licenses(version: &str) -> Result<()> {
-    let data = wayline_support::output(
-        "cargo",
-        &["metadata", "--format-version", "1", "--locked", "--offline"],
-        2 * 1024 * 1024,
-        30,
-    )?;
-    let metadata: Value = serde_json::from_slice(&data)?;
+    let metadata = crate::metadata::workspace()?;
     ensure!(
-        metadata["packages"]
-            .as_array()
-            .is_some_and(
-                |packages| packages.iter().any(|package| package["name"] == "waylined"
-                    && package["source"].is_null()
-                    && package["version"] == version)
-            ),
+        metadata
+            .packages
+            .iter()
+            .any(|package| package.name == "waylined"
+                && package.source.is_none()
+                && package.version.to_string() == version),
         "The tag and package version differ."
     );
     let output = Path::new("dist/licenses");
+    if output.exists() {
+        fs::remove_dir_all(output)?;
+    }
     fs::create_dir_all(output)?;
-    for package in metadata["packages"]
-        .as_array()
-        .context("Invalid dependency metadata.")?
-    {
-        if package["source"].is_null() {
+    for package in &metadata.packages {
+        if package.source.is_none() {
             continue;
         }
-        let source = Path::new(
-            package["manifest_path"]
-                .as_str()
-                .context("Missing dependency source.")?,
-        )
-        .parent()
-        .context("Invalid dependency source.")?;
-        let name = format!(
-            "{}-{}",
-            package["name"].as_str().unwrap_or_default(),
-            package["version"].as_str().unwrap_or_default()
-        );
+        let source = package
+            .manifest_path
+            .as_std_path()
+            .parent()
+            .context("Invalid dependency source.")?;
+        let name = format!("{}-{}", package.name, package.version);
         copy_licenses(
             source,
             &output.join(name),
@@ -289,21 +276,5 @@ pub fn release(version: &str) -> Result<()> {
     )
     .run()?;
     fs::copy("package/files/etc/wayline/release.pub", "dist/release.pub")?;
-    Ok(())
-}
-
-pub fn publish(version: &str) -> Result<()> {
-    let tag = format!("v{version}");
-    let title = format!("Wayline {version}");
-    let artifact = format!("dist/wayline_{version}_aarch64_cortex-a53.ipk");
-    let sh = Shell::new()?;
-    let mut release = cmd!(
-        sh,
-        "gh release create {tag} --repo epk/wayline --verify-tag --title {title} --notes '' {artifact} dist/manifest.json dist/manifest.json.sig dist/release.pub dist/licenses.tar.gz"
-    );
-    if !semver::Version::parse(version)?.pre.is_empty() {
-        release = release.arg("--prerelease");
-    }
-    release.run()?;
     Ok(())
 }

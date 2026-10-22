@@ -449,6 +449,7 @@ fn bridge_checks() -> Result<()> {
         http("", "set_tunnel_enabled", &args)?["error"].is_object(),
         "The bridge accepted a missing session."
     );
+    purge_checks(&sid)?;
     session("logout", &json!({"sid":sid}))?;
     ensure!(
         http(&sid, "set_tunnel_enabled", &args)?["error"].is_object(),
@@ -467,6 +468,95 @@ fn bridge_checks() -> Result<()> {
         "A local RPC request bypassed administrator access."
     );
     println!("Native authenticated bridge checks passed with one HTTP worker.");
+    Ok(())
+}
+
+fn purge_checks(sid: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Path::new(ROOT);
+    let settings = fs::read(root.join("etc/wayline/settings.json"))?;
+    let policy = fs::read(root.join("etc/config/route_policy"))?;
+    let mut files = Vec::new();
+    for directory in ["etc/wayline/history", "var/run/wayline/history"] {
+        let directory = root.join(directory);
+        fs::create_dir_all(&directory)?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        for name in [
+            "latency.sqlite",
+            "latency.sqlite-journal",
+            "latency.sqlite-wal",
+            "latency.sqlite-shm",
+            "latency.sqlite.broken",
+            "events.json",
+            "facts.json",
+        ] {
+            let path = directory.join(name);
+            fs::write(&path, b"purge fixture")?;
+            files.push(path);
+        }
+        fs::write(directory.join("keep.txt"), b"unrelated")?;
+    }
+    let parameters = json!({"confirm":true});
+    ensure!(
+        http("", "purge_history", &parameters)?["error"].is_object(),
+        "An unauthenticated purge succeeded."
+    );
+    ensure!(
+        request("purge_history", &json!({"confirm":false})).is_err(),
+        "An unconfirmed purge succeeded."
+    );
+    ensure!(
+        files.iter().all(|path| path.is_file()),
+        "A rejected purge removed history."
+    );
+    let directory = root.join("etc/wayline/history");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))?;
+    ensure!(
+        request("purge_history", &parameters).is_err(),
+        "A purge accepted an insecure history directory."
+    );
+    ensure!(
+        files.iter().all(|path| path.is_file()),
+        "An insecure purge removed history."
+    );
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join("var/run/wayline/history.lock"))?;
+    lock.lock()?;
+    ensure!(
+        request("purge_history", &parameters).is_err(),
+        "A concurrent purge ignored the history lock."
+    );
+    drop(lock);
+    for _ in 0..2 {
+        ensure!(
+            http(sid, "purge_history", &parameters)?["result"]["applied"] == true,
+            "The authenticated purge failed."
+        );
+        ensure!(
+            files.iter().all(|path| !path.exists()),
+            "The purge retained history files."
+        );
+    }
+    for directory in ["etc/wayline/history", "var/run/wayline/history"] {
+        ensure!(
+            fs::read(root.join(directory).join("keep.txt"))? == b"unrelated",
+            "The purge removed an unrelated file."
+        );
+    }
+    ensure!(
+        settings == fs::read(root.join("etc/wayline/settings.json"))?
+            && policy == fs::read(root.join("etc/config/route_policy"))?,
+        "The purge changed settings or VPN policy."
+    );
+    ensure!(
+        fs::read_to_string(root.join("var/run/wayline/history-cutoff"))?.parse::<u64>()? > 0,
+        "The purge did not block buffered history replay."
+    );
+    println!("Authenticated history purge, repetition, and rejection checks passed.");
     Ok(())
 }
 

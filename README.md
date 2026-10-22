@@ -2,7 +2,7 @@
 
 Wayline compares VPN tunnels on GL.iNet routers. The **VPN → Wayline** page shows latency, loss, history, and exit addresses. It provides native tunnel Start and Stop controls and manual exit selection.
 
-Wayline is experimental. This README describes **0.1.0-alpha.12**, which includes safety fixes and a separate automatic-switching pool. Install signed packages from [GitHub Releases](https://github.com/epk/wayline/releases).
+Wayline is experimental. This README describes **0.1.0-alpha.13**, which adds history purge and separate CI jobs. Install signed packages from [GitHub Releases](https://github.com/epk/wayline/releases).
 
 The screenshots use synthetic data. They contain no live router addresses, endpoints, locations, or tunnel names.
 
@@ -41,7 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/epk/wayline/main/install.sh | sh
 
 The installer downloads the newest published release, including prereleases. It checks the signing key fingerprint, manifest signature, and package hash before installation.
 
-To install a specific version, download `install.sh`. Run `WAYLINE_VERSION=0.1.0-alpha.12 sh install.sh`.
+To install a specific version, download `install.sh`. Run `WAYLINE_VERSION=0.1.0-alpha.13 sh install.sh`.
 
 Create your VPN profiles in the factory dashboard first. Open **VPN → Wayline → Settings**. Choose the tunnels and destinations to monitor, then enable monitoring.
 
@@ -68,6 +68,8 @@ An uncertain switch stops further automatic requests until you review the native
 The monitor supports at most 90 simultaneous measurements. If a configuration needs more, the page warns, and the lowest-priority measurements are skipped; monitoring and exit controls keep working.
 
 ## Update and remove
+
+To clear stored measurements, open **Settings → History → Purge history**. Confirm **Delete all history** to remove latency history, change events, and recovery copies from memory and flash. This action is immediate. Settings and VPN tunnels stay unchanged. New history begins with the next complete measurement bucket.
 
 Choose **Settings → Check for update**, or run `wayline-ctl update --check`. Run `wayline-ctl update` to install an available signed update.
 
@@ -96,10 +98,14 @@ nix run -f nix/bootstrap.nix devenv -- shell
 
 - `cargo xtask deps` fetches locked dependencies.
 - `cargo xtask check` runs formatting, strict Clippy, critical unit checks, and frontend and integration linters.
+- `cargo xtask lint` runs formatting, strict Clippy, and frontend and integration linters.
+- `cargo xtask test` runs the existing critical unit checks.
 - `cargo xtask build` builds the ARM64 binaries and UI bundle.
 - `cargo xtask package [version]` creates the IPK in `dist/`.
 - `cargo xtask preview` serves the UI with synthetic data.
 - `cargo xtask lab` runs the isolated closed-box checks.
+
+CI uses separate lint, build, and test jobs on native ARM64 runners. Tests use the binaries and package from the build job. A version change on `main` publishes those same artifacts after all checks pass. Other branches do not publish releases.
 
 The macOS lab uses a minimal Colima VM with network namespaces and WireGuard interfaces. It starts no containers. Keep fault injection, tunnel changes, and package installation off routers that provide your working Internet connection.
 

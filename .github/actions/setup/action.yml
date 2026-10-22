@@ -1,0 +1,44 @@
+name: Set up the locked environment
+description: Restore the Nix, Rust, and frontend caches for one CI profile.
+inputs:
+  profile:
+    description: The devenv CI profile.
+    required: true
+  frontend:
+    description: Restore and install frontend dependencies.
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+    - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866
+      with:
+        name: devenv
+    - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569
+      with:
+        primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'nix/**', 'rust-toolchain.toml') }}
+        restore-prefixes-first-match: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-
+        save: ${{ github.event_name == 'push' }}
+    - name: Install pinned devenv
+      shell: bash
+      run: nix profile install -f nix/bootstrap.nix devenv
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: ${{ inputs.profile }}
+        key: ${{ hashFiles('devenv.lock', 'devenv.nix') }}
+        cmd-format: devenv --no-tui --no-reload --profile ${{ inputs.profile }} shell -- {0}
+        save-if: ${{ github.event_name == 'push' }}
+        cache-bin: 'false'
+    - name: Fetch locked Rust dependencies
+      shell: devenv --no-tui --no-reload --profile ${{ inputs.profile }} shell -- bash -e {0}
+      run: cargo fetch --locked
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      if: inputs.frontend == 'true'
+      with:
+        path: ~/.local/share/pnpm/store
+        key: pnpm-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('devenv.lock', 'ui/pnpm-lock.yaml') }}
+        restore-keys: pnpm-v1-${{ runner.os }}-${{ runner.arch }}-
+    - name: Install locked frontend dependencies
+      if: inputs.frontend == 'true'
+      shell: devenv --no-tui --no-reload --profile ${{ inputs.profile }} shell -- bash -e {0}
+      run: pnpm --dir ui install --frozen-lockfile --ignore-scripts --prefer-offline

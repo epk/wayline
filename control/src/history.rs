@@ -1,7 +1,7 @@
 use crate::{
     changes::{self, Event},
     router::{Inventory, endpoint_series, endpoints_enabled, series_id, tunnel_prefix},
-    runtime::{RUNTIME, directory, milliseconds, now, ring},
+    runtime::{RUNTIME, directory, locked, milliseconds, now, ring},
     settings::{Settings, Target},
 };
 use anyhow::{Context, Error, Result, ensure};
@@ -117,6 +117,68 @@ pub fn database(config: &Settings) -> PathBuf {
 
 fn known_cache() -> PathBuf {
     Path::new(RUNTIME).join("stored-series.json")
+}
+
+fn fresh_ring() -> Result<Vec<Series>> {
+    let cutoff = match fs::read_to_string(Path::new(RUNTIME).join("history-cutoff")) {
+        Ok(value) => value
+            .parse::<u64>()
+            .context("Invalid history reset marker.")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    let mut samples = ring();
+    discard_before(&mut samples, cutoff);
+    Ok(samples)
+}
+
+fn discard_before(samples: &mut [Series], cutoff: u64) {
+    for series in samples {
+        series.buckets.retain(|bucket| bucket.at > cutoff);
+    }
+}
+
+pub fn purge() -> Result<()> {
+    locked("history", || {
+        let roots = [
+            PathBuf::from("/etc/wayline/history"),
+            Path::new(RUNTIME).join("history"),
+        ];
+        for root in &roots {
+            if root.try_exists()? {
+                directory(root)?;
+            }
+        }
+        atomic(
+            &Path::new(RUNTIME).join("history-cutoff"),
+            now().to_string().as_bytes(),
+        )?;
+        for root in roots {
+            for name in [
+                "latency.sqlite",
+                "latency.sqlite-journal",
+                "latency.sqlite-wal",
+                "latency.sqlite-shm",
+                "latency.sqlite.broken",
+                "events.json",
+                "facts.json",
+            ] {
+                remove(&root.join(name))?;
+            }
+        }
+        remove(&known_cache())?;
+        remove(&Path::new(RUNTIME).join("last-collect"))
+    })
+}
+
+fn remove(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("Cannot remove history file {}.", path.display()))
+        }
+    }
 }
 
 pub fn known_prefixes() -> BTreeSet<String> {
@@ -451,10 +513,14 @@ fn collect_at(path: &Path, days: u32, ring: &[Series]) -> Result<()> {
 }
 
 pub fn collect(config: &Settings) -> Result<()> {
+    locked("history", || collect_inner(config))
+}
+
+fn collect_inner(config: &Settings) -> Result<()> {
     let path = database(config);
     directory(path.parent().context("Invalid history directory.")?)?;
     let cache = known_cache();
-    let ring = ring();
+    let ring = fresh_ring()?;
     let idle = ring.iter().all(|series| series.buckets.is_empty());
     if now() < MIN_CLOCK || (idle && cache.exists()) {
         return Ok(());
@@ -593,6 +659,10 @@ fn lines(
 }
 
 pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {
+    locked("history", || query_inner(config, inventory, query))
+}
+
+fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {
     let step = resolution(
         config.history_days,
         query.step,
@@ -650,7 +720,7 @@ pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<
             identity: series_id(wan.prefix(), target),
         });
     }
-    let series = lines(&database(config), step, query, &ring(), subjects)?;
+    let series = lines(&database(config), step, query, &fresh_ring()?, subjects)?;
     let events = changes::read(config)
         .into_iter()
         .filter(|event| (query.start..=query.end).contains(&event.at))
@@ -698,6 +768,19 @@ mod tests {
             median_us: Some(value),
             max_us: Some(value),
         }
+    }
+
+    #[test]
+    fn purged_buckets_cannot_return_from_the_live_ring() {
+        let mut live = vec![series(
+            "test",
+            vec![bucket(90, 1, 0), bucket(105, 1, 0), bucket(120, 1, 0)],
+        )];
+        super::discard_before(&mut live, 105);
+        assert_eq!(live[0].buckets.len(), 1);
+        assert_eq!(live[0].buckets[0].at, 120);
+        super::discard_before(&mut live, 105);
+        assert_eq!(live[0].buckets.len(), 1);
     }
 
     fn value(index: u64) -> u32 {

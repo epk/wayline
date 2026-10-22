@@ -303,6 +303,33 @@
           Recent minutes keep full detail; older history is summarized. The monitor saves in batches
           to limit flash writes.
         </p>
+        <p class="vph-muted">
+          Purge stored latency history and change events from memory and flash. Live measurements
+          continue. Settings and VPN tunnels stay unchanged.
+        </p>
+        <button
+          v-if="!purgeConfirm"
+          type="button"
+          class="vph-button"
+          :disabled="busy"
+          @click="purgeConfirm = true"
+        >
+          Purge history
+        </button>
+        <div v-else role="group" aria-label="Confirm history deletion">
+          <p>This permanently deletes all stored history, including recovery copies. Continue?</p>
+          <button type="button" class="vph-button" :disabled="busy" @click="purgeConfirm = false">
+            Cancel purge
+          </button>
+          <button
+            type="button"
+            class="vph-button vph-danger"
+            :disabled="busy"
+            @click="purgeHistory"
+          >
+            {{ busyAction === 'purge' ? 'Purging…' : 'Delete all history' }}
+          </button>
+        </div>
       </section>
       <section class="vph-set" aria-labelledby="vph-set-updates">
         <h3 id="vph-set-updates">Updates</h3>
@@ -327,7 +354,7 @@
       <footer>
         <button type="button" class="vph-button" @click="closeSettings">Cancel</button
         ><button class="vph-button vph-primary" :disabled="busy">
-          {{ busy ? 'Saving…' : 'Save settings' }}
+          {{ busy && busyAction !== 'purge' ? 'Saving…' : 'Save settings' }}
         </button>
       </footer>
     </form>
@@ -881,6 +908,7 @@ export default {
       updatePolling: false,
       updateLostSince: 0,
       pendingStop: '',
+      purgeConfirm: false,
       busyAction: '',
       noticeTimer: null,
       draft: defaults(),
@@ -1343,12 +1371,15 @@ export default {
     },
     openSettings() {
       if (!this.can.configure) return;
+      this.purgeConfirm = false;
       this.draft = settingsFrom(this.state.config);
       this.settingsOpen = !this.settingsOpen;
       if (this.settingsOpen)
         this.$nextTick(() => this.$refs.firstField && this.$refs.firstField.focus());
     },
     closeSettings() {
+      if (this.busy) return;
+      this.purgeConfirm = false;
       this.settingsOpen = false;
       this.$nextTick(() => this.$refs.settingsButton && this.$refs.settingsButton.focus());
     },
@@ -1485,6 +1516,30 @@ export default {
       this.draft.autoTunnels = this.draft.autoTunnels.filter((id) =>
         this.draft.tunnels.includes(id),
       );
+    },
+    async purgeHistory() {
+      if (this.busy || !this.purgeConfirm) return;
+      this.busy = true;
+      this.busyAction = 'purge';
+      this.error = '';
+      this.historyRequest++;
+      try {
+        await this.call('purge_history', { confirm: true });
+        this.historyRequest++;
+        this.history = [];
+        this.historyMarkers = [];
+        this.historyAt = 0;
+        this.historyLoaded = false;
+        this.state.events = [];
+        this.purgeConfirm = false;
+        this.notice = 'Stored history was purged. New measurements will appear shortly.';
+        await this.loadHistory();
+      } catch (e) {
+        this.error = this.describe(e, 'History could not be purged.');
+      } finally {
+        this.busy = false;
+        this.busyAction = '';
+      }
     },
     async saveSettings() {
       if (this.busy) return;

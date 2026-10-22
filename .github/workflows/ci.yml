@@ -1,49 +1,126 @@
-name: Check
+name: CI
 on:
   push:
+    branches: ['**']
   pull_request:
 permissions:
   contents: read
 concurrency:
-  group: check-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 jobs:
-  check:
+  lint:
+    name: Lint
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: ./.github/actions/setup
+        with:
+          profile: ci-lint
+          frontend: 'true'
+      - name: Formatting, Clippy, and integration linters
+        shell: devenv --no-tui --no-reload --profile ci-lint shell -- bash -e {0}
+        run: cargo xtask lint
+  build:
+    name: Build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    outputs:
+      artifact: wayline-build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+      publish: ${{ steps.metadata.outputs.publish }}
     defaults:
       run:
-        shell: devenv shell -- bash -e {0}
+        shell: devenv --no-tui --no-reload --profile ci-build shell -- bash -e {0}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
-      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          name: devenv
-      - name: Install the pinned devenv
-        shell: bash
-        run: nix profile install -f nix/bootstrap.nix devenv
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
         with:
+          profile: ci-build
+          frontend: 'true'
+      - name: Read package and release metadata
+        id: metadata
+        env:
+          WAYLINE_PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          WAYLINE_BASE_SHA: ${{ github.event.before }}
+        run: cargo xtask ci-metadata
+      - name: Build ARM64 binaries and frontend
+        run: cargo xtask build
+      - name: Package the binaries
+        run: cargo xtask package
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: wayline-build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+            dist/*.ipk
+            dist/licenses.tar.gz
+            target/aarch64-unknown-linux-musl/release/waylined
+            target/aarch64-unknown-linux-musl/release/wayline-ctl
+            target/aarch64-unknown-linux-musl/release/wayline-dev
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+  test:
+    name: Test
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: devenv --no-tui --no-reload --profile ci-test shell -- bash -e {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: ./.github/actions/setup
         with:
-          path: |
-            ui/node_modules
-            ~/.local/share/pnpm/store
-          key: pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ui/pnpm-lock.yaml') }}
-          restore-keys: |
-            pnpm-${{ runner.os }}-${{ runner.arch }}-
-      - name: Check, build, and lab inside one devenv shell
-        run: |
-          cargo fetch --locked
-          cargo xtask deps
-          cargo xtask check
-          cargo xtask build
-          cargo xtask lab
+          profile: ci-test
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: .
+      - name: Critical unit checks
+        run: cargo xtask test
+      - name: Closed-box WireGuard checks
+        run: cargo xtask lab
+  release:
+    name: Release
+    needs: [lint, build, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: ./.github/actions/setup
+        with:
+          profile: ci-release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: .
+      - name: Sign the built package manifest
+        shell: devenv --no-tui --no-reload --profile ci-release shell -- bash -e {0}
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          WAYLINE_VERSION: ${{ needs.build.outputs.version }}
+        run: cargo xtask release "$WAYLINE_VERSION"
+      - uses: ncipollo/release-action@98d25d4189e9b6cee19b8635b1ea5cc39c158a41
+        with:
+          tag: ${{ needs.build.outputs.tag }}
+          commit: ${{ github.sha }}
+          name: Wayline ${{ needs.build.outputs.version }}
+          prerelease: ${{ needs.build.outputs.prerelease }}
+          artifacts: dist/*.ipk,dist/manifest.json,dist/manifest.json.sig,dist/release.pub,dist/licenses.tar.gz
+          artifactErrorsFailBuild: true
+          immutableCreate: true
+          skipIfReleaseExists: true
+          allowUpdates: true
+          updateOnlyUnreleased: true
+          replacesArtifacts: true
+          generateReleaseNotes: false
+          body: ''

@@ -530,6 +530,19 @@ pub fn history(query: &history::Query) -> Result<history::Response> {
     history::query(&Settings::read()?, &router::inventory_with(false)?, query)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PurgeHistory {
+    confirm: bool,
+}
+
+pub fn purge_history(request: &PurgeHistory) -> Result<Value> {
+    native::require(native::Level::Monitoring)?;
+    ensure!(request.confirm, "Confirm history deletion first.");
+    history::purge()?;
+    Ok(json!({"applied":true}))
+}
+
 pub fn set_config(request: SetConfig) -> Result<Value> {
     locked("selection", || {
         locked("settings", || {

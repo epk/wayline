@@ -22,6 +22,10 @@ pub fn stop() -> Result<()> {
 }
 
 pub fn start() -> Result<()> {
+    for name in ["waylined", "wayline-ctl", "wayline-dev"] {
+        let path = Path::new("target/aarch64-unknown-linux-musl/release").join(name);
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    }
     let root = fs::canonicalize(".")?;
     let sh = Shell::new()?;
     if cfg!(target_os = "linux") {

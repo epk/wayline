@@ -1,7 +1,7 @@
 use crate::{
     history,
     router::{Inventory, PathInfo},
-    runtime::{directory, load, now, store},
+    runtime::{directory, load, locked, now, store},
     settings::Settings,
 };
 use anyhow::{Context, Result};
@@ -139,6 +139,10 @@ pub fn diff(at: u64, stored: &mut BTreeMap<String, String>, facts: &[Fact]) -> (
 }
 
 pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
+    locked("history", || record_inner(config, inventory))
+}
+
+fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
     let database = history::database(config);
     let facts_path = database.with_file_name("facts.json");
     directory(facts_path.parent().context("Invalid history directory.")?)?;

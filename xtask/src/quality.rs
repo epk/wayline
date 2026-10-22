@@ -31,17 +31,27 @@ fn sources(root: &str, extension: &str) -> Vec<String> {
 }
 
 pub fn check() -> Result<()> {
+    lint()?;
+    test()
+}
+
+pub fn test() -> Result<()> {
+    let sh = Shell::new()?;
+    cmd!(
+        sh,
+        "cargo test --locked --offline --package wayline-control"
+    )
+    .run()?;
+    Ok(())
+}
+
+pub fn lint() -> Result<()> {
     let sh = Shell::new()?;
     cmd!(sh, "cargo fmt --all --check").run()?;
     cmd!(sh, "cargo clippy --locked --offline --all-targets --target aarch64-unknown-linux-musl --workspace -- -D warnings").run()?;
     cmd!(
         sh,
         "cargo clippy --locked --offline --all-targets --package xtask -- -D warnings"
-    )
-    .run()?;
-    cmd!(
-        sh,
-        "cargo test --locked --offline --package wayline-control"
     )
     .run()?;
     cmd!(sh, "luacheck {LUA...} --config .luacheckrc").run()?;

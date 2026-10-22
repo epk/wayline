@@ -3,6 +3,7 @@ local rpc = require('oui.rpc')
 local methods = {
     'get_state',
     'get_history',
+    'purge_history',
     'set_config',
     'select_tunnel',
     'set_tunnel_enabled',

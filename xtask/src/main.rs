@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod lab;
+mod metadata;
 mod native;
 mod package;
 mod quality;
@@ -65,11 +66,13 @@ fn main() -> Result<()> {
     match args.next().as_deref() {
         Some("deps") => deps(),
         Some("check") => quality::check(),
+        Some("lint") => quality::lint(),
+        Some("test") => quality::test(),
+        Some("ci-metadata") => metadata::ci(),
         Some("format") => quality::format(),
         Some("build") => build(),
         Some("package") => package::build(&release_version(args.next())?),
         Some("release") => package::release(&release_version(args.next())?),
-        Some("publish") => package::publish(&release_version(args.next())?),
         Some("preview") => preview(),
         Some("lab") => lab::start(),
         Some("lab-native") => {
@@ -83,15 +86,13 @@ fn main() -> Result<()> {
         Some("lab-inside") => lab::inside(),
         Some("lab-stop") => lab::stop(),
         _ => anyhow::bail!(
-            "Use deps, check, format, build, package, release, publish, preview, lab, or lab-stop."
+            "Use deps, check, lint, test, ci-metadata, format, build, package, release, preview, lab, or lab-stop."
         ),
     }
 }
 
 fn release_version(argument: Option<String>) -> Result<String> {
-    let version = argument
-        .or_else(|| std::env::var("GITHUB_REF_NAME").ok())
-        .unwrap_or_else(|| "0.1.0-alpha.12".into());
+    let version = argument.unwrap_or(metadata::version()?.to_string());
     let version = version.strip_prefix('v').unwrap_or(&version).to_owned();
     semver::Version::parse(&version)?;
     Ok(version)

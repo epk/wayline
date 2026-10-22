@@ -13,7 +13,7 @@
     : 'full';
   const wanDown = query.get('wan') === 'unavailable';
   const updateFailed = query.get('update') === 'failed';
-  const release = '0.1.0-alpha.12';
+  const release = '0.1.0-alpha.13';
   const directExit = query.get('exit') === 'direct';
   const wanMs = wanDown ? null : 14.37;
   const compatMessages = {
@@ -32,10 +32,10 @@
   const features = { full: 4, newer: 2, monitoring: 2, unsupported: 0 };
   let revision = 1;
   const state = {
-    version: '0.1.0-alpha.12',
+    version: '0.1.0-alpha.13',
     update: updateFailed
       ? {
-          current: '0.1.0-alpha.12',
+          current: '0.1.0-alpha.13',
           latest: release,
           available: true,
           phase: 'failed',
@@ -46,7 +46,7 @@
           updatedAt: Math.floor(Date.now() / 1000) - 120,
         }
       : {
-          current: '0.1.0-alpha.12',
+          current: '0.1.0-alpha.13',
           latest: null,
           available: false,
           phase: 'idle',
@@ -308,6 +308,7 @@
   };
   state.tunnels.forEach((tunnel) => (tunnel.monitorId = tunnel.id));
   const copy = (o) => JSON.parse(JSON.stringify(o));
+  let historyCutoff = 0;
   const delay = (o) => new Promise((resolve) => setTimeout(() => resolve(copy(o)), 180));
   const measurableUplinks = state.uplinks
     .filter((u) => !u.active && u.state === 'reachable')
@@ -442,6 +443,12 @@
       }
       return delay({ applied: true, enabled });
     },
+    purge_history: async ({ confirm }) => {
+      if (confirm !== true) throw Error('Confirm history deletion first.');
+      historyCutoff = Date.now();
+      state.events = [];
+      return delay({ applied: true });
+    },
     get_history: ({ tunnel, target, start, end, step, include_wan, all, endpoints, uplinks }) => {
       const ids = all
         ? state.tunnels.filter((t) => t.connected || t.historyAvailable).map((t) => t.id)
@@ -454,7 +461,10 @@
           ...(include_wan && !wanDown ? [series('wan', target, start, end, step)] : []),
           ...(uplinks ? measurableUplinks.map((id) => series(id, target, start, end, step)) : []),
           ...(withServers ? ids.map((id) => serverSeries(id, target, start, end, step)) : []),
-        ],
+        ].map((line) => ({
+          ...line,
+          points: line.points.filter((point) => point.at > historyCutoff),
+        })),
         events,
       });
     },

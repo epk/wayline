@@ -17,6 +17,26 @@ let
     coreutils
     glibc.bin
   ];
+  rustTools = [
+    rust
+    pkgs.stdenv.cc
+    pkgs.llvmPackages.lld
+    pkgs.git
+    pkgs.coreutils
+  ];
+  frontendTools = [
+    pkgs.nodejs_24
+    pkgs.pnpm
+  ];
+  lintTools = with pkgs; [
+    lua5_1
+    lua51Packages.luacheck
+    stylua
+    shellcheck
+    shfmt
+    nixfmt
+    actionlint
+  ];
 in
 {
   overlays = [ inputs.rust-overlay.overlays.default ];
@@ -35,7 +55,6 @@ in
       nixfmt
       actionlint
       git
-      gh
       curl
       usign
       binutils
@@ -83,8 +102,25 @@ in
     "-DSQLITE_DEFAULT_MEMSTATUS=0"
   ];
   env.WAYLINE_LAB_PATH = lib.makeBinPath linuxTools;
+  profiles = {
+    ci-lint.module = {
+      packages = lib.mkForce (rustTools ++ frontendTools ++ lintTools);
+      env.WAYLINE_LAB_PATH = lib.mkForce "";
+    };
+    ci-build.module = {
+      packages = lib.mkForce (rustTools ++ frontendTools);
+      env.WAYLINE_LAB_PATH = lib.mkForce "";
+    };
+    ci-test.module.packages = lib.mkForce rustTools;
+    ci-release.module = {
+      packages = lib.mkForce (rustTools ++ [ usign ]);
+      env.WAYLINE_LAB_PATH = lib.mkForce "";
+    };
+  };
   scripts.wayline-deps.exec = "exec cargo run --locked --package xtask -- deps";
   scripts.wayline-check.exec = "exec cargo run --locked --offline --package xtask -- check";
+  scripts.wayline-lint.exec = "exec cargo run --locked --offline --package xtask -- lint";
+  scripts.wayline-test.exec = "exec cargo run --locked --offline --package xtask -- test";
   scripts.wayline-build.exec = "exec cargo run --locked --offline --package xtask -- build";
   scripts.wayline-package.exec = "exec cargo run --locked --offline --package xtask -- package";
   scripts.wayline-preview.exec = "exec cargo run --locked --offline --package xtask -- preview";

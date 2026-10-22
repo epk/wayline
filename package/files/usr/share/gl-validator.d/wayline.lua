@@ -1,4 +1,9 @@
 return {
+    purge_history = {
+        confirm = function(value)
+            return value == true
+        end,
+    },
     set_tunnel_enabled = {
         expected_revision = '^%x+$',
         section_id = '^[%w_-]+$',
