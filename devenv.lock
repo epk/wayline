@@ -3,11 +3,11 @@
     "devenv": {
       "locked": {
         "dir": "src/modules",
-        "lastModified": 1792512187,
-        "narHash": "sha256-UQk5entVLWj6uRM21GQkgq54N4Lah6rEcrduJkbQ7nE=",
+        "lastModified": 1792680408,
+        "narHash": "sha256-YuGsT2+WYaBrbuobaNeeGS7ogjoEgSxl3m2JR4XbfgU=",
         "owner": "cachix",
         "repo": "devenv",
-        "rev": "feb3388b7f1c8398d8c1efde2e3c811b81019d58",
+        "rev": "d9f86dc6fe4cb74c0f9377e5535acc0cdacee721",
         "type": "github"
       },
       "original": {
@@ -19,14 +19,14 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1792488032,
-        "narHash": "sha256-RkAXQ3+a5rHMiP97Er7AawR1kvEXX9tK1mhiWedOPTc=",
+        "lastModified": 1792712296,
+        "narHash": "sha256-MbpS2LDxuBhUu4IdzKlFbeikesP6Nt5Dgr5yVa6c0KY=",
         "type": "tarball",
-        "url": "https://github.com/NixOS/nixpkgs/archive/e513db7b0a65def6f6e17bb55195dfe510871944.tar.gz"
+        "url": "https://github.com/NixOS/nixpkgs/archive/f324bcfb496deb48d1cb1e679b87f82037e0b72f.tar.gz"
       },
       "original": {
         "type": "tarball",
-        "url": "https://github.com/NixOS/nixpkgs/archive/e513db7b0a65def6f6e17bb55195dfe510871944.tar.gz"
+        "url": "https://github.com/NixOS/nixpkgs/archive/f324bcfb496deb48d1cb1e679b87f82037e0b72f.tar.gz"
       }
     },
     "root": {
@@ -44,28 +44,28 @@
         ]
       },
       "locked": {
-        "lastModified": 1792480937,
-        "narHash": "sha256-arni7i+yH5ZnkvAN9UotvhMml5+fZyXcMHpiOvI3WFY=",
+        "lastModified": 1792653800,
+        "narHash": "sha256-E8zFJilWlORqzIUJizyhZ/0WKBOizuM6s1nRSgPRomo=",
         "owner": "oxalica",
         "repo": "rust-overlay",
-        "rev": "5424e1e6dda30b0626935d2a03a6526db4858d60",
+        "rev": "5f267b7f323a4d6df0b9c0e3eaa043cbe85386f2",
         "type": "github"
       },
       "original": {
         "owner": "oxalica",
         "repo": "rust-overlay",
-        "rev": "5424e1e6dda30b0626935d2a03a6526db4858d60",
+        "rev": "5f267b7f323a4d6df0b9c0e3eaa043cbe85386f2",
         "type": "github"
       }
     },
     "ste": {
       "flake": false,
       "locked": {
-        "lastModified": 1791938667,
-        "narHash": "sha256-+KpxI2VoSDopyb9zlcuSnvZbDSCv9pwYrhYYRqtGbcU=",
+        "lastModified": 1792571039,
+        "narHash": "sha256-/8Eza9jyMn2hiywGdgYaR8lZVnYAjVbOwM58DpQdscc=",
         "owner": "danyuchn",
         "repo": "asd-ste100-skill",
-        "rev": "3944283c183eea13fe5bd902b572da3b4de8bf44",
+        "rev": "cd62d297d5ef7cf9f59718cadc233ab2876ea013",
         "type": "github"
       },
       "original": {

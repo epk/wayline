@@ -35,7 +35,7 @@ pub fn store(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
 
 pub fn version() -> String {
     fs::read_to_string("/usr/share/wayline/version")
-        .unwrap_or_else(|_| "0.1.0-alpha.16".into())
+        .unwrap_or_else(|_| "0.1.0-alpha.17".into())
         .trim()
         .into()
 }

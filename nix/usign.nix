@@ -5,7 +5,7 @@
 }:
 stdenv.mkDerivation {
   pname = "usign";
-  version = "2026-08-07";
+  version = "2025-10-03";
   src = fetchFromGitHub {
     owner = "openwrt";
     repo = "usign";

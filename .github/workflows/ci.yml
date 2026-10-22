@@ -109,7 +109,7 @@ jobs:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
           WAYLINE_VERSION: ${{ needs.build.outputs.version }}
         run: cargo xtask release "$WAYLINE_VERSION"
-      - uses: ncipollo/release-action@98d25d4189e9b6cee19b8635b1ea5cc39c158a41
+      - uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd
         with:
           tag: ${{ needs.build.outputs.tag }}
           commit: ${{ github.sha }}
