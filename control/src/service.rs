@@ -26,7 +26,9 @@ fn delete() -> Result<Value> {
 
 fn halt() {
     let _ = fs::remove_file(MONITOR_CONFIG);
-    if monitor_running().unwrap_or(true) {
+    let registered = native::bus::<Value>("service", "list", &json!({"name":"wayline"}))
+        .map_or(true, |list| !list["wayline"].is_null());
+    if registered {
         let _ = delete();
     }
 }
