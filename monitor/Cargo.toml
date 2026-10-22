@@ -15,12 +15,11 @@ bench = false
 
 [dependencies]
 wayline-protocol.workspace = true
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["process", "event"] }
 serde_json.workspace = true
 socket2.workspace = true
 netlink-packet-core.workspace = true
 pnet_packet = { version = "=0.35.0", default-features = false }
-monoio = { version = "=0.2.4", default-features = false, features = ["legacy"] }
 
 [lints]
 workspace = true

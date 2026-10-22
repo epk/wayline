@@ -5,22 +5,20 @@ compile_error!("waylined requires Linux. Cross-compile the ARM64 musl executable
 
 mod config;
 mod probe;
-mod readiness;
 mod route;
 
 use probe::Probe;
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::io::Errno;
 use std::{
     fmt::Write as _,
     fs::{self, File, OpenOptions},
-    future::{self, Future},
     io::{self, Read, Write},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::PathBuf,
-    pin::Pin,
-    task::Poll,
     time::{Duration, Instant},
 };
 use wayline_protocol::{Config, MAX_STATUS, Status};
@@ -33,7 +31,6 @@ const IDLE_WAIT: Duration = Duration::from_secs(1);
 
 struct Endpoint {
     listener: UnixListener,
-    ready: monoio::net::UnixListener,
     path: PathBuf,
     _lock: File,
 }
@@ -81,10 +78,8 @@ impl Endpoint {
         let listener = UnixListener::bind(&path)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
-        let ready = monoio::net::UnixListener::from_std(listener.try_clone()?)?;
         Ok(Self {
             listener,
-            ready,
             path,
             _lock: lock,
         })
@@ -109,7 +104,6 @@ enum Phase {
 
 struct Client {
     stream: UnixStream,
-    ready: monoio::net::UnixStream,
     phase: Phase,
     deadline: Instant,
 }
@@ -263,65 +257,46 @@ enum Ready {
     Other,
 }
 
-type ReadinessFuture<'a> = Pin<Box<dyn Future<Output = io::Result<Ready>> + 'a>>;
-
-#[expect(
-    clippy::future_not_send,
-    reason = "Monoio keeps each future on one local thread."
-)]
-async fn wait_ready(
+fn wait_ready(
     endpoint: &Endpoint,
     probes: &[Probe<'_>],
     clients: &[Client],
     wait: Duration,
-    round: usize,
-) -> io::Result<Ready> {
-    let listening = || {
-        probes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, probe)| Some((index, probe.listening()?)))
-    };
-    let mut pending: Vec<ReadinessFuture<'_>> =
-        Vec::with_capacity(2 + listening().count() + clients.len());
-    pending.push(Box::pin(async {
-        endpoint.ready.readable(false).await?;
-        Ok(Ready::Listener)
-    }));
-    for (index, socket) in listening() {
-        pending.push(Box::pin(async move {
-            socket.ready.readable(false).await?;
-            Ok(Ready::Probe(index))
-        }));
+) -> io::Result<Vec<Ready>> {
+    let mut fds = Vec::with_capacity(1 + probes.len() + clients.len());
+    let mut kinds = Vec::with_capacity(fds.capacity());
+    fds.push(PollFd::new(&endpoint.listener, PollFlags::IN));
+    kinds.push(Ready::Listener);
+    for (index, probe) in probes.iter().enumerate() {
+        if let Some(socket) = probe.listening() {
+            fds.push(PollFd::new(socket, PollFlags::IN));
+            kinds.push(Ready::Probe(index));
+        }
     }
     for client in clients {
-        let reading = matches!(client.phase, Phase::Request { .. });
-        pending.push(Box::pin(async move {
-            if reading {
-                client.ready.readable(false).await?;
-            } else {
-                client.ready.writable(false).await?;
-            }
-            Ok(Ready::Other)
-        }));
+        let flags = if matches!(client.phase, Phase::Request { .. }) {
+            PollFlags::IN
+        } else {
+            PollFlags::OUT
+        };
+        fds.push(PollFd::new(&client.stream, flags));
+        kinds.push(Ready::Other);
     }
-    pending.push(Box::pin(async move {
-        monoio::time::sleep(wait).await;
-        Ok(Ready::Other)
-    }));
-    let start = round % pending.len();
-    future::poll_fn(|cx| {
-        for offset in 0..pending.len() {
-            let index = (start + offset) % pending.len();
-            if let Some(future) = pending.get_mut(index)
-                && let Poll::Ready(event) = future.as_mut().poll(cx)
-            {
-                return Poll::Ready(event);
-            }
-        }
-        Poll::Pending
-    })
-    .await
+    let timeout = Timespec {
+        tv_sec: i64::try_from(wait.as_secs()).unwrap_or(i64::MAX),
+        tv_nsec: i64::from(wait.subsec_nanos()),
+    };
+    match poll(&mut fds, Some(&timeout)) {
+        Ok(_) => (),
+        Err(Errno::INTR) => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(fds
+        .iter()
+        .zip(kinds)
+        .filter(|(fd, _)| !fd.revents().is_empty())
+        .map(|(_, kind)| kind)
+        .collect())
 }
 
 fn accept_clients(endpoint: &Endpoint, clients: &mut Vec<Client>, now: Instant) -> io::Result<()> {
@@ -334,7 +309,6 @@ fn accept_clients(endpoint: &Endpoint, clients: &mut Vec<Client>, now: Instant) 
                 }
                 stream.set_nonblocking(true)?;
                 clients.push(Client {
-                    ready: monoio::net::UnixStream::from_std(stream.try_clone()?)?,
                     stream,
                     phase: Phase::Request {
                         line: [0; MAX_REQUEST],
@@ -350,11 +324,7 @@ fn accept_clients(endpoint: &Endpoint, clients: &mut Vec<Client>, now: Instant) 
     Ok(())
 }
 
-#[expect(
-    clippy::future_not_send,
-    reason = "Monoio keeps each future on one local thread."
-)]
-async fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>) -> io::Result<()> {
+fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>) -> io::Result<()> {
     let endpoint = Endpoint::bind(socket_path)?;
     let routes = route::RouteLookup::new()?;
     let mut monitor = Monitor::new(config)?;
@@ -362,7 +332,6 @@ async fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>)
     let mut clients: Vec<Client> = Vec::with_capacity(MAX_CLIENTS);
     let mut sequence = 0_u64;
     let mut next_probe = 0;
-    let mut round = 0_usize;
     loop {
         let now = Instant::now();
         if stop_at.is_some_and(|at| now >= at) {
@@ -400,16 +369,16 @@ async fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>)
             .min()
             .unwrap_or(now + IDLE_WAIT);
         let wait = deadline.saturating_duration_since(Instant::now());
-        let ready = wait_ready(&endpoint, &monitor.probes, &clients, wait, round).await?;
-        round = round.wrapping_add(1);
-        match ready {
-            Ready::Listener => accept_clients(&endpoint, &mut clients, Instant::now())?,
-            Ready::Probe(index) => {
-                if let Some(probe) = monitor.probes.get_mut(index) {
-                    probe.drain(Instant::now());
+        for ready in wait_ready(&endpoint, &monitor.probes, &clients, wait)? {
+            match ready {
+                Ready::Listener => accept_clients(&endpoint, &mut clients, Instant::now())?,
+                Ready::Probe(index) => {
+                    if let Some(probe) = monitor.probes.get_mut(index) {
+                        probe.drain(Instant::now());
+                    }
                 }
+                Ready::Other => (),
             }
-            Ready::Other => (),
         }
     }
 }
@@ -461,11 +430,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match command.as_str() {
         "monitor" => {
             let config = config::read(&config_path.ok_or("--config is required")?)?;
-            monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
-                .with_entries(32)
-                .enable_timer()
-                .build()?
-                .block_on(serve(&config, socket_path, run_for))?;
+            serve(&config, socket_path, run_for)?;
         }
         "status" if config_path.is_none() && run_for.is_none() => {
             let mut stream = UnixStream::connect(socket_path)?;

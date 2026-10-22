@@ -1,4 +1,3 @@
-use crate::readiness::RegisteredSocket;
 use crate::route::RouteLookup;
 use pnet_packet::{
     Packet,
@@ -104,7 +103,7 @@ pub struct Probe<'a> {
     interval: Duration,
     timeout: Duration,
     sample_hint: usize,
-    socket: Option<RegisteredSocket>,
+    socket: Option<Socket>,
     pending: Vec<Pending>,
     next_due: Instant,
     state: State,
@@ -190,7 +189,7 @@ impl<'a> Probe<'a> {
         now >= self.next_due
     }
 
-    pub fn listening(&self) -> Option<&RegisteredSocket> {
+    pub fn listening(&self) -> Option<&Socket> {
         self.socket.as_ref().filter(|_| !self.pending.is_empty())
     }
 
@@ -339,7 +338,7 @@ impl<'a> Probe<'a> {
         if self.pending.is_empty() {
             let mut stale = [0_u8; 256];
             for _ in 0..16 {
-                if (&**socket).read(&mut stale).is_err() {
+                if (&*socket).read(&mut stale).is_err() {
                     break;
                 }
             }
@@ -376,7 +375,7 @@ impl<'a> Probe<'a> {
             if self.pending.is_empty() {
                 return;
             }
-            let size = match (&**socket).read(&mut bytes) {
+            let size = match (&*socket).read(&mut bytes) {
                 Ok(size) => size,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
                 Err(_) => {
@@ -484,7 +483,7 @@ fn echo_reply(target: Ipv4Addr, bytes: &[u8], sent: &[u8; PACKET_SIZE]) -> bool 
     })
 }
 
-fn open_socket(tunnel: &Tunnel, target: Ipv4Addr, index: u32) -> io::Result<RegisteredSocket> {
+fn open_socket(tunnel: &Tunnel, target: Ipv4Addr, index: u32) -> io::Result<Socket> {
     let index =
         NonZeroU32::new(index).ok_or_else(|| io::Error::other("invalid interface index"))?;
     let socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
@@ -497,5 +496,5 @@ fn open_socket(tunnel: &Tunnel, target: Ipv4Addr, index: u32) -> io::Result<Regi
     socket.set_send_buffer_size(4096)?;
     socket.set_nonblocking(true)?;
     socket.connect(&SockAddr::from(SocketAddrV4::new(target, 0)))?;
-    RegisteredSocket::new(socket)
+    Ok(socket)
 }
