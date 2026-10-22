@@ -258,9 +258,19 @@ fn merge(script: &mut String, predicate: &str, target: &str) -> Result<()> {
             "INSERT OR IGNORE INTO {table} SELECT s.period,t.id,s.min_us,s.median_us,s.max_us,s.sent,s.lost FROM {table} s JOIN series o ON o.id=s.series JOIN series t ON t.name={target} WHERE {predicate};"
         )?;
     }
+    retire(script, predicate)
+}
+
+fn retire(script: &mut String, predicate: &str) -> Result<()> {
+    for (_, table) in LEVELS {
+        write!(
+            script,
+            "DELETE FROM {table} WHERE series IN (SELECT o.id FROM series o WHERE {predicate});"
+        )?;
+    }
     write!(
         script,
-        "DELETE FROM series WHERE id IN (SELECT id FROM series o WHERE {predicate});"
+        "DELETE FROM series WHERE id IN (SELECT o.id FROM series o WHERE {predicate});"
     )?;
     Ok(())
 }
@@ -270,6 +280,7 @@ fn migrate_at(
     ids: &BTreeMap<String, String>,
     prefixes: &BTreeMap<String, String>,
 ) -> Result<()> {
+    ensure!(now() >= MIN_CLOCK, "The clock is not synchronized.");
     convert(path)?;
     let mut script = String::from("BEGIN IMMEDIATE;");
     for (old, new) in ids {
@@ -327,11 +338,6 @@ fn schema() -> Result<String> {
             "CREATE TABLE {table}(period INTEGER NOT NULL,series INTEGER NOT NULL,min_us INTEGER,median_us INTEGER,max_us INTEGER,sent INTEGER NOT NULL,lost INTEGER NOT NULL,PRIMARY KEY(period,series)) WITHOUT ROWID;"
         )?;
     }
-    text.push_str("CREATE TRIGGER retire AFTER DELETE ON series BEGIN ");
-    for (_, table) in LEVELS {
-        write!(text, "DELETE FROM {table} WHERE series=old.id;")?;
-    }
-    text.push_str("END;");
     Ok(text)
 }
 
@@ -347,6 +353,7 @@ fn convert(path: &Path) -> Result<bool> {
     if version >= VERSION {
         return Ok(false);
     }
+    ensure!(now() >= MIN_CLOCK, "The clock is not synchronized.");
     let stored = bins || version >= 2;
     ensure!(!stored || healthy(path), "History database is damaged.");
     let hour = now() / HOUR;
@@ -389,10 +396,10 @@ fn convert(path: &Path) -> Result<bool> {
         _ => {}
     }
     write!(script, "PRAGMA user_version={VERSION}; COMMIT;")?;
-    if stored {
-        script.push_str("VACUUM;");
-    }
     sql(path, false, &script)?;
+    if stored {
+        let _ = sql(path, false, "PRAGMA temp_store=DEFAULT; VACUUM;");
+    }
     Ok(true)
 }
 
@@ -402,7 +409,7 @@ fn sql(path: &Path, readonly: bool, statement: &str) -> Result<String> {
     if !readonly {
         write!(
             input,
-            " PRAGMA page_size=4096; PRAGMA max_page_count={}; PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL;",
+            " PRAGMA page_size=4096; PRAGMA max_page_count={}; PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL; DROP TRIGGER IF EXISTS retire;",
             cap(path)
         )?;
     }
@@ -481,8 +488,8 @@ fn collection(days: u32, now: u64, ring: &[Series]) -> Result<String> {
         .filter(|series| !series.buckets.is_empty())
         .collect();
     let mut script = String::from("BEGIN IMMEDIATE;");
+    live_table(&mut script, &live)?;
     if let Some(mut range) = span(&live) {
-        live_table(&mut script, &live)?;
         write!(
             script,
             "INSERT INTO series(name,seen) SELECT DISTINCT series,{} FROM live WHERE true ON CONFLICT(name) DO UPDATE SET seen=excluded.seen WHERE seen<excluded.seen; \
@@ -518,11 +525,14 @@ fn collection(days: u32, now: u64, ring: &[Series]) -> Result<String> {
         .map(|(step, _)| retained(days, *step))
         .max()
         .unwrap_or_default();
-    write!(
-        script,
-        "DELETE FROM series WHERE seen<{} OR id NOT IN (SELECT id FROM series ORDER BY seen DESC,id DESC LIMIT {MAX_SERIES}); COMMIT; SELECT DISTINCT substr(name,1,48) FROM series;",
-        now.saturating_sub(longest) / HOUR
+    retire(
+        &mut script,
+        &format!(
+            "o.seen<{} OR o.id NOT IN (SELECT id FROM series ORDER BY (name IN (SELECT series FROM live)) DESC,seen DESC,id DESC LIMIT {MAX_SERIES})",
+            now.saturating_sub(longest) / HOUR
+        ),
     )?;
+    script.push_str("COMMIT; SELECT DISTINCT substr(name,1,48) FROM series;");
     Ok(script)
 }
 
@@ -1059,6 +1069,79 @@ mod tests {
     }
 
     #[test]
+    fn retiring_many_series_leaves_no_orphans() -> Result<()> {
+        if !sqlite_available() {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("latency.sqlite");
+        let minute = now() / 60 * 60 - 120;
+        let all: Vec<Series> = (1..=80)
+            .map(|index| series(&identity(index), vec![bucket(minute, 20_000, 0)]))
+            .collect();
+        collect_at(&database, 30, &all)?;
+        sql(
+            &database,
+            false,
+            &format!("UPDATE series SET seen={} WHERE id>1;", now() / HOUR - 721),
+        )?;
+        collect_at(
+            &database,
+            30,
+            &[series(&identity(1), vec![bucket(minute + 15, 20_000, 0)])],
+        )?;
+        let mut statement = String::from("SELECT count(*) FROM series;");
+        for (_, table) in LEVELS {
+            write!(
+                statement,
+                "SELECT count(*) FROM {table} WHERE series NOT IN (SELECT id FROM series);"
+            )?;
+        }
+        let state = sql(&database, true, &statement)?;
+        ensure!(
+            state.lines().collect::<Vec<_>>() == ["1", "0", "0", "0", "0"],
+            "Unexpected state: {state}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn series_cap_keeps_live_series_over_newer_ids() -> Result<()> {
+        if !sqlite_available() {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("latency.sqlite");
+        let minute = now() / 60 * 60 - 120;
+        let all: Vec<Series> = (1..=90)
+            .map(|index| series(&identity(index), vec![bucket(minute, 20_000, 0)]))
+            .collect();
+        collect_at(&database, 1, &all)?;
+        collect_at(
+            &database,
+            1,
+            &[
+                series(&identity(91), vec![bucket(minute + 15, 20_000, 0)]),
+                series(&identity(1), vec![bucket(minute + 15, 20_000, 0)]),
+            ],
+        )?;
+        let state = sql(
+            &database,
+            true,
+            &format!(
+                "SELECT count(*) FROM series; SELECT count(*) FROM series WHERE name IN ('{}','{}');",
+                identity(1),
+                identity(91)
+            ),
+        )?;
+        ensure!(
+            state.lines().collect::<Vec<_>>() == ["90", "2"],
+            "Unexpected state: {state}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn schema_v2_moves_samples_into_one_minute() -> Result<()> {
         if !sqlite_available() {
             return Ok(());
@@ -1115,7 +1198,7 @@ mod tests {
             state.lines().collect::<Vec<_>>() == ["4", "100|1|0", "103|1|3", "0", "1"],
             "Unexpected schema: {state}"
         );
-        sql(&database, false, "DELETE FROM series;")?;
+        sql(&database, false, &collection(30, now() + 60 * DAY, &[])?)?;
         let rows = sql(&database, true, "SELECT count(*) FROM s1m;")?;
         ensure!(rows.trim() == "0", "Rows outlived their series: {rows}");
         Ok(())
