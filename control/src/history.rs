@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use wayline_protocol::{BUCKET_SECONDS, MAX_SERIES, Series};
-use wayline_support::{atomic, digest};
+use wayline_support::atomic;
 
 const HOUR: u64 = 3_600;
 const DAY: u64 = 86_400;
@@ -24,7 +24,6 @@ const MEMORY_PAGES: u64 = 1_024;
 const PAGES: u64 = 8_192;
 const PAGE_BYTES: u64 = 4_096;
 const VERSION: u32 = 4;
-const MARKER: &[u8] = br#"{"version":1}"#;
 const LIMIT: usize = 2 * 1024 * 1024;
 const COLUMNS: &str = "min_us,median_us,max_us,sent,lost";
 const LEVELS: [(u64, &str); 4] = [
@@ -196,71 +195,6 @@ pub fn availability(config: &Settings) -> Availability {
     }
 }
 
-pub fn migrate(config: &Settings, inventory: &Inventory) -> Result<()> {
-    let path = database(config);
-    let directory_path = path.parent().context("Invalid history directory.")?;
-    directory(directory_path)?;
-    let marker = path.with_file_name("migrated.json");
-    if fs::read(&marker).is_ok_and(|data| data == MARKER) {
-        return Ok(());
-    }
-    let legacy_file = path.with_file_name("paths.json");
-    if path.exists() {
-        let legacy: BTreeMap<String, String> = fs::read(&legacy_file)
-            .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or_default();
-        let (ids, prefixes) = renames(inventory, &legacy);
-        migrate_at(&path, &ids, &prefixes)?;
-    }
-    atomic(&marker, MARKER)?;
-    let _ = fs::remove_file(legacy_file);
-    Ok(())
-}
-
-fn renames(
-    inventory: &Inventory,
-    legacy: &BTreeMap<String, String>,
-) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
-    let mut prefixes: BTreeMap<String, String> = legacy
-        .iter()
-        .map(|(key, old)| (old.clone(), tunnel_prefix(key)))
-        .collect();
-    for path in &inventory.paths {
-        if let Some(old) = &path.legacy {
-            prefixes.insert(old.clone(), path.prefix().to_owned());
-        }
-    }
-    let mut ids = BTreeMap::new();
-    if let Some(wan) = &inventory.wan
-        && let Some(old_wan) = &wan.legacy
-    {
-        prefixes.insert(old_wan.clone(), wan.prefix().to_owned());
-        for tunnel in &inventory.tunnels {
-            let old = format!(
-                "{old_wan}_{}",
-                &digest(format!("endpoint|{}", tunnel.key).as_bytes())[..14]
-            );
-            ids.insert(old, endpoint_series(&tunnel.key));
-        }
-    }
-    (ids, prefixes)
-}
-
-fn merge(script: &mut String, predicate: &str, target: &str) -> Result<()> {
-    write!(
-        script,
-        "INSERT OR IGNORE INTO series(name,seen) SELECT {target},o.seen FROM series o WHERE {predicate};"
-    )?;
-    for (_, table) in LEVELS {
-        write!(
-            script,
-            "INSERT OR IGNORE INTO {table} SELECT s.period,t.id,s.min_us,s.median_us,s.max_us,s.sent,s.lost FROM {table} s JOIN series o ON o.id=s.series JOIN series t ON t.name={target} WHERE {predicate};"
-        )?;
-    }
-    retire(script, predicate)
-}
-
 fn retire(script: &mut String, predicate: &str) -> Result<()> {
     for (_, table) in LEVELS {
         write!(
@@ -273,36 +207,6 @@ fn retire(script: &mut String, predicate: &str) -> Result<()> {
         "DELETE FROM series WHERE id IN (SELECT o.id FROM series o WHERE {predicate});"
     )?;
     Ok(())
-}
-
-fn migrate_at(
-    path: &Path,
-    ids: &BTreeMap<String, String>,
-    prefixes: &BTreeMap<String, String>,
-) -> Result<()> {
-    ensure!(now() >= MIN_CLOCK, "The clock is not synchronized.");
-    convert(path)?;
-    let mut script = String::from("BEGIN IMMEDIATE;");
-    for (old, new) in ids {
-        ensure!(
-            settings::id(old) && settings::id(new),
-            "Invalid measurement identity."
-        );
-        merge(&mut script, &format!("o.name='{old}'"), &format!("'{new}'"))?;
-    }
-    for (old, new) in prefixes {
-        ensure!(
-            old.len() == 48 && new.len() == 48 && settings::id(old) && settings::id(new),
-            "Invalid measurement identity."
-        );
-        merge(
-            &mut script,
-            &format!("substr(o.name,1,48)='{old}'"),
-            &format!("'{new}'||substr(o.name,49)"),
-        )?;
-    }
-    script.push_str("COMMIT;");
-    sql(path, false, &script).map(drop)
 }
 
 fn healthy(path: &Path) -> bool {
@@ -345,59 +249,46 @@ fn convert(path: &Path) -> Result<bool> {
     let state = sql(
         path,
         false,
-        "PRAGMA user_version; SELECT count(*) FROM sqlite_master WHERE name='bins';",
+        "PRAGMA user_version; SELECT count(*) FROM sqlite_master;",
     )?;
     let mut lines = state.lines();
     let version: u32 = lines.next().context("Missing schema version.")?.parse()?;
-    let bins = lines.next() == Some("1");
+    let tables: u32 = lines.next().context("Missing schema size.")?.parse()?;
     if version >= VERSION {
         return Ok(false);
     }
     ensure!(now() >= MIN_CLOCK, "The clock is not synchronized.");
-    let stored = bins || version >= 2;
-    ensure!(!stored || healthy(path), "History database is damaged.");
-    let hour = now() / HOUR;
-    let mut script = format!("PRAGMA max_page_count={}; BEGIN IMMEDIATE;", 2 * cap(path));
-    if version >= 2 {
-        script.push_str("ALTER TABLE series RENAME TO old_series;");
+    let upgrade = version == 3;
+    if upgrade {
+        ensure!(healthy(path), "History database is damaged.");
+    } else if tables > 0 {
+        quarantine(path)?;
     }
-    if version == 3 {
+    let mut script = format!("PRAGMA max_page_count={}; BEGIN IMMEDIATE;", 2 * cap(path));
+    if upgrade {
+        script.push_str("ALTER TABLE series RENAME TO old_series;");
         for (_, table) in LEVELS {
             write!(script, "ALTER TABLE {table} RENAME TO old_{table};")?;
         }
     }
     script.push_str(&schema()?);
-    if version >= 2 {
+    if upgrade {
         write!(
             script,
-            "INSERT INTO series SELECT id,name,{hour} FROM old_series; DROP TABLE old_series;"
+            "INSERT INTO series SELECT id,name,{} FROM old_series; DROP TABLE old_series;",
+            now() / HOUR
         )?;
-    }
-    match version {
-        3 => {
-            for (_, table) in LEVELS {
-                write!(
-                    script,
-                    "INSERT INTO {table}(series,period,{COLUMNS}) SELECT * FROM old_{table}; DROP TABLE old_{table};"
-                )?;
-            }
-            script.push_str("DROP TABLE meta;");
+        for (_, table) in LEVELS {
+            write!(
+                script,
+                "INSERT INTO {table}(series,period,{COLUMNS}) SELECT * FROM old_{table}; DROP TABLE old_{table};"
+            )?;
         }
-        2 => write!(
-            script,
-            "INSERT OR IGNORE INTO s1m(series,period,{COLUMNS}) SELECT * FROM samples; DROP TABLE samples;"
-        )?,
-        _ if bins => write!(
-            script,
-            "INSERT OR IGNORE INTO series(name,seen) SELECT DISTINCT series,{hour} FROM bins; \
-             INSERT OR IGNORE INTO s1m SELECT b.minute,s.id,b.min_us,b.median_us,b.max_us,b.sent,b.lost FROM bins b JOIN series s ON s.name=b.series; \
-             DROP TABLE bins;"
-        )?,
-        _ => {}
+        script.push_str("DROP TABLE meta;");
     }
     write!(script, "PRAGMA user_version={VERSION}; COMMIT;")?;
     sql(path, false, &script)?;
-    if stored {
+    if upgrade {
         let _ = sql(path, false, "PRAGMA temp_store=DEFAULT; VACUUM;");
     }
     Ok(true)
@@ -819,12 +710,11 @@ pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        DAY, HOUR, LEVELS, Query, Subject, collect_at, collection, convert, lines, migrate_at,
-        resolution, sql,
+        DAY, HOUR, LEVELS, Query, Subject, collect_at, collection, convert, lines, resolution, sql,
     };
     use crate::runtime::now;
     use anyhow::{Result, ensure};
-    use std::{collections::BTreeMap, fmt::Write, fs, net::Ipv4Addr, path::Path, process::Command};
+    use std::{fmt::Write, fs, net::Ipv4Addr, path::Path, process::Command};
     use wayline_protocol::{Bucket, Series, State};
 
     fn sqlite_available() -> bool {
@@ -1142,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_moves_samples_into_one_minute() -> Result<()> {
+    fn unknown_schema_is_reset() -> Result<()> {
         if !sqlite_available() {
             return Ok(());
         }
@@ -1151,17 +1041,22 @@ mod tests {
         sql(
             &database,
             false,
-            "CREATE TABLE series(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE); CREATE TABLE samples(series INTEGER NOT NULL, minute INTEGER NOT NULL, min_us INTEGER, median_us INTEGER, max_us INTEGER, sent INTEGER NOT NULL, lost INTEGER NOT NULL, PRIMARY KEY(series, minute)) WITHOUT ROWID; INSERT INTO series(name) VALUES('x'),('y'); INSERT INTO samples VALUES(1,100,1,2,3,4,0),(1,101,1,2,3,4,0),(2,100,NULL,NULL,NULL,0,1); PRAGMA user_version=2;",
+            "CREATE TABLE samples(x INTEGER); PRAGMA user_version=2;",
         )?;
         ensure!(convert(&database)?, "Expected a conversion.");
+        ensure!(
+            directory.path().join("latency.sqlite.broken").exists(),
+            "The old database was not moved aside."
+        );
         let state = sql(
             &database,
             true,
-            "PRAGMA user_version; SELECT count(*), sum(sent), sum(lost) FROM s1m; SELECT count(*) FROM sqlite_master WHERE name IN ('samples','old_series');",
+            "PRAGMA user_version; SELECT count(*) FROM sqlite_master WHERE name='samples';",
         )?;
-        let lines: Vec<&str> = state.lines().collect();
-        ensure!(lines == ["4", "3|8|1", "0"], "Unexpected schema: {state}");
-        ensure!(!convert(&database)?, "A current schema must be left alone.");
+        ensure!(
+            state.lines().collect::<Vec<_>>() == ["4", "0"],
+            "Unexpected schema: {state}"
+        );
         Ok(())
     }
 
@@ -1279,79 +1174,6 @@ mod tests {
             events.contains("The history database was damaged and was reset."),
             "Missing recovery event."
         );
-        Ok(())
-    }
-
-    #[test]
-    fn migration_moves_rows_to_stable_identities() -> Result<()> {
-        if !sqlite_available() {
-            return Ok(());
-        }
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let minute = now() / 60 - 3;
-        let old = "a".repeat(48);
-        let new = "b".repeat(48);
-        let old_endpoint = format!("{old}_{}", "c".repeat(14));
-        let new_endpoint = format!("{new}_server");
-        sql(
-            &database,
-            false,
-            &format!(
-                "CREATE TABLE bins(minute INTEGER,series TEXT,min_us INTEGER,median_us INTEGER,max_us INTEGER,sent INTEGER,lost INTEGER,PRIMARY KEY(minute,series)) WITHOUT ROWID; \
-                 INSERT INTO bins VALUES({minute},'{old}_1_1_1_1',1,20000,3,6,0); \
-                 INSERT INTO bins VALUES({minute},'{old}_9_9_9_9',1,20000,3,6,0); \
-                 INSERT INTO bins VALUES({minute},'{new}_9_9_9_9',1,30000,3,9,0); \
-                 INSERT INTO bins VALUES({minute},'{old_endpoint}',1,40000,3,6,0);"
-            ),
-        )?;
-        let ids = BTreeMap::from([(old_endpoint, new_endpoint.clone())]);
-        let prefixes = BTreeMap::from([(old.clone(), new.clone())]);
-        migrate_at(&database, &ids, &prefixes)?;
-        let state = sql(
-            &database,
-            true,
-            &format!(
-                "SELECT count(*) FROM s1m; SELECT count(*) FROM series WHERE name IN ('{new}_1_1_1_1','{new}_9_9_9_9','{new_endpoint}'); SELECT t.sent FROM s1m t JOIN series s ON s.id=t.series WHERE s.name='{new}_9_9_9_9' AND t.period={minute}; SELECT count(*) FROM series WHERE name LIKE '{old}%';"
-            ),
-        )?;
-        ensure!(
-            state.lines().collect::<Vec<_>>() == ["3", "3", "9", "0"],
-            "Unexpected migration: {state}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn schema_v1_converts_to_current() -> Result<()> {
-        if !sqlite_available() {
-            return Ok(());
-        }
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let minute = now() / 60 - 3;
-        sql(
-            &database,
-            false,
-            &format!(
-                "CREATE TABLE bins(minute INTEGER,series TEXT,min_us INTEGER,median_us INTEGER,max_us INTEGER,sent INTEGER,lost INTEGER,PRIMARY KEY(minute,series)) WITHOUT ROWID; \
-                 INSERT INTO bins VALUES({minute},'{}',1,2,3,4,0); \
-                 INSERT INTO bins VALUES({minute},'{}',1,2,3,4,0); \
-                 INSERT INTO bins VALUES({},'{}',1,2,3,4,0);",
-                identity(1),
-                identity(2),
-                minute + 1,
-                identity(1)
-            ),
-        )?;
-        convert(&database)?;
-        let state = sql(
-            &database,
-            true,
-            "PRAGMA user_version; SELECT count(*) FROM series; SELECT count(*) FROM s1m; SELECT count(*) FROM sqlite_master WHERE name='bins';",
-        )?;
-        let lines: Vec<&str> = state.lines().collect();
-        ensure!(lines == ["4", "2", "3", "0"], "Unexpected schema: {state}");
         Ok(())
     }
 

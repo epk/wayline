@@ -182,11 +182,7 @@ fn routine() -> Result<()> {
         .unwrap_or(0);
     let now = now();
     if config.enabled && (now.saturating_sub(last) >= 300 || now < last) {
-        let result = history::collect(&config).and_then(|()| {
-            inventory
-                .as_ref()
-                .map_or(Ok(()), |inventory| history::migrate(&config, inventory))
-        });
+        let result = history::collect(&config);
         atomic(Path::new(&collected), now.to_string().as_bytes())?;
         result?;
     }
