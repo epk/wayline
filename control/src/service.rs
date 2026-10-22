@@ -26,7 +26,9 @@ fn delete() -> Result<Value> {
 
 fn halt() {
     let _ = fs::remove_file(MONITOR_CONFIG);
-    let _ = delete();
+    if monitor_running().unwrap_or(true) {
+        let _ = delete();
+    }
 }
 
 pub fn stop() -> Result<()> {
@@ -139,7 +141,11 @@ pub fn tick() -> Result<()> {
 
 fn routine() -> Result<()> {
     let config = Settings::read()?;
-    let inventory = config.enabled.then(router::inventory).transpose()?;
+    let (inventory, failure) = match config.enabled.then(router::inventory) {
+        Some(Ok(inventory)) => (Some(inventory), None),
+        Some(Err(error)) => (None, Some(error)),
+        None => (None, None),
+    };
     let monitored = inventory.as_ref().filter(|_| native::supported());
     if let Some(inventory) = monitored {
         let hosts = router::hosts(&config, inventory);
@@ -148,7 +154,9 @@ fn routine() -> Result<()> {
             resolved.refresh(&hosts)?;
         }
     }
-    locked("reconcile", || apply(&config, monitored))?;
+    if failure.is_none() {
+        locked("reconcile", || apply(&config, monitored))?;
+    }
     let recorded = inventory
         .as_ref()
         .map_or(Ok(()), |inventory| changes::record(&config, inventory));
@@ -161,13 +169,15 @@ fn routine() -> Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let now = now();
-    if let Some(inventory) = &inventory
-        && (now.saturating_sub(last) >= 300 || now < last)
-    {
-        let result = history::collect(&config).and_then(|()| history::migrate(&config, inventory));
+    if config.enabled && (now.saturating_sub(last) >= 300 || now < last) {
+        let result = history::collect(&config).and_then(|()| {
+            inventory
+                .as_ref()
+                .map_or(Ok(()), |inventory| history::migrate(&config, inventory))
+        });
         atomic(Path::new(&collected), now.to_string().as_bytes())?;
         result?;
     }
     let _ = auto::step(&config);
-    recorded
+    failure.map_or(recorded, Err)
 }
