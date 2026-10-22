@@ -13,7 +13,7 @@
     : 'full';
   const wanDown = query.get('wan') === 'unavailable';
   const updateFailed = query.get('update') === 'failed';
-  const release = '0.1.0-alpha.11';
+  const release = '0.1.0-alpha.12';
   const directExit = query.get('exit') === 'direct';
   const wanMs = wanDown ? null : 14.37;
   const compatMessages = {
@@ -32,10 +32,10 @@
   const features = { full: 4, newer: 2, monitoring: 2, unsupported: 0 };
   let revision = 1;
   const state = {
-    version: '0.1.0-alpha.11',
+    version: '0.1.0-alpha.12',
     update: updateFailed
       ? {
-          current: '0.1.0-alpha.11',
+          current: '0.1.0-alpha.12',
           latest: release,
           available: true,
           phase: 'failed',
@@ -46,7 +46,7 @@
           updatedAt: Math.floor(Date.now() / 1000) - 120,
         }
       : {
-          current: '0.1.0-alpha.11',
+          current: '0.1.0-alpha.12',
           latest: null,
           available: false,
           phase: 'idle',

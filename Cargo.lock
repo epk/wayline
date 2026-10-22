@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "waylined"
-version = "0.1.0-alpha.11"
+version = "0.1.0-alpha.12"
 dependencies = [
  "netlink-packet-core",
  "pnet_packet",
