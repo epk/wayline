@@ -112,7 +112,6 @@ pub struct PathInfo {
     pub mark: u32,
     pub profile: String,
     pub series_prefix: String,
-    pub legacy: Option<String>,
     pub endpoint: Option<Target>,
     pub endpoint_reason: String,
 }
@@ -305,9 +304,6 @@ fn path(
         mark,
         profile: profile.into(),
         series_prefix: tunnel_prefix(key),
-        legacy: Some(digest_prefix(&format!(
-            "{key}|{name}|{device}|{source}|{mark}|{profile}"
-        ))),
         endpoint: None,
         endpoint_reason: String::new(),
     })
@@ -412,7 +408,6 @@ fn uplinks(interfaces: &[Interface]) -> Vec<PathInfo> {
                 mark: 0,
                 profile: String::new(),
                 series_prefix: digest_prefix(&format!("uplink|{}", item.name)),
-                legacy: None,
                 endpoint: None,
                 endpoint_reason: String::new(),
             }
@@ -430,10 +425,6 @@ fn direct(uplink: &PathInfo) -> PathInfo {
         mark: 0,
         profile: String::new(),
         series_prefix: digest_prefix("direct-wan"),
-        legacy: Some(digest_prefix(&format!(
-            "wan|{}|{}|{}|0|",
-            uplink.name, uplink.interface, uplink.source
-        ))),
         endpoint: None,
         endpoint_reason: String::new(),
     }
@@ -747,7 +738,6 @@ mod tests {
             mark: 4096,
             profile: String::new(),
             series_prefix: "ab".repeat(24),
-            legacy: None,
             endpoint: endpoint.and_then(|value| value.parse().ok()),
             endpoint_reason: String::new(),
         }
