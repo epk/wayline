@@ -1,8 +1,13 @@
-use crate::run;
 use anyhow::{Result, ensure};
 use std::{fs, path::Path};
 use walkdir::WalkDir;
+use xshell::{Shell, cmd};
 
+const LUA: [&str; 2] = [
+    "package/files/usr/lib/oui-httpd/rpc/wayline",
+    "package/files/usr/share/gl-validator.d/wayline.lua",
+];
+const NIX: [&str; 3] = ["devenv.nix", "nix/bootstrap.nix", "nix/usign.nix"];
 const SHELL_SCRIPTS: [&str; 4] = [
     "package/postinst",
     "package/prerm",
@@ -26,79 +31,26 @@ fn sources(root: &str, extension: &str) -> Vec<String> {
 }
 
 pub fn check() -> Result<()> {
-    run("cargo", &["fmt", "--all", "--check"])?;
-    run(
-        "cargo",
-        &[
-            "clippy",
-            "--locked",
-            "--offline",
-            "--all-targets",
-            "--target",
-            "aarch64-unknown-linux-musl",
-            "--workspace",
-            "--",
-            "-D",
-            "warnings",
-        ],
-    )?;
-    run(
-        "cargo",
-        &[
-            "clippy",
-            "--locked",
-            "--offline",
-            "--all-targets",
-            "--package",
-            "xtask",
-            "--",
-            "-D",
-            "warnings",
-        ],
-    )?;
-    run(
-        "cargo",
-        &[
-            "test",
-            "--locked",
-            "--offline",
-            "--package",
-            "wayline-control",
-        ],
-    )?;
-    run(
-        "luacheck",
-        &[
-            "package/files/usr/lib/oui-httpd/rpc/wayline",
-            "package/files/usr/share/gl-validator.d/wayline.lua",
-            "--config",
-            ".luacheckrc",
-        ],
-    )?;
-    run(
-        "stylua",
-        &[
-            "--check",
-            "package/files/usr/lib/oui-httpd/rpc/wayline",
-            "package/files/usr/share/gl-validator.d/wayline.lua",
-        ],
-    )?;
-    run("shellcheck", &SHELL_SCRIPTS)?;
-    run(
-        "shfmt",
-        &[&["-d", "-i", "4"][..], &SHELL_SCRIPTS[..]].concat(),
-    )?;
-    run(
-        "nixfmt",
-        &[
-            "--check",
-            "devenv.nix",
-            "nix/bootstrap.nix",
-            "nix/usign.nix",
-        ],
-    )?;
-    run("actionlint", &[])?;
-    run("pnpm", &["--dir", "ui", "check"])?;
+    let sh = Shell::new()?;
+    cmd!(sh, "cargo fmt --all --check").run()?;
+    cmd!(sh, "cargo clippy --locked --offline --all-targets --target aarch64-unknown-linux-musl --workspace -- -D warnings").run()?;
+    cmd!(
+        sh,
+        "cargo clippy --locked --offline --all-targets --package xtask -- -D warnings"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "cargo test --locked --offline --package wayline-control"
+    )
+    .run()?;
+    cmd!(sh, "luacheck {LUA...} --config .luacheckrc").run()?;
+    cmd!(sh, "stylua --check {LUA...}").run()?;
+    cmd!(sh, "shellcheck {SHELL_SCRIPTS...}").run()?;
+    cmd!(sh, "shfmt -d -i 4 {SHELL_SCRIPTS...}").run()?;
+    cmd!(sh, "nixfmt --check {NIX...}").run()?;
+    cmd!(sh, "actionlint").run()?;
+    cmd!(sh, "pnpm --dir ui check").run()?;
     for root in [
         "monitor/src",
         "control/src",
@@ -140,21 +92,11 @@ pub fn check() -> Result<()> {
 }
 
 pub fn format() -> Result<()> {
-    run("cargo", &["fmt", "--all"])?;
-    run(
-        "stylua",
-        &[
-            "package/files/usr/lib/oui-httpd/rpc/wayline",
-            "package/files/usr/share/gl-validator.d/wayline.lua",
-        ],
-    )?;
-    run(
-        "shfmt",
-        &[&["-w", "-i", "4"][..], &SHELL_SCRIPTS[..]].concat(),
-    )?;
-    run(
-        "nixfmt",
-        &["devenv.nix", "nix/bootstrap.nix", "nix/usign.nix"],
-    )?;
-    run("pnpm", &["--dir", "ui", "format"])
+    let sh = Shell::new()?;
+    cmd!(sh, "cargo fmt --all").run()?;
+    cmd!(sh, "stylua {LUA...}").run()?;
+    cmd!(sh, "shfmt -w -i 4 {SHELL_SCRIPTS...}").run()?;
+    cmd!(sh, "nixfmt {NIX...}").run()?;
+    cmd!(sh, "pnpm --dir ui format").run()?;
+    Ok(())
 }

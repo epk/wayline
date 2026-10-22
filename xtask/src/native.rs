@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 use wayline_support::{FIRMWARE_CONTRACT as CONTRACT, digest};
+use xshell::{Shell, cmd};
 
 const ROOT: &str = "artifacts/local/firmware-root";
 const NATIVE_PATH: &str = "PATH=/usr/sbin:/usr/bin:/sbin:/bin";
@@ -28,7 +29,10 @@ pub fn prepare(source: &Path) -> Result<()> {
         !Path::new(ROOT).exists(),
         "The lab firmware directory already exists."
     );
-    crate::package::copy_tree(source, Path::new(ROOT))
+    fs::create_dir_all(ROOT)?;
+    let sh = Shell::new()?;
+    cmd!(sh, "cp -a {source}/. {ROOT}").run()?;
+    Ok(())
 }
 
 fn call(program: &str, arguments: &[&str]) -> Result<String> {
@@ -66,23 +70,14 @@ pub fn check() -> Result<()> {
     if !Path::new(ROOT).exists() {
         return Ok(());
     }
-    crate::run("ip", &["link", "set", "lo", "up"])?;
+    let sh = Shell::new()?;
+    cmd!(sh, "ip link set lo up").run()?;
     ensure!(
         contract(Path::new(ROOT))? == CONTRACT,
         "The firmware contract differs."
     );
     fs::create_dir_all(format!("{ROOT}/tmp"))?;
-    crate::run(
-        "mount",
-        &[
-            "-t",
-            "tmpfs",
-            "-o",
-            "mode=1777",
-            "tmpfs",
-            &format!("{ROOT}/tmp"),
-        ],
-    )?;
+    cmd!(sh, "mount -t tmpfs -o mode=1777 tmpfs {ROOT}/tmp").run()?;
     for directory in [
         "tmp",
         "tmp/run",
@@ -108,33 +103,20 @@ pub fn check() -> Result<()> {
         if !destination.exists() {
             fs::File::create(&destination)?;
         }
-        crate::run(
-            "mount",
-            &[
-                "--bind",
-                &format!("/dev/{device}"),
-                destination.to_str().context("Invalid device path.")?,
-            ],
-        )?;
+        cmd!(sh, "mount --bind /dev/{device} {destination}").run()?;
     }
-    crate::run("mount", &["-t", "proc", "proc", &format!("{ROOT}/proc")])?;
+    cmd!(sh, "mount -t proc proc {ROOT}/proc").run()?;
     let console =
         rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)?;
     rustix::pty::grantpt(&console)?;
     rustix::pty::unlockpt(&console)?;
     let slave = rustix::pty::ptsname(&console, Vec::new())?;
+    let slave = slave.to_str()?;
     let destination = Path::new(ROOT).join("dev/console");
     if !destination.exists() {
         fs::File::create(&destination)?;
     }
-    crate::run(
-        "mount",
-        &[
-            "--bind",
-            slave.to_str()?,
-            destination.to_str().context("Invalid console path.")?,
-        ],
-    )?;
+    cmd!(sh, "mount --bind {slave} {destination}").run()?;
     let network = Path::new(ROOT).join("etc/config/network");
     if !network.exists() {
         fs::write(
