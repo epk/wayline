@@ -449,6 +449,11 @@ fn discover(endpoints: bool) -> Result<Inventory> {
     let dump = native::bus::<Dump>("network.interface", "dump", &json!({}));
     let interfaces = dump.as_ref().map_or(&[][..], |dump| &dump.interface);
     let (tunnels, found) = native_tunnels(&network, &rules, interfaces)?;
+    if let Err(error) = &dump
+        && tunnels.iter().any(|tunnel| tunnel.enabled)
+    {
+        anyhow::bail!("The interface list could not be read: {error}.");
+    }
     let (uplinks, wan, wan_reason) = match &dump {
         Ok(_) => {
             let uplinks = uplinks(interfaces);

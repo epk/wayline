@@ -336,6 +336,14 @@ impl<'a> Probe<'a> {
         if self.pending.len() >= MAX_PENDING {
             return;
         }
+        if self.pending.is_empty() {
+            let mut stale = [0_u8; 256];
+            for _ in 0..16 {
+                if (&**socket).read(&mut stale).is_err() {
+                    break;
+                }
+            }
+        }
         let Some(packet) = echo_request(sequence, nonce) else {
             return;
         };

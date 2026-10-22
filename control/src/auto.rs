@@ -1,6 +1,6 @@
 use crate::{
     api::{self, Exits},
-    native,
+    native, router,
     runtime::{RUNTIME, locked, now},
     settings::Settings,
 };
@@ -161,6 +161,7 @@ pub fn step(config: &Settings) -> Result<()> {
         if record.needs_attention {
             return Ok(());
         }
+        router::forget();
         let Exits { revision, tunnels } = api::exits()?;
         let Some(current) = tunnels.iter().find(|tunnel| tunnel.preferred) else {
             return Ok(());

@@ -157,7 +157,13 @@ fn routine() -> Result<()> {
         }
     }
     if failure.is_none() {
-        locked("reconcile", || apply(&config, monitored))?;
+        locked("reconcile", || {
+            if Settings::read()? == config {
+                apply(&config, monitored)
+            } else {
+                Ok(())
+            }
+        })?;
     }
     let recorded = inventory
         .as_ref()
