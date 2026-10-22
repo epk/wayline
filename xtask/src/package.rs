@@ -1,4 +1,3 @@
-use crate::run;
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, write::GzEncoder};
 use serde_json::{Value, json};
@@ -6,6 +5,7 @@ use std::{fs, io::Write, path::Path};
 use tar::{Builder, EntryType, Header};
 use walkdir::WalkDir;
 use wayline_support::digest;
+use xshell::{Shell, cmd};
 
 fn header(mode: u32, size: u64) -> Header {
     let mut header = Header::new_gnu();
@@ -65,21 +65,6 @@ fn archive(root: &Path) -> Result<Vec<u8>> {
         }
     }
     Ok(builder.into_inner()?.finish()?)
-}
-
-pub fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-    for entry in WalkDir::new(source) {
-        let item = entry?;
-        let target = destination.join(item.path().strip_prefix(source)?);
-        if item.file_type().is_dir() {
-            fs::create_dir_all(target)?;
-        } else if item.file_type().is_symlink() {
-            std::os::unix::fs::symlink(fs::read_link(item.path())?, target)?;
-        } else {
-            fs::copy(item.path(), target)?;
-        }
-    }
-    Ok(())
 }
 
 const LOADER_PREFIX: &str = "(function(){var module={exports:{}};var exports=module.exports;";
@@ -150,7 +135,8 @@ pub fn build(version: &str) -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().join("root");
     fs::create_dir(&root)?;
-    copy_tree(Path::new("package/files"), &root)?;
+    let sh = Shell::new()?;
+    cmd!(sh, "cp -a package/files/. {root}").run()?;
     let binaries = root.join("usr/sbin");
     fs::create_dir_all(&binaries)?;
     for name in ["waylined", "wayline-ctl"] {
@@ -183,7 +169,7 @@ pub fn build(version: &str) -> Result<()> {
     fs::write(
         control.join("control"),
         format!(
-            "Package: wayline\nVersion: {version}\nArchitecture: aarch64_cortex-a53\nMaintainer: epk\nSection: net\nPriority: optional\nLicense: MIT\nDepends: libc, rpcd, lua, lua-cjson, curl, ca-bundle, usign, sqlite3-cli\nDescription: VPN latency measurements and a native GL.iNet UI.\n"
+            "Package: wayline\nVersion: {version}\nArchitecture: aarch64_cortex-a53\nMaintainer: epk\nSection: net\nPriority: optional\nLicense: MIT\nDepends: libc, rpcd, lua, lua-cjson, curl, ca-bundle, usign\nDescription: VPN latency measurements and a native GL.iNet UI.\n"
         ),
     )?;
     fs::write(control.join("conffiles"), "/etc/wayline/settings.json\n")?;
@@ -294,26 +280,14 @@ pub fn release(version: &str) -> Result<()> {
         })
         .context("The release signing key is unavailable.")?;
     key.write_all(secret.as_bytes())?;
-    run(
-        "usign",
-        &[
-            "-S",
-            "-s",
-            key.path().to_str().context("Invalid key path.")?,
-            "-m",
-            "dist/manifest.json",
-        ],
-    )?;
-    run(
-        "usign",
-        &[
-            "-V",
-            "-p",
-            "package/files/etc/wayline/release.pub",
-            "-m",
-            "dist/manifest.json",
-        ],
-    )?;
+    let sh = Shell::new()?;
+    let key = key.path();
+    cmd!(sh, "usign -S -s {key} -m dist/manifest.json").run()?;
+    cmd!(
+        sh,
+        "usign -V -p package/files/etc/wayline/release.pub -m dist/manifest.json"
+    )
+    .run()?;
     fs::copy("package/files/etc/wayline/release.pub", "dist/release.pub")?;
     Ok(())
 }
@@ -322,25 +296,14 @@ pub fn publish(version: &str) -> Result<()> {
     let tag = format!("v{version}");
     let title = format!("Wayline {version}");
     let artifact = format!("dist/wayline_{version}_aarch64_cortex-a53.ipk");
-    let mut args = vec![
-        "release",
-        "create",
-        &tag,
-        "--repo",
-        "epk/wayline",
-        "--verify-tag",
-        "--title",
-        &title,
-        "--notes",
-        "",
-        &artifact,
-        "dist/manifest.json",
-        "dist/manifest.json.sig",
-        "dist/release.pub",
-        "dist/licenses.tar.gz",
-    ];
+    let sh = Shell::new()?;
+    let mut release = cmd!(
+        sh,
+        "gh release create {tag} --repo epk/wayline --verify-tag --title {title} --notes '' {artifact} dist/manifest.json dist/manifest.json.sig dist/release.pub dist/licenses.tar.gz"
+    );
     if !semver::Version::parse(version)?.pre.is_empty() {
-        args.push("--prerelease");
+        release = release.arg("--prerelease");
     }
-    run("gh", &args)
+    release.run()?;
+    Ok(())
 }

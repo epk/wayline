@@ -24,6 +24,7 @@ tar.workspace = true
 tempfile.workspace = true
 tiny_http = "0.12"
 walkdir = "2"
+xshell = "0.2"
 
 [lints]
 workspace = true

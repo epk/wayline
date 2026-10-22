@@ -5,24 +5,9 @@ mod native;
 mod package;
 mod quality;
 
-use anyhow::{Context, Result, ensure};
-use std::{
-    fs,
-    path::Path,
-    process::{Child, Command},
-};
-
-fn run(program: &str, args: &[&str]) -> Result<()> {
-    ensure!(
-        Command::new(program)
-            .args(args)
-            .status()
-            .with_context(|| format!("Cannot start {program}."))?
-            .success(),
-        "{program} failed."
-    );
-    Ok(())
-}
+use anyhow::{Context, Result};
+use std::{fs, path::Path, process::Child};
+use xshell::{Shell, cmd};
 
 fn stop_child(child: &mut Child) {
     let _ = child.kill();
@@ -30,38 +15,21 @@ fn stop_child(child: &mut Child) {
 }
 
 fn build() -> Result<()> {
-    run(
-        "cargo",
-        &[
-            "build",
-            "--release",
-            "--locked",
-            "--offline",
-            "--target",
-            "aarch64-unknown-linux-musl",
-            "--package",
-            "waylined",
-            "--package",
-            "wayline-control",
-            "--package",
-            "xtask",
-        ],
-    )?;
-    run("pnpm", &["--dir", "ui", "build"])
+    let sh = Shell::new()?;
+    cmd!(sh, "cargo build --release --locked --offline --target aarch64-unknown-linux-musl --package waylined --package wayline-control --package xtask").run()?;
+    cmd!(sh, "pnpm --dir ui build").run()?;
+    Ok(())
 }
 
 fn deps() -> Result<()> {
-    run("cargo", &["fetch", "--locked"])?;
-    run(
-        "pnpm",
-        &[
-            "--dir",
-            "ui",
-            "install",
-            "--frozen-lockfile",
-            "--ignore-scripts",
-        ],
+    let sh = Shell::new()?;
+    cmd!(sh, "cargo fetch --locked").run()?;
+    cmd!(
+        sh,
+        "pnpm --dir ui install --frozen-lockfile --ignore-scripts"
     )
+    .run()?;
+    Ok(())
 }
 
 fn preview() -> Result<()> {

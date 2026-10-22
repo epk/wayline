@@ -1,4 +1,4 @@
-use crate::{run, stop_child};
+use crate::stop_child;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -11,76 +11,34 @@ use std::{
     time::{Duration, Instant},
 };
 use wayline_support::{atomic, digest, input, output, text};
+use xshell::{Shell, cmd};
 
 const PROFILE: &str = "wayline-lab";
 
 pub fn stop() -> Result<()> {
-    run("colima", &["--profile", PROFILE, "stop"])
+    let sh = Shell::new()?;
+    cmd!(sh, "colima --profile {PROFILE} stop").run()?;
+    Ok(())
 }
 
 pub fn start() -> Result<()> {
     let root = fs::canonicalize(".")?;
+    let sh = Shell::new()?;
     if cfg!(target_os = "linux") {
         let executable = std::env::current_exe()?;
         let path = std::env::var("WAYLINE_LAB_PATH")?;
-        return run(
-            "sudo",
-            &[
-                "env",
-                &format!("PATH={path}"),
-                &format!("WAYLINE_ROOT={}", root.display()),
-                executable.to_str().context("Invalid executable path.")?,
-                "lab-inside",
-            ],
-        );
+        cmd!(
+            sh,
+            "sudo env PATH={path} WAYLINE_ROOT={root} {executable} lab-inside"
+        )
+        .run()?;
+        return Ok(());
     }
-    run(
-        "colima",
-        &[
-            "--profile",
-            PROFILE,
-            "start",
-            "--runtime",
-            "containerd",
-            "--vm-type",
-            "vz",
-            "--cpu",
-            "2",
-            "--memory",
-            "1",
-            "--disk",
-            "6",
-            "--root-disk",
-            "4",
-            "--port-forwarder",
-            "none",
-            "--ssh-config=false",
-            "--activate=false",
-            "--binfmt=false",
-            "--mount",
-            "/nix/store",
-            "--mount",
-            &format!("{}:w", root.display()),
-        ],
-    )?;
+    cmd!(sh, "colima --profile {PROFILE} start --runtime containerd --vm-type vz --cpu 2 --memory 1 --disk 6 --root-disk 4 --port-forwarder none --ssh-config=false --activate=false --binfmt=false --mount /nix/store --mount {root}:w").run()?;
     let executable = root.join("target/aarch64-unknown-linux-musl/release/wayline-dev");
     ensure!(executable.exists(), "Build the ARM64 lab executable first.");
     let path = std::env::var("WAYLINE_LAB_PATH")?;
-    let result = run(
-        "colima",
-        &[
-            "--profile",
-            PROFILE,
-            "ssh",
-            "--",
-            "sudo",
-            "env",
-            &format!("PATH={path}"),
-            &format!("WAYLINE_ROOT={}", root.display()),
-            executable.to_str().context("Invalid executable path.")?,
-            "lab-inside",
-        ],
-    );
+    let result = cmd!(sh, "colima --profile {PROFILE} ssh -- sudo env PATH={path} WAYLINE_ROOT={root} {executable} lab-inside").run();
     let stopped = stop();
     result?;
     stopped
@@ -98,207 +56,116 @@ pub fn inside() -> Result<()> {
         return scenarios();
     }
     let executable = std::env::current_exe()?;
-    ensure!(
-        Command::new("unshare")
-            .args([
-                "--mount",
-                "--net",
-                "--pid",
-                "--fork",
-                "--mount-proc",
-                "--kill-child"
-            ])
-            .arg(executable)
-            .arg("lab-inside")
-            .env("WAYLINE_ISOLATED", "1")
-            .status()?
-            .success(),
-        "The closed lab failed."
-    );
+    let sh = Shell::new()?;
+    cmd!(
+        sh,
+        "unshare --mount --net --pid --fork --mount-proc --kill-child {executable} lab-inside"
+    )
+    .env("WAYLINE_ISOLATED", "1")
+    .run()
+    .context("The closed lab failed.")?;
     Ok(())
 }
 
-fn ip(namespace: &str, args: &[&str]) -> Result<()> {
-    let mut all = vec!["-n", namespace];
-    all.extend_from_slice(args);
-    run("ip", &all)
-}
-
-fn net(namespace: &str, program: &str, args: &[&str]) -> Result<()> {
-    let mut all = vec!["netns", "exec", namespace, program];
-    all.extend_from_slice(args);
-    run("ip", &all)
-}
-
 fn topology() -> Result<()> {
-    run("mount", &["--make-rprivate", "/"])?;
-    run("mount", &["-t", "tmpfs", "-o", "mode=755", "tmpfs", "/run"])?;
+    let sh = Shell::new()?;
+    cmd!(sh, "mount --make-rprivate /").run()?;
+    cmd!(sh, "mount -t tmpfs -o mode=755 tmpfs /run").run()?;
     fs::create_dir_all("/run/netns")?;
     fs::create_dir_all("/run/wayline-lab/keys")?;
     fs::create_dir_all("/run/wayline")?;
     fs::set_permissions("/run/wayline", fs::Permissions::from_mode(0o700))?;
     fs::set_permissions("/run/wayline-lab/keys", fs::Permissions::from_mode(0o700))?;
-    run("ip", &["netns", "add", "router"])?;
-    ip("router", &["link", "set", "lo", "up"])?;
+    cmd!(sh, "ip netns add router").run()?;
+    cmd!(sh, "ip -n router link set lo up").run()?;
     for index in 1..=8 {
-        links(index)?;
-        wireguard(index)?;
-        policy(index)?;
+        links(&sh, index)?;
+        wireguard(&sh, index)?;
+        policy(&sh, index)?;
     }
-    ip("router", &["route", "add", "default", "dev", "wg1"])?;
+    cmd!(sh, "ip -n router route add default dev wg1").run()?;
     Ok(())
 }
 
-fn links(index: u32) -> Result<()> {
-    let exit = format!("exit{index}");
-    let r = format!("r{index}");
-    let e = format!("e{index}");
-    run("ip", &["netns", "add", &exit])?;
-    ip(&exit, &["link", "set", "lo", "up"])?;
-    run(
-        "ip",
-        &["link", "add", &r, "type", "veth", "peer", "name", &e],
-    )?;
-    run("ip", &["link", "set", &r, "netns", "router"])?;
-    run("ip", &["link", "set", &e, "netns", &exit])?;
-    ip(
-        "router",
-        &["address", "add", &format!("172.20.{index}.1/30"), "dev", &r],
-    )?;
-    ip(
-        &exit,
-        &["address", "add", &format!("172.20.{index}.2/30"), "dev", &e],
-    )?;
-    ip("router", &["link", "set", &r, "up"])?;
-    ip(&exit, &["link", "set", &e, "up"])?;
+fn links(sh: &Shell, index: u32) -> Result<()> {
+    let index = index.to_string();
+    cmd!(sh, "ip netns add exit{index}").run()?;
+    cmd!(sh, "ip -n exit{index} link set lo up").run()?;
+    cmd!(sh, "ip link add r{index} type veth peer name e{index}").run()?;
+    cmd!(sh, "ip link set r{index} netns router").run()?;
+    cmd!(sh, "ip link set e{index} netns exit{index}").run()?;
+    cmd!(
+        sh,
+        "ip -n router address add 172.20.{index}.1/30 dev r{index}"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "ip -n exit{index} address add 172.20.{index}.2/30 dev e{index}"
+    )
+    .run()?;
+    cmd!(sh, "ip -n router link set r{index} up").run()?;
+    cmd!(sh, "ip -n exit{index} link set e{index} up").run()?;
     Ok(())
 }
 
-fn wireguard(index: u32) -> Result<()> {
-    let exit = format!("exit{index}");
-    let wg = format!("wg{index}");
+fn wireguard(sh: &Shell, index: u32) -> Result<()> {
     let rk = key(&format!("r{index}"))?;
     let ek = key(&format!("e{index}"))?;
-    ip("router", &["link", "add", &wg, "type", "wireguard"])?;
-    ip(&exit, &["link", "add", "wg0", "type", "wireguard"])?;
-    net(
-        "router",
-        "wg",
-        &[
-            "set",
-            &wg,
-            "private-key",
-            &format!("/run/wayline-lab/keys/r{index}"),
-            "peer",
-            &ek,
-            "allowed-ips",
-            "0.0.0.0/0",
-            "endpoint",
-            &format!("172.20.{index}.2:51820"),
-        ],
-    )?;
-    net(
-        &exit,
-        "wg",
-        &[
-            "set",
-            "wg0",
-            "listen-port",
-            "51820",
-            "private-key",
-            &format!("/run/wayline-lab/keys/e{index}"),
-            "peer",
-            &rk,
-            "allowed-ips",
-            &format!("10.90.{index}.2/32"),
-        ],
-    )?;
-    ip(
-        "router",
-        &["address", "add", &format!("10.90.{index}.2/24"), "dev", &wg],
-    )?;
-    ip(
-        &exit,
-        &[
-            "address",
-            "add",
-            &format!("10.90.{index}.1/24"),
-            "dev",
-            "wg0",
-        ],
-    )?;
+    let index = index.to_string();
+    cmd!(sh, "ip -n router link add wg{index} type wireguard").run()?;
+    cmd!(sh, "ip -n exit{index} link add wg0 type wireguard").run()?;
+    cmd!(sh, "ip netns exec router wg set wg{index} private-key /run/wayline-lab/keys/r{index} peer {ek} allowed-ips 0.0.0.0/0 endpoint 172.20.{index}.2:51820").run()?;
+    cmd!(sh, "ip netns exec exit{index} wg set wg0 listen-port 51820 private-key /run/wayline-lab/keys/e{index} peer {rk} allowed-ips 10.90.{index}.2/32").run()?;
+    cmd!(
+        sh,
+        "ip -n router address add 10.90.{index}.2/24 dev wg{index}"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "ip -n exit{index} address add 10.90.{index}.1/24 dev wg0"
+    )
+    .run()?;
     for target in 1..=12 {
-        ip(
-            &exit,
-            &[
-                "address",
-                "add",
-                &format!("198.18.0.{target}/32"),
-                "dev",
-                "lo",
-            ],
-        )?;
+        let target = target.to_string();
+        cmd!(
+            sh,
+            "ip -n exit{index} address add 198.18.0.{target}/32 dev lo"
+        )
+        .run()?;
     }
-    ip("router", &["link", "set", &wg, "up"])?;
-    ip(&exit, &["link", "set", "wg0", "up"])?;
+    cmd!(sh, "ip -n router link set wg{index} up").run()?;
+    cmd!(sh, "ip -n exit{index} link set wg0 up").run()?;
     Ok(())
 }
 
-fn policy(index: u32) -> Result<()> {
-    let exit = format!("exit{index}");
-    let wg = format!("wg{index}");
-    ip(
-        "router",
-        &[
-            "route",
-            "add",
-            "default",
-            "dev",
-            &wg,
-            "table",
-            &(1000 + index).to_string(),
-        ],
-    )?;
-    ip(
-        "router",
-        &[
-            "route",
-            "add",
-            "blackhole",
-            "default",
-            "metric",
-            "254",
-            "table",
-            &(1000 + index).to_string(),
-        ],
-    )?;
-    ip(
-        "router",
-        &[
-            "rule",
-            "add",
-            "pref",
-            &(6000 + index).to_string(),
-            "fwmark",
-            &format!("{}/0xf000", index * 4096),
-            "table",
-            &(1000 + index).to_string(),
-        ],
-    )?;
-    net(
-        &exit,
-        "tc",
-        &[
-            "qdisc",
-            "add",
-            "dev",
-            "wg0",
-            "root",
-            "netem",
-            "delay",
-            &format!("{}ms", index * 10),
-        ],
-    )?;
+fn policy(sh: &Shell, index: u32) -> Result<()> {
+    let table = (1000 + index).to_string();
+    let pref = (6000 + index).to_string();
+    let mark = (index * 4096).to_string();
+    let latency = (index * 10).to_string();
+    let index = index.to_string();
+    cmd!(
+        sh,
+        "ip -n router route add default dev wg{index} table {table}"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "ip -n router route add blackhole default metric 254 table {table}"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "ip -n router rule add pref {pref} fwmark {mark}/0xf000 table {table}"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "ip netns exec exit{index} tc qdisc add dev wg0 root netem delay {latency}ms"
+    )
+    .run()?;
     Ok(())
 }
 
@@ -373,9 +240,14 @@ fn after(seconds: u64) -> Result<Value> {
 }
 
 fn delay(index: u32, args: &[&str]) -> Result<()> {
-    let mut all = vec!["qdisc", "replace", "dev", "wg0", "root", "netem"];
-    all.extend_from_slice(args);
-    net(&format!("exit{index}"), "tc", &all)
+    let sh = Shell::new()?;
+    let index = index.to_string();
+    cmd!(
+        sh,
+        "ip netns exec exit{index} tc qdisc replace dev wg0 root netem {args...}"
+    )
+    .run()?;
+    Ok(())
 }
 
 fn scenarios() -> Result<()> {
@@ -555,81 +427,48 @@ fn rejection_checks() -> Result<()> {
 }
 
 fn route_failures(results: &mut serde_json::Map<String, Value>) -> Result<()> {
-    ip(
-        "router",
-        &["route", "del", "default", "dev", "wg4", "table", "1004"],
-    )?;
+    let sh = Shell::new()?;
+    cmd!(sh, "ip -n router route del default dev wg4 table 1004").run()?;
     let blackhole = after(2)?;
     ensure!(
         blackhole["tunnels"][3]["state"] == "route_unavailable",
         "The monitor did not reject a blackhole route."
     );
-    ip(
-        "router",
-        &[
-            "route",
-            "del",
-            "blackhole",
-            "default",
-            "metric",
-            "254",
-            "table",
-            "1004",
-        ],
-    )?;
+    cmd!(
+        sh,
+        "ip -n router route del blackhole default metric 254 table 1004"
+    )
+    .run()?;
     let mismatch = after(2)?;
     ensure!(
         mismatch["tunnels"][3]["state"] == "route_mismatch",
         "The monitor did not reject another exit."
     );
     results.insert("wrong_exit".into(), mismatch);
-    ip(
-        "router",
-        &["route", "add", "default", "dev", "wg4", "table", "1004"],
-    )?;
-    ip(
-        "router",
-        &[
-            "route",
-            "add",
-            "blackhole",
-            "default",
-            "metric",
-            "254",
-            "table",
-            "1004",
-        ],
-    )?;
-    ip(
-        "router",
-        &[
-            "rule",
-            "add",
-            "pref",
-            "5000",
-            "ipproto",
-            "icmp",
-            "fwmark",
-            "0x4000/0xf000",
-            "blackhole",
-        ],
-    )?;
+    cmd!(sh, "ip -n router route add default dev wg4 table 1004").run()?;
+    cmd!(
+        sh,
+        "ip -n router route add blackhole default metric 254 table 1004"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "ip -n router rule add pref 5000 ipproto icmp fwmark 0x4000/0xf000 blackhole"
+    )
+    .run()?;
     let blocked = after(2)?;
     ensure!(
         blocked["tunnels"][3]["state"] == "route_unavailable",
         "The route query used an incorrect protocol."
     );
-    ip("router", &["rule", "del", "pref", "5000"])?;
-    ip("router", &["link", "set", "wg5", "down"])?;
+    cmd!(sh, "ip -n router rule del pref 5000").run()?;
+    cmd!(sh, "ip -n router link set wg5 down").run()?;
     ensure!(
         after(2)?["tunnels"][4]["state"] == "interface_down",
         "A down interface remained active."
     );
-    ip("router", &["link", "set", "wg5", "up"])?;
-    ip(
-        "router",
-        &["route", "replace", "default", "dev", "wg5", "table", "1005"],
-    )?;
+    cmd!(sh, "ip -n router link set wg5 up").run()?;
+    cmd!(sh, "ip -n router route replace default dev wg5 table 1005").run()?;
     Ok(())
 }
 
