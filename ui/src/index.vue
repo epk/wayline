@@ -62,6 +62,7 @@
         <p>Compare your tunnels and choose an exit.</p>
       </div>
       <button
+        type="button"
         ref="settingsButton"
         class="vph-button"
         :disabled="!can.configure"
@@ -86,9 +87,6 @@
         >
           <p class="vph-hero-label vph-muted">{{ c.label }}</p>
           <p v-if="c.ip" class="vph-hero-main">
-            <span v-if="c.flag" class="vph-flag vph-hero-flag" aria-hidden="true">{{
-              c.flag
-            }}</span>
             <span class="vph-hero-ip">{{ c.ip }}</span>
           </p>
           <p v-else class="vph-hero-main vph-hero-pending vph-muted" :title="c.error || null">
@@ -188,7 +186,12 @@
         <ol class="vph-dests">
           <li v-for="(target, i) in draft.targets" :key="i" class="vph-dest">
             <div class="vph-dest-field">
+              <label :for="'vph-target-' + i">{{
+                i ? 'Destination ' + (i + 1) : 'Primary destination'
+              }}</label>
               <input
+                :id="'vph-target-' + i"
+                :name="'destination-' + (i + 1)"
                 v-model.trim="draft.targets[i]"
                 required
                 maxlength="253"
@@ -197,8 +200,11 @@
                 spellcheck="false"
                 :placeholder="i ? 'IP address or host name' : '1.1.1.1'"
                 :aria-label="i ? 'Destination ' + (i + 1) : 'Primary destination'"
+                :aria-describedby="resolvedText(target) ? 'vph-resolved-' + i : null"
               />
-              <small v-if="resolvedText(target)">{{ resolvedText(target) }}</small>
+              <small v-if="resolvedText(target)" :id="'vph-resolved-' + i">{{
+                resolvedText(target)
+              }}</small>
             </div>
             <div class="vph-dest-actions">
               <span v-if="!i" class="vph-badge">Primary</span>
@@ -352,8 +358,9 @@
         />
       </section>
       <footer>
-        <button type="button" class="vph-button" @click="closeSettings">Cancel</button
-        ><button class="vph-button vph-primary" :disabled="busy">
+        <button type="button" class="vph-button" :disabled="busy" @click="closeSettings">
+          Cancel</button
+        ><button type="submit" class="vph-button vph-primary" :disabled="busy">
           {{ busy && busyAction !== 'purge' ? 'Saving…' : 'Save settings' }}
         </button>
       </footer>
@@ -383,6 +390,7 @@
     <div class="vph-table-head">
       <div v-if="destinations.length > 1" class="vph-ranges" role="group" aria-label="Destination">
         <button
+          type="button"
           v-for="d in destinations"
           :key="d"
           :class="{ active: selectedTarget === d }"
@@ -401,6 +409,7 @@
       tabindex="0"
       role="region"
       aria-label="Exit tunnels table"
+      :aria-busy="!ready && !readError ? 'true' : 'false'"
     >
       <table class="vph-exits">
         <thead>
@@ -425,6 +434,7 @@
                   aria-hidden="true"
                 ></span>
                 <button
+                  type="button"
                   class="vph-name"
                   :title="t.name"
                   :aria-pressed="selectedTunnel === t.id ? 'true' : 'false'"
@@ -440,11 +450,7 @@
               <div v-if="exitIdentity(t.id) && !isExit(t)" class="vph-muted vph-status">
                 Exit IP {{ exitIdentity(t.id).ip
                 }}<template v-if="exitIdentity(t.id).place.name"
-                  >,
-                  <span class="vph-flag" aria-hidden="true">{{
-                    exitIdentity(t.id).place.flag
-                  }}</span>
-                  {{ exitIdentity(t.id).place.name }}</template
+                  >, {{ exitIdentity(t.id).place.name }}</template
                 >
               </div>
               <div v-else class="vph-muted vph-status">{{ t.stateLabel }}</div>
@@ -475,7 +481,7 @@
                   >Server {{ serverFor(t).address }}</span
                 >
               </template>
-              <span v-else class="vph-muted">—</span>
+              <span v-else class="vph-muted">No endpoint</span>
             </td>
             <td class="vph-action" :class="{ 'vph-confirming': pendingStop === t.id }">
               <div v-if="pendingStop === t.id" class="vph-confirm">
@@ -562,7 +568,7 @@
         </tbody>
       </table>
       <div v-if="!state.tunnels.length" class="vph-empty" role="status">
-        {{ emptyText }}
+        {{ !ready ? (readError ? 'Tunnel state is unavailable.' : 'Loading tunnels…') : emptyText }}
       </div>
     </div>
     <p v-if="uplinkRows.length && !wanAvailable" class="vph-muted vph-note" role="note">
@@ -589,7 +595,9 @@
               :disabled="offset + range >= maxMinutes"
               @click="shift(1)"
             >
-              ‹
+              <svg class="vph-chevron" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                <path d="m10 3-5 5 5 5" />
+              </svg>
             </button>
             <button
               type="button"
@@ -598,7 +606,9 @@
               :disabled="offset === 0"
               @click="shift(-1)"
             >
-              ›
+              <svg class="vph-chevron" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                <path d="m6 3 5 5-5 5" />
+              </svg>
             </button>
             <button v-if="offset > 0" type="button" @click="goNow">Now</button>
           </div>
@@ -785,16 +795,7 @@ const settingsFrom = (source) => {
   });
   return settings;
 };
-const palette = [
-  '#e69f00',
-  '#0072b2',
-  '#d55e00',
-  '#cc79a7',
-  '#56b4e9',
-  '#b8860b',
-  '#5b4bb7',
-  '#a6761d',
-];
+const palette = Array.from({ length: 8 }, (_, i) => 'var(--vph-series-' + (i + 1) + ')');
 const historyInterval = 30000;
 const rpcObject = 'wayline_' + WAYLINE_VERSION.replace(/\./g, '_');
 const endpointPrefix = 'endpoint:';
@@ -819,8 +820,6 @@ const storage = {
   },
 };
 const validCountry = (code) => typeof code === 'string' && /^[A-Z]{2}$/.test(code) && code !== 'XX';
-const flagOf = (code) =>
-  String.fromCodePoint(...[...code].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
 const countryName = (code) => {
   try {
     return new Intl.DisplayNames(['en'], { type: 'region' }).of(code) || code;
@@ -1102,7 +1101,6 @@ export default {
       return columns.map((c) => ({
         label: c.label,
         ip: c.egress && !c.egress.error ? c.egress.ip : '',
-        flag: c.place.flag,
         error: c.egress && c.egress.error,
         route: c.route,
         latency: c.latency,
@@ -1487,8 +1485,7 @@ export default {
       return !!this.exitTunnel && this.exitTunnel.id === t.id;
     },
     place(code) {
-      if (!validCountry(code)) return { flag: '', name: '' };
-      return { flag: flagOf(code), name: countryName(code) };
+      return { name: validCountry(code) ? countryName(code) : '' };
     },
     diagnosticValue(id) {
       const d = (this.state.diagnostics || {})[this.selectedTarget] || {};
@@ -1849,20 +1846,24 @@ export default {
     },
     readTheme() {
       const style = window.getComputedStyle(this.$el);
-      const read = (name, fallback) => style.getPropertyValue('--vph-' + name).trim() || fallback;
-      const brand = read('brand', '#159b9b');
+      const read = (name) => style.getPropertyValue('--vph-' + name).trim();
+      const brand = read('brand');
       this.theme = {
         brand,
-        text: read('text', '#253644'),
-        muted: read('muted', '#667984'),
-        border: read('border', '#e3e9ed'),
-        card: read('card', '#ffffff'),
+        text: read('text'),
+        muted: read('muted'),
+        border: read('border'),
+        card: read('card'),
         event: withAlpha(brand, 0.6),
         eventDot: withAlpha(brand, 0.85),
       };
+      palette.forEach((_, i) => {
+        const name = 'series-' + (i + 1);
+        this.theme[name] = read(name);
+      });
     },
     canvasColor(color) {
-      const match = /^var\(--vph-(\w+)\)$/.exec(color);
+      const match = /^var\(--vph-([\w-]+)\)$/.exec(color);
       return match ? this.theme[match[1]] : color;
     },
     axisOptions(extra) {
@@ -2321,24 +2322,43 @@ export default {
 </script>
 
 <style>
-.vph {
-  --vph-bg: var(--background-color, #f4f6f8);
-  --vph-card: var(--card-background-color, #fff);
-  --vph-text: var(--text-color, #253644);
-  --vph-muted: var(--label-color, #667984);
-  --vph-border: var(--table-border, #e3e9ed);
-  --vph-brand: var(--primary-color, #159b9b);
-  --vph-brand-text: color-mix(in srgb, var(--vph-brand) 65%, var(--vph-text));
-  --vph-brand-strong: color-mix(in srgb, var(--vph-brand) 72%, #000);
+:root {
+  --vph-default-bg: #f4f6f8;
+  --vph-default-card: #fff;
+  --vph-default-text: #253644;
+  --vph-default-muted: #5a6d78;
+  --vph-default-border: #e3e9ed;
+  --vph-default-brand: #159b9b;
+  --vph-inverse: #fff;
+  --vph-shade: #000;
   --vph-danger: #c62d3f;
+  --vph-warning: #b7791f;
+  --vph-warning-fill: #e0a800;
+  --vph-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --vph-series-1: #a86500;
+  --vph-series-2: #0072b2;
+  --vph-series-3: #b34a00;
+  --vph-series-4: #9b5792;
+  --vph-series-5: #257592;
+  --vph-series-6: #876116;
+  --vph-series-7: #5b4bb7;
+  --vph-series-8: #966b1f;
+}
+.vph {
+  --vph-bg: var(--background-color, var(--vph-default-bg));
+  --vph-card: var(--card-background-color, var(--vph-default-card));
+  --vph-text: var(--text-color, var(--vph-default-text));
+  --vph-muted: var(--label-color, var(--vph-default-muted));
+  --vph-border: var(--table-border, var(--vph-default-border));
+  --vph-brand: var(--primary-color, var(--vph-default-brand));
+  --vph-brand-text: color-mix(in srgb, var(--vph-brand) 65%, var(--vph-text));
+  --vph-brand-strong: color-mix(in srgb, var(--vph-brand) 72%, var(--vph-shade));
   --vph-danger-text: color-mix(in srgb, var(--vph-danger) 70%, var(--vph-text));
-  --vph-warn-text: color-mix(in srgb, #b7791f 55%, var(--vph-text));
+  --vph-warn-text: color-mix(in srgb, var(--vph-warning) 55%, var(--vph-text));
+  --vph-focus: var(--vph-text);
+  --vph-control-border: color-mix(in srgb, var(--vph-text) 55%, var(--vph-card));
   color: var(--vph-text);
-  font:
-    14px/1.5 -apple-system,
-    BlinkMacSystemFont,
-    'Segoe UI',
-    sans-serif;
+  font: 14px/1.5 var(--vph-font);
   width: 100%;
   box-sizing: border-box;
   min-width: 0;
@@ -2348,11 +2368,17 @@ export default {
 .vph * {
   box-sizing: border-box;
 }
+.vph [hidden] {
+  display: none !important;
+}
 .vph h1 {
   font-size: 26px;
   font-weight: 600;
   line-height: 1.25;
   margin: 3px 0 7px;
+  text-wrap: balance;
+  overflow-wrap: break-word;
+  min-width: 0;
 }
 .vph h2 {
   font-size: 16px;
@@ -2368,11 +2394,24 @@ export default {
   font: inherit;
 }
 .vph button {
+  position: relative;
+  min-height: 36px;
+  white-space: nowrap;
   cursor: pointer;
 }
-.vph button:disabled {
-  cursor: default;
+.vph button:disabled,
+.vph input:disabled,
+.vph select:disabled {
+  cursor: not-allowed;
   opacity: 0.55;
+}
+.vph button::before {
+  content: '';
+  position: absolute;
+  inset: -4px 0;
+}
+.vph button:active:enabled {
+  transform: translateY(1px);
 }
 .vph-sr {
   position: absolute;
@@ -2384,14 +2423,15 @@ export default {
 }
 .vph svg:focus-visible,
 .vph-table-wrap:focus-visible {
-  outline: 2px solid var(--vph-brand);
+  outline: 2px solid var(--vph-focus);
   outline-offset: 2px;
 }
 .vph button:focus-visible,
 .vph input:focus-visible,
-.vph select:focus-visible {
-  outline: 2px solid var(--vph-brand);
-  outline-offset: 3px;
+.vph select:focus-visible,
+.vph a:focus-visible {
+  outline: 2px solid var(--vph-focus);
+  outline-offset: 2px;
 }
 .vph-heading,
 .vph-chart-heading,
@@ -2413,15 +2453,18 @@ export default {
 .vph small {
   color: var(--vph-muted);
 }
+.vph select {
+  height: 40px;
+}
 .vph-preview {
-  background: color-mix(in srgb, #e0a800 20%, var(--vph-card));
+  background: color-mix(in srgb, var(--vph-warning-fill) 20%, var(--vph-card));
   color: var(--vph-warn-text);
   text-align: center;
   padding: 8px;
   border-radius: 5px;
 }
 .vph-button {
-  border: 1px solid var(--vph-border);
+  border: 1px solid var(--vph-control-border);
   border-radius: 5px;
   background: var(--vph-card);
   color: var(--vph-text);
@@ -2431,7 +2474,7 @@ export default {
 .vph-primary {
   background: var(--vph-brand-strong);
   border-color: var(--vph-brand-strong);
-  color: #fff;
+  color: var(--vph-inverse);
 }
 .vph-danger {
   border-color: var(--vph-danger);
@@ -2559,7 +2602,7 @@ export default {
   background: var(--vph-brand);
 }
 .vph-state-offline {
-  background: #d69e2e;
+  background: var(--vph-warning);
 }
 .vph-badge {
   flex: none;
@@ -2580,7 +2623,7 @@ export default {
   line-height: 16px;
   white-space: nowrap;
   color: var(--vph-warn-text);
-  background: color-mix(in srgb, #e0a800 18%, var(--vph-card));
+  background: color-mix(in srgb, var(--vph-warning-fill) 18%, var(--vph-card));
   padding: 1px 8px;
 }
 .vph-status {
@@ -2644,10 +2687,10 @@ export default {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 32px;
+  min-height: 36px;
   padding: 0 12px;
   font-size: 13px;
-  border: 1px solid var(--vph-border);
+  border: 1px solid var(--vph-control-border);
   border-radius: 5px;
   background: var(--vph-card);
   color: var(--vph-text);
@@ -2659,8 +2702,8 @@ export default {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 36px;
-  height: 32px;
+  width: 44px;
+  height: 36px;
   padding: 0;
   border: 0;
   background: none;
@@ -2728,9 +2771,6 @@ export default {
   gap: 10px;
   margin-top: 8px;
 }
-.vph-hero-flag {
-  font-size: 28px;
-}
 .vph-hero-ip {
   font-size: 30px;
   font-weight: 500;
@@ -2749,7 +2789,6 @@ export default {
 .vph-hero .vph-hero-latency {
   margin-top: 8px;
 }
-.vph-hero-secondary .vph-hero-flag,
 .vph-hero-secondary .vph-hero-ip {
   font-size: 22px;
 }
@@ -2792,9 +2831,6 @@ export default {
   margin-top: 16px;
   font-size: 12px;
   text-align: right;
-}
-.vph-flag {
-  font-family: 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif;
 }
 .vph-table-head {
   display: flex;
@@ -2924,8 +2960,13 @@ th[aria-sort='descending'] .vph-sort::after {
 .vph-ranges {
   display: flex;
   gap: 3px;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 4px;
+  scrollbar-width: thin;
 }
 .vph-ranges button {
+  flex: none;
   border: 0;
   border-radius: 4px;
   background: none;
@@ -2936,6 +2977,16 @@ th[aria-sort='descending'] .vph-sort::after {
   font-size: 18px;
   line-height: 1;
   padding: 5px 9px;
+}
+.vph-chevron {
+  display: block;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 .vph-ranges button.active {
   background: color-mix(in srgb, var(--vph-brand) 10%, var(--vph-card));
@@ -2958,7 +3009,7 @@ th[aria-sort='descending'] .vph-sort::after {
   font-size: 0.8125rem;
 }
 .vph-chart:focus-visible {
-  outline: 2px solid var(--vph-brand);
+  outline: 2px solid var(--vph-focus);
   outline-offset: 2px;
 }
 .vph-chart .u-select {
@@ -3052,6 +3103,7 @@ th[aria-sort='descending'] .vph-sort::after {
 .vph-set p {
   margin: 4px 0 0;
   font-size: 13px;
+  max-width: 72ch;
 }
 .vph-set .vph-check {
   margin: 10px 0 0;
@@ -3059,6 +3111,7 @@ th[aria-sort='descending'] .vph-sort::after {
 .vph-set select {
   width: auto;
   min-width: 200px;
+  max-width: 100%;
   margin-top: 8px;
 }
 .vph-row {
@@ -3074,6 +3127,7 @@ th[aria-sort='descending'] .vph-sort::after {
   gap: 8px;
 }
 .vph .vph-inline select {
+  width: auto;
   min-width: 0;
   margin: 0;
 }
@@ -3100,6 +3154,14 @@ th[aria-sort='descending'] .vph-sort::after {
   display: block;
   margin-top: 2px;
 }
+.vph-dest-field {
+  min-width: 0;
+}
+.vph-dest-field label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+}
 .vph-dest-actions {
   display: flex;
   align-items: center;
@@ -3112,7 +3174,9 @@ th[aria-sort='descending'] .vph-sort::after {
 .vph select {
   display: block;
   width: 100%;
-  border: 1px solid var(--vph-border);
+  min-height: 40px;
+  min-width: 0;
+  border: 1px solid var(--vph-control-border);
   border-radius: 4px;
   padding: 9px 11px;
   margin-top: 7px;
@@ -3194,8 +3258,8 @@ th[aria-sort='descending'] .vph-sort::after {
 }
 .vph-compat-monitoring {
   color: var(--vph-warn-text);
-  background: color-mix(in srgb, #e0a800 18%, var(--vph-card));
-  border: 1px solid color-mix(in srgb, #e0a800 45%, var(--vph-card));
+  background: color-mix(in srgb, var(--vph-warning-fill) 18%, var(--vph-card));
+  border: 1px solid color-mix(in srgb, var(--vph-warning-fill) 45%, var(--vph-card));
 }
 .vph-compat-unsupported {
   color: var(--vph-danger-text);
@@ -3268,11 +3332,21 @@ th[aria-sort='descending'] .vph-sort::after {
   .vph select {
     font-size: 16px !important;
   }
+  .vph select {
+    height: 48px;
+  }
   .vph-preview {
     font-size: 12px;
   }
 }
 @media (max-width: 639px) {
+  .vph-dest {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .vph-dest-actions {
+    justify-content: flex-start;
+    margin-top: 0;
+  }
   .vph-hero-primary .vph-hero-ip {
     font-size: 24px;
   }
@@ -3336,15 +3410,21 @@ th[aria-sort='descending'] .vph-sort::after {
 }
 @media (pointer: coarse) {
   .vph .vph-control,
-  .vph .vph-sort {
-    min-height: 44px;
+  .vph .vph-sort,
+  .vph button,
+  .vph input:not([type='checkbox']),
+  .vph select {
+    min-height: 48px;
   }
   .vph .vph-switch {
-    width: 44px;
-    height: 44px;
+    width: 48px;
+    height: 48px;
   }
 }
 @media (prefers-reduced-motion: reduce) {
+  .vph button:active:enabled {
+    transform: none;
+  }
   .vph-track,
   .vph-track::after {
     transition: none;

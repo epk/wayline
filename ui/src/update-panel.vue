@@ -202,7 +202,7 @@ export default {
 .vph-upd-brand {
   background: var(--vph-brand-strong);
   border-color: var(--vph-brand-strong);
-  color: #fff;
+  color: var(--vph-inverse);
 }
 .vph-upd-actions {
   display: flex;

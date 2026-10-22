@@ -17,7 +17,17 @@ module.exports = {
   module: {
     rules: [
       { test: /\.vue$/, loader: 'vue-loader' },
-      { test: /\.css$/, use: ['vue-style-loader', 'css-loader'] },
+      {
+        test: /\.css$/,
+        use: [
+          'vue-style-loader',
+          'css-loader',
+          {
+            loader: 'postcss-loader',
+            options: { postcssOptions: { config: false, plugins: ['cssnano'] } },
+          },
+        ],
+      },
     ],
   },
   plugins: [new VueLoaderPlugin(), new DefinePlugin({ WAYLINE_VERSION: JSON.stringify(version) })],
