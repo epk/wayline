@@ -4,8 +4,8 @@
   "private": true,
   "scripts": {
     "build": "webpack --mode production --fail-on-warnings",
-    "check": "eslint src/index.vue src/boundary.js preview/demo.js webpack.config.cjs && prettier --check src preview webpack.config.cjs package.json pnpm-workspace.yaml",
-    "format": "prettier --write src preview webpack.config.cjs package.json pnpm-workspace.yaml"
+    "check": "eslint src/index.vue src/boundary.js preview/demo.js webpack.config.cjs compiler-check.cjs && prettier --check src preview webpack.config.cjs compiler-check.cjs package.json pnpm-workspace.yaml && node compiler-check.cjs",
+    "format": "prettier --write src preview webpack.config.cjs compiler-check.cjs package.json pnpm-workspace.yaml"
   },
   "devDependencies": {
     "css-loader": "7.1.5",

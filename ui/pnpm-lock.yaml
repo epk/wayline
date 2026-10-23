@@ -8,7 +8,9 @@ overrides:
   vue-loader@15.11.1>@vue/component-compiler-utils: '-'
 
 patchedDependencies:
+  '@vue/compiler-sfc@2.7.16': 86ff5253e4f93bb33d92f5e7868b7bcb92d968ae4ac66b57fa1eb7b4db750de7
   vue-loader@15.11.1: 80a4618d903b187cb58a4976bb0dd4a15d99efdab93e30199bff64725afa901c
+  vue@2.7.16: fddd8c04cbeb1df46121d5c76fdbf58c603c7536b66ab048de62e44a53744819
 
 importers:
 
@@ -40,10 +42,10 @@ importers:
         version: 1.6.32
       vue:
         specifier: 2.7.16
-        version: 2.7.16
+        version: 2.7.16(patch_hash=fddd8c04cbeb1df46121d5c76fdbf58c603c7536b66ab048de62e44a53744819)
       vue-loader:
         specifier: 15.11.1
-        version: 15.11.1(patch_hash=80a4618d903b187cb58a4976bb0dd4a15d99efdab93e30199bff64725afa901c)(css-loader@7.1.5(webpack@5.112.0))(prettier@3.9.10)(vue-template-compiler@2.7.16)(webpack@5.112.0)
+        version: 15.11.1(patch_hash=80a4618d903b187cb58a4976bb0dd4a15d99efdab93e30199bff64725afa901c)(css-loader@7.1.5(webpack@5.112.0))(prettier@3.9.10)(webpack@5.112.0)
       vue-style-loader:
         specifier: 4.1.3
         version: 4.1.3
@@ -1177,7 +1179,7 @@ snapshots:
     dependencies:
       undici-types: 8.9.0
 
-  '@vue/compiler-sfc@2.7.16':
+  '@vue/compiler-sfc@2.7.16(patch_hash=86ff5253e4f93bb33d92f5e7868b7bcb92d968ae4ac66b57fa1eb7b4db750de7)':
     dependencies:
       '@babel/parser': 7.29.9
       postcss: 8.5.31
@@ -1893,7 +1895,7 @@ snapshots:
 
   vue-hot-reload-api@2.3.4: {}
 
-  vue-loader@15.11.1(patch_hash=80a4618d903b187cb58a4976bb0dd4a15d99efdab93e30199bff64725afa901c)(css-loader@7.1.5(webpack@5.112.0))(prettier@3.9.10)(vue-template-compiler@2.7.16)(webpack@5.112.0):
+  vue-loader@15.11.1(patch_hash=80a4618d903b187cb58a4976bb0dd4a15d99efdab93e30199bff64725afa901c)(css-loader@7.1.5(webpack@5.112.0))(prettier@3.9.10)(webpack@5.112.0):
     dependencies:
       css-loader: 7.1.5(webpack@5.112.0)
       hash-sum: 1.0.2
@@ -1901,15 +1903,17 @@ snapshots:
       vue-hot-reload-api: 2.3.4
       vue-style-loader: 4.1.3
       webpack: 5.112.0(cssnano@9.9.0(postcss@8.5.31))(postcss@8.5.31)(webpack-cli@7.2.3)
+    optionalDependencies:
+      prettier: 3.9.10
 
   vue-style-loader@4.1.3:
     dependencies:
       hash-sum: 1.0.2
       loader-utils: 1.4.2
 
-  vue@2.7.16:
+  vue@2.7.16(patch_hash=fddd8c04cbeb1df46121d5c76fdbf58c603c7536b66ab048de62e44a53744819):
     dependencies:
-      '@vue/compiler-sfc': 2.7.16
+      '@vue/compiler-sfc': 2.7.16(patch_hash=86ff5253e4f93bb33d92f5e7868b7bcb92d968ae4ac66b57fa1eb7b4db750de7)
       csstype: 3.2.3
 
   watchpack@2.6.3:

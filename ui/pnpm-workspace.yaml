@@ -1,4 +1,6 @@
 overrides:
   'vue-loader@15.11.1>@vue/component-compiler-utils': '-'
 patchedDependencies:
+  '@vue/compiler-sfc@2.7.16': patches/@vue__compiler-sfc@2.7.16.patch
   vue-loader@15.11.1: patches/vue-loader@15.11.1.patch
+  vue@2.7.16: patches/vue@2.7.16.patch

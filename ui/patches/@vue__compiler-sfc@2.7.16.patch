@@ -1,0 +1,10 @@
+diff --git a/dist/compiler-sfc.js b/dist/compiler-sfc.js
+index 91da3e0..07d9d40 100644
+--- a/dist/compiler-sfc.js
++++ b/dist/compiler-sfc.js
+@@ -483,2 +483,3 @@ function parseHTML(html, options) {
+-                (reCache[stackedTag] = new RegExp('([\\s\\S]*?)(</' + stackedTag + '[^>]*>)', 'i'));
+-            const rest = html.replace(reStackedTag, function (all, text, endTag) {
++                (reCache[stackedTag] = new RegExp('^([\\s\\S]*?)(</' + stackedTag + '[^>]*>)', 'i'));
++            const closingTagStart = html.search(new RegExp('</' + stackedTag, 'i'));
++            const rest = closingTagStart < 0 || html.indexOf('>', closingTagStart) < 0 ? html : html.replace(reStackedTag, function (all, text, endTag) {
