@@ -13,7 +13,7 @@
     : 'full';
   const wanDown = query.get('wan') === 'unavailable';
   const updateFailed = query.get('update') === 'failed';
-  const release = '0.1.0-alpha.19';
+  const release = '0.1.0-alpha.20';
   const installed = query.get('stale') === '1' ? '0.0.0' : release;
   const directExit = query.get('exit') === 'direct';
   const wanMs = wanDown ? null : 14.37;

@@ -2,7 +2,7 @@
 
 Wayline compares VPN tunnels on GL.iNet routers. The **VPN → Wayline** page shows latency, loss, history, and exit addresses. It provides native tunnel Start and Stop controls and manual exit selection.
 
-Wayline is experimental. This README describes **0.1.0-alpha.19**, which fixes the Vue compiler denial-of-service issue in the build dependencies. It includes the alpha.16 UI improvements. Install signed packages from [GitHub Releases](https://github.com/epk/wayline/releases).
+Wayline is experimental. This README describes **0.1.0-alpha.20**, which fixes the Vue compiler denial-of-service issue in the build dependencies. It includes the alpha.16 UI improvements. Install signed packages from [GitHub Releases](https://github.com/epk/wayline/releases).
 
 The screenshots use synthetic data. They contain no live router addresses, endpoints, locations, or tunnel names.
 
@@ -41,7 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/epk/wayline/main/install.sh | sh
 
 The installer downloads the newest published release, including prereleases. It checks the signing key fingerprint, manifest signature, and package hash before installation.
 
-To install a specific version, download `install.sh`. Run `WAYLINE_VERSION=0.1.0-alpha.19 sh install.sh`.
+To install a specific version, download `install.sh`. Run `WAYLINE_VERSION=0.1.0-alpha.20 sh install.sh`.
 
 Create your VPN profiles in the factory dashboard first. Open **VPN → Wayline → Settings**. Choose the tunnels and destinations to monitor, then enable monitoring.
 

@@ -29,7 +29,11 @@ async function check(build) {
       if (tag === 'style') assert.equal(parsed.styles[0].content, body);
       for (const body of ['<'.repeat(1_000_000), `</${tag}`.repeat(100_000)]) {
         compiler.parseComponent(`<${tag}>${body}</different>`);
-        compiler.compileTemplate({ source: `<${tag}>${body}`, filename: 'security.vue' });
+        compiler.compileTemplate({
+          source: `<${tag}>${body}`,
+          filename: 'security.vue',
+          prettify: false,
+        });
       }
     }
     const body = '\nİ < value';
@@ -42,6 +46,7 @@ async function check(build) {
     const compiled = compiler.compileTemplate({
       source: result.template.content,
       filename: 'valid.vue',
+      prettify: false,
     });
     assert.deepEqual(compiled.errors, []);
     assert.match(compiled.code, /textarea/);
