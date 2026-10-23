@@ -16,8 +16,11 @@ runs:
         name: devenv
     - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569
       with:
-        primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'nix/**', 'rust-toolchain.toml') }}
-        restore-prefixes-first-match: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-
+        primary-key: nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'nix/**', 'rust-toolchain.toml') }}-${{ inputs.profile }}
+        restore-prefixes-first-match: |
+          nix-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'nix/**', 'rust-toolchain.toml') }}-
+          nix-v2-${{ runner.os }}-${{ runner.arch }}-
+          nix-v1-${{ runner.os }}-${{ runner.arch }}-
         save: ${{ github.event_name == 'push' }}
     - name: Install pinned devenv
       shell: bash

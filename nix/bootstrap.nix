@@ -1,7 +1,7 @@
 let
   source = builtins.fetchTarball {
-    url = "https://github.com/NixOS/nixpkgs/archive/f324bcfb496deb48d1cb1e679b87f82037e0b72f.tar.gz";
-    sha256 = "sha256-MbpS2LDxuBhUu4IdzKlFbeikesP6Nt5Dgr5yVa6c0KY=";
+    url = "https://github.com/NixOS/nixpkgs/archive/e513db7b0a65def6f6e17bb55195dfe510871944.tar.gz";
+    sha256 = "sha256-RkAXQ3+a5rHMiP97Er7AawR1kvEXX9tK1mhiWedOPTc=";
   };
   pkgs = import source { };
 in
