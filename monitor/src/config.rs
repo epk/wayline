@@ -15,6 +15,13 @@ fn valid_name(value: &str, max: usize) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 
+fn valid_path_id(value: &str) -> bool {
+    match value.split_once(':') {
+        Some((kind, name)) => valid_name(kind, 64) && valid_name(name, 64 - kind.len() - 1),
+        None => valid_name(value, 64),
+    }
+}
+
 const fn valid_ip(ip: Ipv4Addr) -> bool {
     !ip.is_unspecified()
         && !ip.is_loopback()
@@ -45,7 +52,7 @@ pub fn read(path: &Path) -> Result<Config, Box<dyn Error>> {
     }
     for (i, tunnel) in config.tunnels.iter().enumerate() {
         if tunnel.target.is_some_and(|ip| !valid_ip(ip))
-            || (!tunnel.path_id.is_empty() && !valid_name(&tunnel.path_id, 64))
+            || (!tunnel.path_id.is_empty() && !valid_path_id(&tunnel.path_id))
             || !valid_name(&tunnel.id, 64)
             || !valid_name(&tunnel.interface, 15)
             || tunnel.interface == "lo"
