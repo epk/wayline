@@ -16,6 +16,9 @@ let
     util-linux
     coreutils
     glibc.bin
+    gnutar
+    gzip
+    apk-tools
   ];
   rustTools = [
     rust
@@ -23,6 +26,10 @@ let
     pkgs.llvmPackages.lld
     pkgs.git
     pkgs.coreutils
+  ];
+  packageTools = [
+    pkgs.apk-tools
+    pkgs.fakeroot
   ];
   frontendTools = [
     pkgs.nodejs_24
@@ -62,6 +69,7 @@ in
       gzip
       coreutils
     ]
+    ++ packageTools
     ++ lib.optionals pkgs.stdenv.isDarwin [ pkgs.colima ];
   env.CC_aarch64_unknown_linux_musl = "${musl}/bin/${musl.targetPrefix}cc";
   env.AR_aarch64_unknown_linux_musl = "${musl.bintools}/bin/${musl.targetPrefix}ar";
@@ -108,7 +116,7 @@ in
       env.WAYLINE_LAB_PATH = lib.mkForce "";
     };
     ci-build.module = {
-      packages = lib.mkForce (rustTools ++ frontendTools);
+      packages = lib.mkForce (rustTools ++ frontendTools ++ packageTools);
       env.WAYLINE_LAB_PATH = lib.mkForce "";
     };
     ci-test.module.packages = lib.mkForce rustTools;

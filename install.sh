@@ -10,7 +10,18 @@ fail() {
     exit 1
 }
 
-for tool in curl jsonfilter usign sha256sum opkg mktemp; do
+if [ -f /etc/apk/arch ]; then
+    manager=apk
+    format=apk
+    manifest='manifest-apk.json'
+    grep -qx "$ARCH" /etc/apk/arch || fail "this router does not support $ARCH packages"
+else
+    manager=opkg
+    format=ipk
+    manifest=manifest.json
+fi
+
+for tool in curl jsonfilter usign sha256sum "$manager" mktemp; do
     command -v "$tool" >/dev/null 2>&1 || fail "missing required tool: $tool"
 done
 
@@ -32,10 +43,10 @@ case "$version" in
 esac
 
 base="https://github.com/$REPO/releases/download/v$version"
-package="wayline_${version}_${ARCH}.ipk"
+package="wayline_${version}_${ARCH}.${format}"
 printf 'Downloading Wayline %s...\n' "$version"
 curl -fsSL --fail-early --remote-name-all \
-    "$base/release.pub" "$base/manifest.json" "$base/manifest.json.sig" "$base/$package" ||
+    "$base/release.pub" "$base/$manifest" "$base/$manifest.sig" "$base/$package" ||
     fail "cannot download Wayline $version from $base"
 
 printf 'Checking the signing key...\n'
@@ -43,20 +54,23 @@ printf 'Checking the signing key...\n'
     fail "the signing key does not match $RELEASE_KEY"
 
 printf 'Checking the manifest signature...\n'
-usign -V -p release.pub -m manifest.json -x manifest.json.sig >/dev/null ||
+usign -V -p release.pub -m "$manifest" -x "$manifest.sig" >/dev/null ||
     fail "the manifest signature is invalid"
 
 printf 'Checking the package hash...\n'
 digest=$(sha256sum "$package") || fail "cannot hash $package"
 digest=${digest%% *}
 [ -n "$digest" ] || fail "cannot hash $package"
-grep -F -q "$digest" manifest.json ||
+grep -F -q "$digest" "$manifest" ||
     fail "the package hash is not listed in the signed manifest"
 
-printf 'Updating package lists...\n'
-opkg update </dev/null >/dev/null || fail "opkg update failed"
-
 printf 'Installing Wayline %s...\n' "$version"
-opkg install "./$package" </dev/null || fail "opkg install failed"
+if [ "$manager" = apk ]; then
+    apk add --allow-untrusted "./$package" </dev/null || fail "apk add failed"
+else
+    printf 'Updating package lists...\n'
+    opkg update </dev/null >/dev/null || fail "opkg update failed"
+    opkg install "./$package" </dev/null || fail "opkg install failed"
+fi
 
 printf 'Wayline %s installed. Open VPN → Wayline in the admin UI.\n' "$version"

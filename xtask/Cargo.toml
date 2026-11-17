@@ -10,7 +10,7 @@ autobenches = false
 [[bin]]
 name = "wayline-dev"
 path = "src/main.rs"
-test = false
+test = true
 bench = false
 
 [dependencies]

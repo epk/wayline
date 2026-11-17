@@ -58,6 +58,7 @@ jobs:
           name: wayline-build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             dist/*.ipk
+            dist/*.apk
             dist/licenses.tar.gz
             target/aarch64-unknown-linux-musl/release/waylined
             target/aarch64-unknown-linux-musl/release/wayline-ctl
@@ -115,7 +116,7 @@ jobs:
           commit: ${{ github.sha }}
           name: Wayline ${{ needs.build.outputs.version }}
           prerelease: ${{ needs.build.outputs.prerelease }}
-          artifacts: dist/*.ipk,dist/manifest.json,dist/manifest.json.sig,dist/release.pub,dist/licenses.tar.gz
+          artifacts: dist/*.ipk,dist/*.apk,dist/manifest.json,dist/manifest.json.sig,dist/manifest-apk.json,dist/manifest-apk.json.sig,dist/release.pub,dist/licenses.tar.gz
           artifactErrorsFailBuild: true
           immutableCreate: true
           skipIfReleaseExists: true

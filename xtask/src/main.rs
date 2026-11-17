@@ -88,6 +88,7 @@ fn main() -> Result<()> {
         Some("format") => quality::format(),
         Some("build") => build(),
         Some("package") => package::build(&release_version(args.next())?),
+        Some("package-apk") => package::build_apk(&release_version(args.next())?),
         Some("release") => package::release(&release_version(args.next())?),
         Some("preview") => preview(),
         Some("lab") => lab::start(),
@@ -102,7 +103,7 @@ fn main() -> Result<()> {
         Some("lab-inside") => lab::inside(),
         Some("lab-stop") => lab::stop(),
         _ => anyhow::bail!(
-            "Use deps, check, lint, test, ci-metadata, format, build, package, release, preview, lab, or lab-stop."
+            "Use deps, check, lint, test, ci-metadata, format, build, package, package-apk, release, preview, lab, or lab-stop."
         ),
     }
 }

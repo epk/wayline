@@ -16,8 +16,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
-pub const FIRMWARE_CONTRACT: &str =
-    "9c8a9102c046ff12ba95e4c9a03b4e5392c461584c5d4d8ab9c5591ab6ec9237";
+pub const FIRMWARE_CONTRACTS: [&str; 2] = [
+    "9c8a9102c046ff12ba95e4c9a03b4e5392c461584c5d4d8ab9c5591ab6ec9237",
+    "e3a134103d13d815b019671372ebe3ceb01dc43d279acce51f5d222de0b8b812",
+];
 
 #[must_use]
 pub fn digest(data: &[u8]) -> String {

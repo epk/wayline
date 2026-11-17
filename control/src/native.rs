@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
-use wayline_support::FIRMWARE_CONTRACT;
+use wayline_support::FIRMWARE_CONTRACTS;
 
 pub const MAX_TUNNELS: usize = 8;
 
@@ -163,7 +163,7 @@ fn decide(firmware: &str, digest: Option<&str>) -> (Level, bool, String) {
             false,
             "The native VPN module is missing.".into(),
         ),
-        Some(FIRMWARE_CONTRACT) => (Level::Full, true, String::new()),
+        Some(digest) if FIRMWARE_CONTRACTS.contains(&digest) => (Level::Full, true, String::new()),
         Some(_) => (
             Level::Full,
             false,
@@ -234,6 +234,20 @@ pub fn bus<T: DeserializeOwned>(object: &str, method: &str, params: &Value) -> R
         .with_context(|| format!("Unknown reply from ubus {object} {method}."))
 }
 
+pub fn refusal(reply: &Value) -> Option<String> {
+    reply.get("err_code")?;
+    Some(
+        reply
+            .get("err_msg")
+            .and_then(Value::as_str)
+            .filter(|message| !message.is_empty())
+            .map_or_else(
+                || "The native VPN manager refused the change.".into(),
+                |message| format!("The native VPN manager refused the change: {message}"),
+            ),
+    )
+}
+
 pub fn call<T: DeserializeOwned>(method: &str, params: &Value) -> Result<T> {
     let params = json!({"module":"vpn-client","func":method,"params":params}).to_string();
     let (timeout, deadline) = if matches!(method, "set_tunnel" | "order_tunnel") {
@@ -254,7 +268,23 @@ pub fn call<T: DeserializeOwned>(method: &str, params: &Value) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::{Level, decide, version};
-    use wayline_support::FIRMWARE_CONTRACT;
+    use wayline_support::FIRMWARE_CONTRACTS;
+
+    #[test]
+    fn refusals() {
+        use super::refusal;
+        use serde_json::json;
+        assert_eq!(refusal(&json!({})), None);
+        assert_eq!(refusal(&json!({"tunnel_id":8151})), None);
+        assert_eq!(
+            refusal(&json!({"err_code":20_001_213,"err_msg":"VPN configuration is busy"})),
+            Some("The native VPN manager refused the change: VPN configuration is busy".into())
+        );
+        assert_eq!(
+            refusal(&json!({"err_code":1})),
+            Some("The native VPN manager refused the change.".into())
+        );
+    }
 
     #[test]
     fn versions() {
@@ -268,10 +298,14 @@ mod tests {
 
     #[test]
     fn policy() {
-        let known = Some(FIRMWARE_CONTRACT);
+        let known = Some(FIRMWARE_CONTRACTS[0]);
         for firmware in ["4.9.0", "4.9.1", "4.10.3", "5.0.0"] {
             let (level, verified, _) = decide(firmware, known);
             assert!(level == Level::Full && verified, "{firmware}");
+        }
+        for contract in FIRMWARE_CONTRACTS {
+            let (level, verified, _) = decide("4.11.0", Some(contract));
+            assert!(level == Level::Full && verified, "{contract}");
         }
         for firmware in ["4.9.2", "4.10.0", "5.1.0"] {
             let (level, verified, message) = decide(firmware, Some("changed"));

@@ -626,8 +626,12 @@ pub fn set_tunnel_enabled(request: &SetEnabled) -> Result<Value> {
                 runtime::store(SETTINGS, &config)?;
             }
             auto::Record::touch(auto::Attention::Preserve)?;
-            native::call::<Value>("set_tunnel", &json!({"tunnel_id":number,"enabled":enabled}))
-                .context(UNKNOWN)?;
+            let reply =
+                native::call::<Value>("set_tunnel", &json!({"tunnel_id":number,"enabled":enabled}))
+                    .context(UNKNOWN)?;
+            if let Some(message) = native::refusal(&reply) {
+                anyhow::bail!(message);
+            }
             thread::sleep(Duration::from_secs(5));
             let after = native::List::read().context(UNKNOWN)?;
             let actual = after
@@ -701,6 +705,9 @@ pub fn apply(id: &str, expected_revision: &str, selection: Selection) -> Result<
         auto::Record::touch(auto::Attention::Preserve)?;
     }
     let response = native::call::<Value>("order_tunnel", &json!({"id_list":desired}));
+    if let Some(message) = response.as_ref().ok().and_then(native::refusal) {
+        anyhow::bail!(message);
+    }
     let after = native::List::read().context("Selection outcome is unknown. Refresh first.")?;
     ensure!(
         after

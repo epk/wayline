@@ -25,13 +25,15 @@ pub fn start() -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
     }
     let root = fs::canonicalize(".")?;
+    let firmware = std::env::var("WAYLINE_FIRMWARE_ROOT")
+        .unwrap_or_else(|_| "artifacts/local/firmware-root".into());
     let sh = Shell::new()?;
     if cfg!(target_os = "linux") {
         let executable = std::env::current_exe()?;
         let path = std::env::var("WAYLINE_LAB_PATH")?;
         cmd!(
             sh,
-            "sudo env PATH={path} WAYLINE_ROOT={root} {executable} lab-inside"
+            "sudo env PATH={path} WAYLINE_ROOT={root} WAYLINE_FIRMWARE_ROOT={firmware} {executable} lab-inside"
         )
         .run()?;
         return Ok(());
@@ -40,7 +42,7 @@ pub fn start() -> Result<()> {
     let executable = root.join("target/aarch64-unknown-linux-musl/release/wayline-dev");
     ensure!(executable.exists(), "Build the ARM64 lab executable first.");
     let path = std::env::var("WAYLINE_LAB_PATH")?;
-    let result = cmd!(sh, "colima --profile {PROFILE} ssh -- sudo env PATH={path} WAYLINE_ROOT={root} {executable} lab-inside").run();
+    let result = cmd!(sh, "colima --profile {PROFILE} ssh -- sudo env PATH={path} WAYLINE_ROOT={root} WAYLINE_FIRMWARE_ROOT={firmware} {executable} lab-inside").run();
     let stopped = stop();
     result?;
     stopped

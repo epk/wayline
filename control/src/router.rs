@@ -19,7 +19,7 @@ const OPENVPN: &str = "OpenVPN endpoint discovery is not supported.";
 const IPV6: &str = "The endpoint is an IPv6 address, which Wayline does not measure.";
 const TOO_MANY: &str = "More than eight VPN tunnels are unsupported.";
 
-const IGNORED: [&str; 8] = [
+const IGNORED: [&str; 9] = [
     ".name",
     ".anonymous",
     "peer_id",
@@ -28,6 +28,7 @@ const IGNORED: [&str; 8] = [
     "profiles",
     "options_in_used",
     "mark",
+    "failover_revision",
 ];
 
 struct Found {
@@ -905,6 +906,18 @@ mod tests {
             let changed: Rule = serde_json::from_str(changed)?;
             assert_ne!(left.signature(), changed.signature());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_signatures_ignore_native_switch_revisions() -> Result<()> {
+        let started: Rule = serde_json::from_str(
+            r#"{"killswitch":"1","via_type":"wireguard","mtu":"1420","failover_revision":"lua_dgFOdD"}"#,
+        )?;
+        let untouched: Rule = serde_json::from_str(
+            r#"{"killswitch":"1","via_type":"wireguard","mtu":"1420","options_in_used":"1","mark":"0x2000"}"#,
+        )?;
+        assert_eq!(started.signature(), untouched.signature());
         Ok(())
     }
 

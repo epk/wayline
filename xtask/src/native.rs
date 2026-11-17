@@ -4,12 +4,16 @@ use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::LazyLock;
 use std::thread;
 use std::time::{Duration, Instant};
-use wayline_support::FIRMWARE_CONTRACT as CONTRACT;
+use wayline_support::FIRMWARE_CONTRACTS;
 use xshell::{Shell, cmd};
 
-const ROOT: &str = "artifacts/local/firmware-root";
+static ROOT: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("WAYLINE_FIRMWARE_ROOT")
+        .unwrap_or_else(|_| "artifacts/local/firmware-root".into())
+});
 const NATIVE_PATH: &str = "PATH=/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub fn reload_probe() -> Result<()> {
@@ -60,21 +64,22 @@ fn contract(root: &Path) -> Result<String> {
 
 pub fn prepare(source: &Path) -> Result<()> {
     ensure!(
-        contract(source)? == CONTRACT,
+        FIRMWARE_CONTRACTS.contains(&contract(source)?.as_str()),
         "The extracted firmware contract differs."
     );
     ensure!(
-        !Path::new(ROOT).exists(),
+        !Path::new(ROOT.as_str()).exists(),
         "The lab firmware directory already exists."
     );
-    fs::create_dir_all(ROOT)?;
+    fs::create_dir_all(ROOT.as_str())?;
     let sh = Shell::new()?;
-    cmd!(sh, "cp -a {source}/. {ROOT}").run()?;
+    let root = ROOT.as_str();
+    cmd!(sh, "cp -a {source}/. {root}").run()?;
     Ok(())
 }
 
 fn call(program: &str, arguments: &[&str]) -> Result<String> {
-    let mut args = vec![ROOT, "/usr/bin/env", NATIVE_PATH, program];
+    let mut args = vec![ROOT.as_str(), "/usr/bin/env", NATIVE_PATH, program];
     args.extend_from_slice(arguments);
     let response = wayline_support::output_status("chroot", &args, 524_288, 50)?;
     let output = String::from_utf8(response.bytes)?;
@@ -86,9 +91,14 @@ fn service(program: &str, arguments: &[&str]) -> Result<Child> {
     let name = Path::new(program)
         .file_name()
         .context("Invalid service path.")?;
-    let log = fs::File::create(Path::new(ROOT).join("tmp").join(name).with_extension("log"))?;
+    let log = fs::File::create(
+        Path::new(ROOT.as_str())
+            .join("tmp")
+            .join(name)
+            .with_extension("log"),
+    )?;
     Ok(Command::new("chroot")
-        .args([ROOT, "/usr/bin/env", NATIVE_PATH, program])
+        .args([ROOT.as_str(), "/usr/bin/env", NATIVE_PATH, program])
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -105,17 +115,18 @@ fn request(method: &str, args: &Value) -> Result<Value> {
 }
 
 pub fn check() -> Result<()> {
-    if !Path::new(ROOT).exists() {
+    if !Path::new(ROOT.as_str()).exists() {
         return Ok(());
     }
     let sh = Shell::new()?;
     cmd!(sh, "ip link set lo up").run()?;
     ensure!(
-        contract(Path::new(ROOT))? == CONTRACT,
+        FIRMWARE_CONTRACTS.contains(&contract(Path::new(ROOT.as_str()))?.as_str()),
         "The firmware contract differs."
     );
-    fs::create_dir_all(format!("{ROOT}/tmp"))?;
-    cmd!(sh, "mount -t tmpfs -o mode=1777 tmpfs {ROOT}/tmp").run()?;
+    let root = ROOT.as_str();
+    fs::create_dir_all(format!("{root}/tmp"))?;
+    cmd!(sh, "mount -t tmpfs -o mode=1777 tmpfs {root}/tmp").run()?;
     for directory in [
         "tmp",
         "tmp/run",
@@ -127,35 +138,35 @@ pub fn check() -> Result<()> {
         "tmp/log/nginx",
         "tmp/lib/nginx",
     ] {
-        fs::create_dir_all(Path::new(ROOT).join(directory))?;
+        fs::create_dir_all(Path::new(ROOT.as_str()).join(directory))?;
     }
     fs::write(
-        Path::new(ROOT).join("tmp/resolv.conf"),
+        Path::new(ROOT.as_str()).join("tmp/resolv.conf"),
         "nameserver 127.0.0.1\n",
     )?;
-    if !Path::new(ROOT).join("var").exists() {
-        std::os::unix::fs::symlink("tmp", Path::new(ROOT).join("var"))?;
+    if !Path::new(ROOT.as_str()).join("var").exists() {
+        std::os::unix::fs::symlink("tmp", Path::new(ROOT.as_str()).join("var"))?;
     }
     for device in ["null", "urandom"] {
-        let destination = Path::new(ROOT).join("dev").join(device);
+        let destination = Path::new(ROOT.as_str()).join("dev").join(device);
         if !destination.exists() {
             fs::File::create(&destination)?;
         }
         cmd!(sh, "mount --bind /dev/{device} {destination}").run()?;
     }
-    cmd!(sh, "mount -t proc proc {ROOT}/proc").run()?;
+    cmd!(sh, "mount -t proc proc {root}/proc").run()?;
     let console =
         rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)?;
     rustix::pty::grantpt(&console)?;
     rustix::pty::unlockpt(&console)?;
     let slave = rustix::pty::ptsname(&console, Vec::new())?;
     let slave = slave.to_str()?;
-    let destination = Path::new(ROOT).join("dev/console");
+    let destination = Path::new(ROOT.as_str()).join("dev/console");
     if !destination.exists() {
         fs::File::create(&destination)?;
     }
     cmd!(sh, "mount --bind {slave} {destination}").run()?;
-    let network = Path::new(ROOT).join("etc/config/network");
+    let network = Path::new(ROOT.as_str()).join("etc/config/network");
     if !network.exists() {
         fs::write(
             network,
@@ -175,10 +186,10 @@ pub fn check() -> Result<()> {
     ensure!(
         session.try_wait()?.is_none(),
         "The native session service exited: {}",
-        fs::read_to_string(Path::new(ROOT).join("tmp/eco.log"))?
+        fs::read_to_string(Path::new(ROOT.as_str()).join("tmp/eco.log"))?
     );
     fs::write(
-        Path::new(ROOT).join("tmp/wayline-nginx.conf"),
+        Path::new(ROOT.as_str()).join("tmp/wayline-nginx.conf"),
         "user root;\nworker_processes 1;\ninclude /etc/nginx/module.d/*.module;\npid /var/run/nginx.pid;\nerror_log /var/log/nginx/error.log notice;\nevents { worker_connections 64; }\nhttp {\n lua_package_path \"/usr/lib/lua/?.lua;;\";\n access_log off;\n lua_shared_dict shmem 12k;\n lua_shared_dict nonces 16k;\n lua_shared_dict sessions 16k;\n init_by_lua_file /usr/share/gl-ngx/oui-init.lua;\n server { listen 127.0.0.1:80;\n location = /rpc { access_by_lua_file /usr/share/gl-ngx/oui-access.lua; content_by_lua_file /usr/share/gl-ngx/oui-rpc.lua; }\n }\n}\n",
     )?;
     let mut http = service(
@@ -189,14 +200,15 @@ pub fn check() -> Result<()> {
     ensure!(
         http.try_wait()?.is_none(),
         "The native HTTP service exited: {}",
-        fs::read_to_string(Path::new(ROOT).join("tmp/nginx.log"))?
+        fs::read_to_string(Path::new(ROOT.as_str()).join("tmp/nginx.log"))?
     );
     println!("{}", call("/bin/ubus", &["list"])?);
     let result = package_checks();
     if result.is_err() {
         println!(
             "Native HTTP log: {}",
-            fs::read_to_string(Path::new(ROOT).join("tmp/log/nginx/error.log")).unwrap_or_default()
+            fs::read_to_string(Path::new(ROOT.as_str()).join("tmp/log/nginx/error.log"))
+                .unwrap_or_default()
         );
     }
     for child in [&mut http, &mut session, &mut rpc, &mut bus] {
@@ -240,18 +252,19 @@ fn fixtures() -> Result<()> {
         );
     }
     call("/sbin/uci", &["commit", "route_policy"])?;
-    let policy = Path::new(ROOT).join("etc/config/route_policy");
+    let policy = Path::new(ROOT.as_str()).join("etc/config/route_policy");
     let mut rules = fs::read_to_string(&policy)?;
     for (id, number) in [("wayline_lab", 2001), ("wayline_other", 2002)] {
-        let _ =
-            fs::remove_file(Path::new(ROOT).join(format!("etc/vpn_profiles.d/profile{number}")));
+        let _ = fs::remove_file(
+            Path::new(ROOT.as_str()).join(format!("etc/vpn_profiles.d/profile{number}")),
+        );
         write!(
             rules,
             "\nconfig rule '{id}'\n option name '{id}'\n option tunnel_id '{number}'\n option enabled '0'\n option via_type 'wireguard'\n option via 'wgclient1'\n option from_type 'default'\n option to_type 'default'\n option group_id '1'\n option peer_id '1'\n"
         )?;
     }
     fs::write(policy, rules)?;
-    let wireguard = Path::new(ROOT).join("etc/config/wireguard");
+    let wireguard = Path::new(ROOT.as_str()).join("etc/config/wireguard");
     let original = fs::read_to_string(&wireguard)?;
     if !original.contains("peer_991") {
         fs::write(
@@ -264,19 +277,45 @@ fn fixtures() -> Result<()> {
     Ok(())
 }
 
+fn package_format() -> &'static str {
+    if Path::new(ROOT.as_str()).join("etc/apk/arch").is_file() {
+        "apk"
+    } else {
+        "ipk"
+    }
+}
+
+fn install_package(version: &str, format: &str) -> Result<()> {
+    let installed = format!("/tmp/wayline.{format}");
+    fs::copy(
+        Path::new("dist").join(crate::package::artifact(version, format)),
+        Path::new(ROOT.as_str()).join(installed.trim_start_matches('/')),
+    )?;
+    let output = if format == "apk" {
+        call("/usr/bin/apk", &["add", "--allow-untrusted", &installed])?
+    } else {
+        call("/bin/opkg", &["--force-reinstall", "install", &installed])?
+    };
+    println!("{output}");
+    Ok(())
+}
+
+fn remove_package(format: &str) -> Result<()> {
+    let output = if format == "apk" {
+        call("/usr/bin/apk", &["del", "wayline"])?
+    } else {
+        call("/bin/opkg", &["remove", "wayline"])?
+    };
+    println!("{output}");
+    Ok(())
+}
+
 fn package_checks() -> Result<()> {
     let version = crate::release_version(None)?;
-    let package = format!("dist/wayline_{version}_aarch64_cortex-a53.ipk");
-    fs::copy(package, Path::new(ROOT).join("tmp/wayline.ipk"))?;
-    println!("Checking the package with native firmware binaries.");
+    let format = package_format();
+    println!("Checking the {format} package with native firmware binaries.");
     fixtures()?;
-    println!(
-        "{}",
-        call(
-            "/bin/opkg",
-            &["--force-reinstall", "install", "/tmp/wayline.ipk"]
-        )?
-    );
+    install_package(&version, format)?;
     let state = request("get_state", &json!({}))?;
     ensure!(
         state["capabilities"]["configure"] == true
@@ -300,7 +339,7 @@ fn package_checks() -> Result<()> {
         stored == config,
         "Native settings did not persist. Sent {config}, read {stored}."
     );
-    let path = Path::new(ROOT).join("etc/wayline/settings.json");
+    let path = Path::new(ROOT.as_str()).join("etc/wayline/settings.json");
     let saved = fs::read(&path)?;
     ensure!(
         call("/usr/sbin/wayline-ctl", &["set_config", &args.to_string()]).is_err(),
@@ -324,7 +363,7 @@ fn package_checks() -> Result<()> {
     tunnel_controls()?;
     bridge_checks()?;
     request("install", &json!({}))?;
-    let cron = fs::read_to_string(Path::new(ROOT).join("etc/crontabs/root"))?;
+    let cron = fs::read_to_string(Path::new(ROOT.as_str()).join("etc/crontabs/root"))?;
     ensure!(
         cron.matches("/usr/sbin/wayline-ctl tick").count() == 1,
         "Installation duplicated its scheduler entry."
@@ -346,9 +385,9 @@ fn package_checks() -> Result<()> {
         update["failed"] == true && update["phase"] == "failed",
         "An offline update failure did not reach the UI state."
     );
-    println!("{}", call("/bin/opkg", &["remove", "wayline"])?);
+    remove_package(format)?;
     ensure!(
-        !fs::read_to_string(Path::new(ROOT).join("etc/crontabs/root"))?
+        !fs::read_to_string(Path::new(ROOT.as_str()).join("etc/crontabs/root"))?
             .contains("/usr/sbin/wayline-ctl tick"),
         "Removal retained its scheduler entry."
     );
@@ -356,7 +395,7 @@ fn package_checks() -> Result<()> {
     fs::write(
         "artifacts/local/current/native-package.json",
         serde_json::to_vec_pretty(
-            &json!({"firmware_contract":CONTRACT,"package_install_remove":true,"settings_read_write":true,"stale_write_rejected":true,"unchanged_write_avoided":true,"scheduler_idempotent":true,
+            &json!({"firmware_contract":contract(Path::new(ROOT.as_str()))?,"package_format":format,"package_install_remove":true,"settings_read_write":true,"stale_write_rejected":true,"unchanged_write_avoided":true,"scheduler_idempotent":true,
                 "native_start_stop":true,"monitor_choice_retained":true,"tunnel_priority_retained":true,"missing_profile_rejected":true,"invalid_tunnel_request_rejected":true,
                 "authenticated_bridge":true,"single_http_worker":true,"missing_session_rejected":true,"revoked_session_rejected":true,"local_session_bypass_rejected":true,"physical_router":false}),
         )?,
@@ -365,12 +404,12 @@ fn package_checks() -> Result<()> {
 }
 
 fn compatibility_checks() -> Result<()> {
-    let module = Path::new(ROOT).join("usr/lib/oui-httpd/rpc/vpn-client");
+    let module = Path::new(ROOT.as_str()).join("usr/lib/oui-httpd/rpc/vpn-client");
     let original = fs::read(&module)?;
     let mut changed = original.clone();
     changed.push(b'\n');
     fs::write(&module, changed)?;
-    let policy = Path::new(ROOT).join("etc/config/route_policy");
+    let policy = Path::new(ROOT.as_str()).join("etc/config/route_policy");
     let saved = fs::read(&policy)?;
     let result = (|| -> Result<()> {
         let state = request("get_state", &json!({}))?;
@@ -420,7 +459,7 @@ fn http(sid: &str, method: &str, params: &Value) -> Result<Value> {
 
 fn http_object(sid: &str, object: &str, method: &str, params: &Value) -> Result<Value> {
     wayline_support::atomic(
-        &Path::new(ROOT).join("tmp/wayline-http.json"),
+        &Path::new(ROOT.as_str()).join("tmp/wayline-http.json"),
         &serde_json::to_vec(
             &json!({"jsonrpc":"2.0","id":1,"method":"call","params":[sid,object,method,params]}),
         )?,
@@ -443,7 +482,7 @@ fn http_object(sid: &str, object: &str, method: &str, params: &Value) -> Result<
 }
 
 fn bridge_checks() -> Result<()> {
-    let shadow = Path::new(ROOT).join("etc/shadow");
+    let shadow = Path::new(ROOT.as_str()).join("etc/shadow");
     let original = fs::read_to_string(&shadow)?;
     let crypt = call(
         "/usr/bin/openssl",
@@ -488,7 +527,7 @@ fn bridge_checks() -> Result<()> {
         http(&sid, "set_tunnel_enabled", &args)?["result"]["unchanged"] == true,
         "An authenticated tunnel control failed."
     );
-    let policy = fs::read(Path::new(ROOT).join("etc/config/route_policy"))?;
+    let policy = fs::read(Path::new(ROOT.as_str()).join("etc/config/route_policy"))?;
     ensure!(
         http("", "set_tunnel_enabled", &args)?["error"].is_object(),
         "The bridge accepted a missing session."
@@ -500,7 +539,7 @@ fn bridge_checks() -> Result<()> {
         "The bridge accepted a revoked session."
     );
     ensure!(
-        fs::read(Path::new(ROOT).join("etc/config/route_policy"))? == policy,
+        fs::read(Path::new(ROOT.as_str()).join("etc/config/route_policy"))? == policy,
         "A rejected session changed the policy."
     );
     ensure!(
@@ -516,7 +555,7 @@ fn bridge_checks() -> Result<()> {
 }
 
 fn cached_bridge_check(sid: &str) -> Result<()> {
-    let bridge = Path::new(ROOT).join("usr/lib/oui-httpd/rpc/wayline");
+    let bridge = Path::new(ROOT.as_str()).join("usr/lib/oui-httpd/rpc/wayline");
     let current = fs::read_to_string(&bridge)?;
     let legacy = current.replace("    'purge_history',\n", "");
     ensure!(current != legacy, "The legacy bridge fixture is unchanged.");
@@ -538,7 +577,7 @@ fn cached_bridge_check(sid: &str) -> Result<()> {
 
 fn purge_checks(sid: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let root = Path::new(ROOT);
+    let root = Path::new(ROOT.as_str());
     let settings = fs::read(root.join("etc/wayline/settings.json"))?;
     let policy = fs::read(root.join("etc/config/route_policy"))?;
     let mut files = Vec::new();
@@ -630,7 +669,7 @@ fn purge_checks(sid: &str) -> Result<()> {
 }
 
 fn tunnel_controls() -> Result<()> {
-    let init = Path::new(ROOT).join("etc/init.d/vpn-client");
+    let init = Path::new(ROOT.as_str()).join("etc/init.d/vpn-client");
     let original_init = init.with_file_name("vpn-client-wayline-original");
     fs::rename(&init, &original_init)?;
     fs::copy(
@@ -646,7 +685,7 @@ fn tunnel_controls() -> Result<()> {
 }
 
 fn selection_checks() -> Result<()> {
-    let root = Path::new(ROOT);
+    let root = Path::new(ROOT.as_str());
     let policy = root.join("etc/config/route_policy");
     let network = root.join("etc/config/network");
     let saved_policy = fs::read(&policy)?;
@@ -676,7 +715,7 @@ fn selection_checks() -> Result<()> {
 }
 
 fn selection_scenarios() -> Result<()> {
-    let root = Path::new(ROOT);
+    let root = Path::new(ROOT.as_str());
     let before = native("get_tunnel", &json!({}))?;
     let tunnels = before["tunnels"].as_array().context("Missing tunnels.")?;
     let mut interfaces = Vec::new();
@@ -749,7 +788,7 @@ fn selection_scenarios() -> Result<()> {
 
 fn tunnel_control_checks() -> Result<()> {
     let state = request("get_state", &json!({}))?;
-    let path = Path::new(ROOT).join("etc/config/route_policy");
+    let path = Path::new(ROOT.as_str()).join("etc/config/route_policy");
     let saved = fs::read(&path)?;
     let args =
         json!({"section_id":"wayline_lab","enabled":false,"expected_revision":state["revision"]});
@@ -799,7 +838,7 @@ fn tunnel_control_checks() -> Result<()> {
     for enabled in [true, true, false, false] {
         let current = request("get_state", &json!({}))?;
         let changed = tunnel_row(&current)?["enabled"] != enabled;
-        let completed = Path::new(ROOT).join("tmp/wayline-reload-completed");
+        let completed = Path::new(ROOT.as_str()).join("tmp/wayline-reload-completed");
         let _ = fs::remove_file(&completed);
         let id = tunnel_row(&current)?["id"].clone();
         let result = request(

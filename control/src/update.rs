@@ -36,6 +36,67 @@ struct Manifest {
     artifacts: Vec<Artifact>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Opkg,
+    Apk,
+}
+
+impl Format {
+    fn detect() -> Self {
+        if Path::new("/etc/apk/arch").is_file() {
+            Self::Apk
+        } else {
+            Self::Opkg
+        }
+    }
+
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Opkg => "ipk",
+            Self::Apk => "apk",
+        }
+    }
+
+    const fn manifest(self) -> &'static str {
+        match self {
+            Self::Opkg => "manifest.json",
+            Self::Apk => "manifest-apk.json",
+        }
+    }
+
+    fn supports(self, architecture: &str) -> Result<bool> {
+        Ok(match self {
+            Self::Opkg => wayline_support::text("opkg", &["print-architecture"], 8192, 5)?
+                .lines()
+                .any(|line| line.split_whitespace().nth(1) == Some(architecture)),
+            Self::Apk => {
+                wayline_support::read(Path::new("/etc/apk/arch"), 8192).is_ok_and(|data| {
+                    String::from_utf8_lossy(&data)
+                        .split_whitespace()
+                        .any(|line| line == architecture)
+                })
+            }
+        })
+    }
+
+    fn install(self, path: &str, simulate: bool) -> Result<()> {
+        let (program, args): (&str, Vec<&str>) = match (self, simulate) {
+            (Self::Opkg, true) => ("opkg", vec!["--noaction", "install", path]),
+            (Self::Opkg, false) => ("opkg", vec!["install", path]),
+            (Self::Apk, true) => ("apk", vec!["add", "--allow-untrusted", "--simulate", path]),
+            (Self::Apk, false) => ("apk", vec!["add", "--allow-untrusted", path]),
+        };
+        let (limit, seconds) = if simulate {
+            (16_384, 30)
+        } else {
+            (32_768, 120)
+        };
+        wayline_support::text(program, &args, limit, seconds)?;
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
 struct Release {
     tag_name: String,
@@ -224,13 +285,18 @@ fn newer(folder: &Path) -> Result<Option<Version>> {
     Ok(newest(&releases).filter(|latest| *latest > installed))
 }
 
-fn metadata(folder: &Path, latest: &Version) -> Result<(Manifest, Artifact, String)> {
+fn metadata(
+    folder: &Path,
+    latest: &Version,
+    format: Format,
+) -> Result<(Manifest, Artifact, String)> {
     let tag = latest.to_string();
     let prefix = format!("https://github.com/epk/wayline/releases/download/v{tag}/");
-    let manifest = folder.join("manifest.json");
-    let signature = folder.join("manifest.json.sig");
-    download(&format!("{prefix}manifest.json"), &manifest, 16_384)?;
-    download(&format!("{prefix}manifest.json.sig"), &signature, 1024)?;
+    let name = format.manifest();
+    let manifest = folder.join(name);
+    let signature = folder.join(format!("{name}.sig"));
+    download(&format!("{prefix}{name}"), &manifest, 16_384)?;
+    download(&format!("{prefix}{name}.sig"), &signature, 1024)?;
     wayline_support::text(
         "usign",
         &[
@@ -263,18 +329,20 @@ fn metadata(folder: &Path, latest: &Version) -> Result<(Manifest, Artifact, Stri
         .context("The release has no artifact.")?;
     ensure!(
         artifact.architecture == "aarch64_cortex-a53"
-            && artifact.name == format!("wayline_{}_aarch64_cortex-a53.ipk", data.version)
+            && artifact.name
+                == format!(
+                    "wayline_{}_aarch64_cortex-a53.{}",
+                    data.version,
+                    format.extension()
+                )
             && artifact.bytes > 0
             && artifact.bytes <= 4_194_304
             && artifact.sha256.len() == 64
             && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "The release artifact is invalid."
     );
-    let architectures = wayline_support::text("opkg", &["print-architecture"], 8192, 5)?;
     ensure!(
-        architectures
-            .lines()
-            .any(|line| line.split_whitespace().nth(1) == Some(artifact.architecture.as_str())),
+        format.supports(&artifact.architecture)?,
         "The release architecture is unsupported."
     );
     Ok((data, artifact, prefix))
@@ -300,7 +368,8 @@ fn execute(operation: Operation, report: &dyn Fn(Phase, &str) -> Result<()>) -> 
     if operation == Operation::Install {
         report(Phase::Downloading, "Downloading the signed update.")?;
     }
-    let (manifest, artifact, prefix) = metadata(folder.path(), &latest)?;
+    let format = Format::detect();
+    let (manifest, artifact, prefix) = metadata(folder.path(), &latest, format)?;
     if operation == Operation::Check {
         let message = format!("Version {} is available.", manifest.version);
         return Ok(Status::finished(
@@ -312,7 +381,9 @@ fn execute(operation: Operation, report: &dyn Fn(Phase, &str) -> Result<()>) -> 
     }
     space(folder.path(), artifact.bytes.saturating_mul(2) + 1_048_576)?;
     space(Path::new("/etc/wayline"), 4_194_304)?;
-    let package = folder.path().join("package.ipk");
+    let package = folder
+        .path()
+        .join(format!("package.{}", format.extension()));
     download(
         &format!("{prefix}{}", artifact.name),
         &package,
@@ -326,9 +397,9 @@ fn execute(operation: Operation, report: &dyn Fn(Phase, &str) -> Result<()>) -> 
         "The release size or digest does not match."
     );
     let path = package.to_str().context("Invalid package path.")?;
-    wayline_support::text("opkg", &["--noaction", "install", path], 16_384, 30)?;
+    format.install(path, true)?;
     report(Phase::Installing, "Installing the signed update.")?;
-    wayline_support::text("opkg", &["install", path], 32_768, 120)?;
+    format.install(path, false)?;
     ensure!(
         runtime::version() == manifest.version,
         "The installed version needs checking. Do not retry automatically."
