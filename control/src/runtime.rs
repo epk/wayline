@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, ensure};
+use rustix::fs::{Mode, OFlags};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,7 +35,7 @@ pub fn store(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
 
 pub fn version() -> String {
     fs::read_to_string("/usr/share/wayline/version")
-        .unwrap_or_else(|_| "0.1.0-alpha.22".into())
+        .unwrap_or_else(|_| "0.1.0-alpha.23".into())
         .trim()
         .into()
 }
@@ -52,15 +52,24 @@ pub fn locked<T>(name: &str, action: impl FnOnce() -> Result<T>) -> Result<T> {
 }
 
 pub fn directory(path: &Path) -> Result<()> {
+    private(path, 0)
+}
+
+fn private(path: &Path, owner: u32) -> Result<()> {
     if !path.exists() {
         fs::create_dir(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
-    let metadata = fs::symlink_metadata(path)?;
-    ensure!(
-        metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o777 == 0o700,
-        "Private directory is not secure."
-    );
+    let folder = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context("Private directory is not secure.")?;
+    let stat = rustix::fs::fstat(&folder)?;
+    ensure!(stat.st_uid == owner, "Private directory is not secure.");
+    if stat.st_mode & 0o7777 != 0o700 {
+        rustix::fs::fchmod(&folder, Mode::from_raw_mode(0o700))?;
+    }
     Ok(())
 }
 
@@ -102,9 +111,11 @@ pub fn milliseconds(micros: u32) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{fetch, status};
+    use super::{fetch, private, status};
     use anyhow::{Result, ensure};
+    use std::fs;
     use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::os::unix::net::UnixListener;
     use std::thread;
 
@@ -132,6 +143,31 @@ mod tests {
             .join()
             .map_err(|_| anyhow::anyhow!("Server thread panicked."))??;
         ensure!(requests == ["since=0\n", "\n"], "Unexpected: {requests:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn private_directories_are_created_and_tightened() -> Result<()> {
+        let owner = rustix::process::getuid().as_raw();
+        let root = tempfile::tempdir()?;
+        let mode = |path: &std::path::Path| -> Result<u32> {
+            Ok(fs::symlink_metadata(path)?.permissions().mode() & 0o7777)
+        };
+        let fresh = root.path().join("fresh");
+        private(&fresh, owner)?;
+        ensure!(mode(&fresh)? == 0o700);
+        let restored = root.path().join("restored");
+        fs::create_dir(&restored)?;
+        fs::set_permissions(&restored, fs::Permissions::from_mode(0o755))?;
+        private(&restored, owner)?;
+        ensure!(mode(&restored)? == 0o700);
+        ensure!(private(&restored, owner + 1).is_err());
+        let link = root.path().join("link");
+        symlink(&restored, &link)?;
+        ensure!(private(&link, owner).is_err());
+        let file = root.path().join("file");
+        fs::write(&file, b"")?;
+        ensure!(private(&file, owner).is_err());
         Ok(())
     }
 }
