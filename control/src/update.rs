@@ -8,7 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const RELEASES: &str = "https://api.github.com/repos/epk/wayline/releases?per_page=30";
+const RELEASES_LIMIT: usize = 2_097_152;
+const RELEASES: &str = "https://api.github.com/repos/epk/wayline/releases?per_page=10";
 const STALE_AFTER: u64 = 240;
 const DONE_VISIBLE: u64 = 600;
 
@@ -279,8 +280,9 @@ fn newest(releases: &[Release]) -> Option<Version> {
 
 fn newer(folder: &Path) -> Result<Option<Version>> {
     let path = folder.join("releases.json");
-    download(RELEASES, &path, 262_144)?;
-    let releases: Vec<Release> = serde_json::from_slice(&wayline_support::read(&path, 262_144)?)?;
+    download(RELEASES, &path, u64::try_from(RELEASES_LIMIT)?)?;
+    let releases: Vec<Release> =
+        serde_json::from_slice(&wayline_support::read(&path, RELEASES_LIMIT)?)?;
     let installed = Version::parse(&runtime::version())?;
     Ok(newest(&releases).filter(|latest| *latest > installed))
 }
