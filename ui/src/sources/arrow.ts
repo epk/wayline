@@ -1,4 +1,4 @@
-import { CompressionType, setCompressionCodec, tableFromIPC } from '@uwdata/flechette';
+import { readIpc } from './ipc.ts';
 import type {
   ChangeEvent,
   Column,
@@ -17,28 +17,11 @@ export const setZstd = (decoder: Decompress): void => {
   decompress = decoder;
 };
 
-export const registerCodec = (): void => {
-  const zstd = decompress;
-  if (!zstd) throw Error('No zstd decoder is registered.');
-  setCompressionCodec(CompressionType.ZSTD, {
-    encode: () => {
-      throw Error('Wayline only reads Arrow data.');
-    },
-    decode: (bytes: Uint8Array, length: number) => zstd(bytes, new Uint8Array(length)),
-  });
-};
-
 const fromBase64 = (text: string): Uint8Array => {
   const binary = atob(text);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
-};
-
-export const yieldToMain = (): Promise<void> => {
-  const s = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
-  if (s && typeof s.yield === 'function') return s.yield();
-  return new Promise((resolve) => setTimeout(resolve, 0));
 };
 
 export interface Frame {
@@ -59,26 +42,16 @@ export async function decodeFrame(reply: unknown): Promise<Frame> {
   const { start, step, count } = r;
   if (typeof start !== 'number' || typeof step !== 'number' || typeof count !== 'number')
     throw Error('The router sent a history document without a time axis.');
-  registerCodec();
-  const table = tableFromIPC(fromBase64(r.data), { useBigInt: false });
-  if (table.numRows !== count)
-    throw Error('The history table has ' + table.numRows + ' rows, not ' + count + '.');
-  const names = new Set(table.schema.fields.map((f) => f.name));
-  const cache = new Map<string, Column>();
-  let deadline = performance.now() + 40;
-  for (const name of names) {
-    cache.set(name, table.getChild(name)?.toArray() as Column);
-    if (performance.now() >= deadline) {
-      await yieldToMain();
-      deadline = performance.now() + 40;
-    }
-  }
+  if (!decompress) throw Error('No zstd decoder is registered.');
+  const table = readIpc(fromBase64(r.data), decompress);
+  if (table.rows !== count)
+    throw Error('The history table has ' + table.rows + ' rows, not ' + count + '.');
   return {
     start,
     step,
     count,
     meta: r,
-    column: (name) => cache.get(name) || empty(count),
+    column: (name) => table.columns.get(name) || empty(count),
   };
 }
 

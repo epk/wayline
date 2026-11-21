@@ -133,3 +133,17 @@ test('a wayline-ctl v4 history reply decodes to the same values as its JSON form
   assert.ok(decoded.min[row] <= decoded.p50[row] && decoded.p50[row] <= decoded.p95[row]);
   assert.ok(decoded.p95[row] <= decoded.p99[row] && decoded.p99[row] <= decoded.max[row]);
 });
+
+test('joins several record batches and keeps nulls across them', async () => {
+  const bytes = tableToIPC(
+    tableFromArrays(
+      { a: [1, null, 3, 4, null], b: [1.5, 2.5, 3.5, 4.5, 5.5] },
+      { types: { a: int32(), b: float64() }, maxBatchRows: 2 },
+    ),
+    { format: 'stream' },
+  );
+  const frame = await decodeFrame(envelope(bytes, 5));
+  assert.deepEqual(Array.from(frame.column('a')), [1, null, 3, 4, null]);
+  assert.deepEqual(Array.from(frame.column('b')), [1.5, 2.5, 3.5, 4.5, 5.5]);
+  assert.deepEqual(Array.from(frame.column('missing')), [null, null, null, null, null]);
+});
