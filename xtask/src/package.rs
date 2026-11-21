@@ -382,14 +382,13 @@ fn licenses(version: &str) -> Result<()> {
     Ok(())
 }
 
-const UI_PACKAGES: [&str; 9] = [
+const UI_PACKAGES: [&str; 8] = [
     "react",
     "react-dom",
     "scheduler",
     "@ui-sdk/core",
     "@ui-sdk/react",
     "@uwdata/flechette",
-    "@uwdata/wk-geojson",
     "fzstd",
     "uplot",
 ];
@@ -476,7 +475,28 @@ pub fn release(version: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apk_version, artifact};
+    use super::{apk_version, artifact, install_chunks};
+    use std::fs;
+
+    #[test]
+    fn page_chunks_install_as_zstd_and_gzip_fallback() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("build");
+        fs::create_dir(&source)?;
+        fs::write(source.join("core-abc.js"), b"export const a = 1;")?;
+        fs::write(source.join("core-abc.js.zst"), b"zstd")?;
+        fs::write(source.join("size-report.json"), b"{}")?;
+        let destination = directory.path().join("www/views/wayline");
+        install_chunks(&source, &destination)?;
+        let mut names: Vec<String> = fs::read_dir(&destination)?
+            .map(|item| Ok(item?.file_name().to_string_lossy().into_owned()))
+            .collect::<anyhow::Result<_>>()?;
+        names.sort();
+        assert_eq!(names, ["core-abc.js.gz", "core-abc.js.zst"]);
+        fs::remove_file(source.join("core-abc.js.zst"))?;
+        assert!(install_chunks(&source, &directory.path().join("other")).is_err());
+        Ok(())
+    }
 
     #[test]
     fn apk_versions_keep_release_order() -> anyhow::Result<()> {

@@ -116,3 +116,20 @@ test('passes a plain v2 document through and rejects unknown formats', async () 
     Error,
   );
 });
+
+test('a wayline-ctl v4 history reply decodes to the same values as its JSON form', async () => {
+  const read = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url)));
+  const json = read('history-v4.json');
+  const doc = await decodeHistory(read('history-v4.arrow.json'), latencyDoc);
+  assert.equal(doc.count, json.count);
+  const [decoded] = doc.series;
+  const [expected] = json.series;
+  for (const key of ['median', 'min', 'max', 'jitter', 'p50', 'p95', 'p99', 'sent', 'lost']) {
+    const values = Array.from(decoded[key], (value) => value ?? null);
+    assert.deepEqual(values, expected[key], key);
+  }
+  const row = decoded.p50.findIndex((value) => value !== null);
+  assert.ok(row >= 0, 'no percentile data');
+  assert.ok(decoded.min[row] <= decoded.p50[row] && decoded.p50[row] <= decoded.p95[row]);
+  assert.ok(decoded.p95[row] <= decoded.p99[row] && decoded.p99[row] <= decoded.max[row]);
+});
