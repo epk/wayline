@@ -73,10 +73,14 @@ fn decide(state: &mut State, observation: &Observation, marker: Option<&str>) ->
 }
 
 pub fn observe(observation: &Observation) -> Result<Clock> {
-    let path = Path::new(RUNTIME).join("clock.json");
+    observe_in(Path::new(RUNTIME), observation)
+}
+
+fn observe_in(directory: &Path, observation: &Observation) -> Result<Clock> {
+    let path = directory.join("clock.json");
     let mut state: State = runtime::load(&path);
     let before = serde_json::to_vec(&state)?;
-    let marker = std::fs::read_to_string(Path::new(RUNTIME).join(MARKER)).ok();
+    let marker = std::fs::read_to_string(directory.join(MARKER)).ok();
     let clock = decide(&mut state, observation, marker.as_deref());
     if serde_json::to_vec(&state)? != before {
         runtime::store(&path, &state)?;
@@ -131,7 +135,7 @@ pub fn restamp<T: Stamped>(items: &mut [T], offset_ms: i64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Observation, Source, State, corrected, decide, restamp};
+    use super::{Observation, Source, State, corrected, decide, observe_in, restamp};
     use wayline_protocol::WifiBucket;
 
     fn seen(boot: &str, boot_ms: u64, wall_ms: u64, reachable: bool) -> Observation<'_> {
@@ -212,5 +216,42 @@ mod tests {
         assert_eq!(restamp(&mut buckets, offset), 2);
         assert_eq!(buckets[1].at - buckets[0].at, 15);
         assert_eq!(buckets[0].at % 15, 0);
+    }
+
+    fn hotplug(directory: &std::path::Path, action: &str, stratum: &str) -> anyhow::Result<()> {
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../package/files/etc/hotplug.d/ntp/95-wayline"
+        );
+        let status = std::process::Command::new("sh")
+            .arg(script)
+            .env("ACTION", action)
+            .env("stratum", stratum)
+            .env("WAYLINE_RUNTIME", directory)
+            .env("WAYLINE_BOOT_ID", directory.join("boot_id"))
+            .status()?;
+        anyhow::ensure!(status.success(), "The hotplug script failed.");
+        Ok(())
+    }
+
+    #[test]
+    fn the_ntp_hotplug_script_marks_this_boot_synced() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        std::fs::write(root.join("boot_id"), "boot-a\n")?;
+        let early = seen("boot-a", 20_000, 1_700_000_020_000, false);
+        anyhow::ensure!(!observe_in(root, &early)?.synced);
+        hotplug(root, "stratum", "16")?;
+        hotplug(root, "periodic", "2")?;
+        anyhow::ensure!(
+            !observe_in(root, &early)?.synced,
+            "An unsynced event marked sync."
+        );
+        hotplug(root, "stratum", "2")?;
+        let clock = observe_in(root, &seen("boot-a", 25_000, 1_700_000_025_000, false))?;
+        anyhow::ensure!(clock.synced && clock.source == Some(Source::Ntp));
+        let next = observe_in(root, &seen("boot-b", 5_000, 1_700_000_005_000, false))?;
+        anyhow::ensure!(!next.synced, "A marker from an earlier boot counted.");
+        Ok(())
     }
 }
