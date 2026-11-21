@@ -1,5 +1,8 @@
 import { float64, int32, int64, tableFromArrays, tableToIPC, uint32 } from '@uwdata/flechette';
-import { decodeHistory, latencyDoc, telemetryDoc, wifiDoc } from '../src/sources/arrow.ts';
+import { decompress } from 'fzstd';
+import { decodeHistory, latencyDoc, setZstd, telemetryDoc, wifiDoc } from '../src/sources/arrow.ts';
+
+setZstd(decompress);
 
 const anchor = Math.floor(Date.now() / 60000) * 60000;
 const names = {

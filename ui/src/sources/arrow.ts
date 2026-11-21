@@ -1,5 +1,4 @@
 import { CompressionType, setCompressionCodec, tableFromIPC } from '@uwdata/flechette';
-import { decompress } from 'fzstd';
 import type {
   ChangeEvent,
   Column,
@@ -11,12 +10,21 @@ import type {
   WifiKey,
 } from '../types.ts';
 
+type Decompress = (bytes: Uint8Array, out: Uint8Array) => Uint8Array;
+let decompress: Decompress | null = null;
+
+export const setZstd = (decoder: Decompress): void => {
+  decompress = decoder;
+};
+
 export const registerCodec = (): void => {
+  const zstd = decompress;
+  if (!zstd) throw Error('No zstd decoder is registered.');
   setCompressionCodec(CompressionType.ZSTD, {
     encode: () => {
       throw Error('Wayline only reads Arrow data.');
     },
-    decode: (bytes: Uint8Array, length: number) => decompress(bytes, new Uint8Array(length)),
+    decode: (bytes: Uint8Array, length: number) => zstd(bytes, new Uint8Array(length)),
   });
 };
 

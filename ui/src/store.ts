@@ -147,9 +147,11 @@ export const purgeConfirm = signal(false);
 export const updateError = signal('');
 export const updateWaiting = signal(false);
 export const settingsOpen = signal(false);
+export const settingsUsed = signal(false);
 export const draft = signal<Settings>(defaults());
 export const isPreview = signal(false);
 export const clock = signal(Date.now());
+export const themeKey = signal<'light' | 'dark' | ''>('');
 
 const storedView = storage.get(viewKey) as ViewId;
 export const view = signal<ViewId>(
@@ -543,6 +545,7 @@ export function openSettings(): void {
   if (!can.value.configure) return;
   purgeConfirm.value = false;
   draft.value = settingsFrom(state.value.config);
+  settingsUsed.value = true;
   settingsOpen.value = !settingsOpen.value;
 }
 

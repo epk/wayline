@@ -12,7 +12,10 @@ import {
   tableToIPC,
   uint32,
 } from '@uwdata/flechette';
-import { decodeFrame, decodeHistory, latencyDoc, wifiDoc } from '../src/sources/arrow.ts';
+import { decompress } from 'fzstd';
+import { decodeFrame, decodeHistory, latencyDoc, setZstd, wifiDoc } from '../src/sources/arrow.ts';
+
+setZstd(decompress);
 
 const envelope = (bytes, count, meta = {}) => ({
   format: 'arrow',

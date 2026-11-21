@@ -1,13 +1,19 @@
 import './layer.css';
 import '@ui-sdk/core/web.css';
-import './uplot.css';
 import './styles.css';
 import { Button } from '@ui-sdk/react/button';
 import { Tabs, TabsIndicator, TabsList, TabsPanel, TabsTab } from '@ui-sdk/react/tabs';
-import { Component, useEffect, useRef, type ReactNode } from 'react';
-import { themeKey } from './chart.tsx';
+import {
+  Component,
+  lazy,
+  Suspense,
+  useEffect,
+  useRef,
+  type ComponentType,
+  type ReactNode,
+} from 'react';
 import { Header } from './header.tsx';
-import { SettingsDrawer } from './settings.tsx';
+import { loadChunk, prefetch, type ChunkName } from './runtime.ts';
 import { useStore } from './signal.ts';
 import {
   bundleVersion,
@@ -31,18 +37,15 @@ import {
   state,
   statusLine,
   stop,
+  settingsUsed,
+  themeKey,
   view,
   views,
   type ViewId,
 } from './store.ts';
 import type { DataSource } from './sources/source.ts';
 import { UpdatePanel } from './update-panel.tsx';
-import { EventsView } from './views/events.tsx';
 import { OverviewView } from './views/overview.tsx';
-import { PathsView } from './views/paths.tsx';
-import { RouterView } from './views/router.tsx';
-import { TrafficView } from './views/traffic.tsx';
-import { WifiView } from './views/wifi.tsx';
 
 function Features() {
   const list = compat.value.features;
@@ -140,14 +143,40 @@ function Notice() {
   );
 }
 
-const screens: Record<ViewId, () => ReactNode> = {
+const chunk = (name: ChunkName, exported: string) =>
+  lazy(() => loadChunk(name).then((module) => ({ default: module[exported] as ComponentType })));
+
+const screens: Record<ViewId, ComponentType> = {
   overview: OverviewView,
-  paths: PathsView,
-  wifi: WifiView,
-  traffic: TrafficView,
-  router: RouterView,
-  events: EventsView,
+  paths: chunk('paths', 'PathsView'),
+  wifi: chunk('wifi', 'WifiView'),
+  traffic: chunk('traffic', 'TrafficView'),
+  router: chunk('router', 'RouterView'),
+  events: chunk('events', 'EventsView'),
 };
+
+const Settings = chunk('settings', 'SettingsDrawer');
+
+class ViewBoundary extends Component<{ children: ReactNode }, { failure: string }> {
+  state = { failure: '' };
+  static getDerivedStateFromError(err: unknown) {
+    return { failure: err instanceof Error ? err.message : String(err) };
+  }
+  render() {
+    if (!this.state.failure) return this.props.children;
+    return (
+      <div className="wl-panel wl-fail" role="alert">
+        <h2>This view could not be loaded.</h2>
+        <p className="wl-fail-text">{this.state.failure}</p>
+        <Button className="wl-button" onClick={reloadPage}>
+          Reload page
+        </Button>
+      </div>
+    );
+  }
+}
+
+const pending = <p className="wl-muted wl-loading">Loading view…</p>;
 
 const luminance = (color: string): number => {
   const parts = (color.match(/[\d.]+/g) || []).slice(0, 4).map(Number);
@@ -178,6 +207,15 @@ function switchView(next: ViewId): void {
 function Dashboard() {
   useStore();
   const probe = useRef<HTMLSpanElement>(null);
+  useEffect(prefetch, []);
+  const current = view.value;
+  const shown = ready.value;
+  useEffect(() => {
+    probe.current
+      ?.closest('.wl')
+      ?.querySelector('.wl-tabs [data-selected]')
+      ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [current, shown]);
   useEffect(() => {
     const detect = () => {
       if (!probe.current) return;
@@ -242,7 +280,11 @@ function Dashboard() {
             const Screen = screens[v.id];
             return (
               <TabsPanel key={v.id} value={v.id} className="wl-view">
-                <Screen />
+                <ViewBoundary>
+                  <Suspense fallback={pending}>
+                    <Screen />
+                  </Suspense>
+                </ViewBoundary>
               </TabsPanel>
             );
           })}
@@ -251,7 +293,13 @@ function Dashboard() {
       {!ready.value && !readError.value && (
         <p className="wl-muted wl-loading">Reading tunnel state…</p>
       )}
-      <SettingsDrawer />
+      {settingsUsed.value && (
+        <ViewBoundary>
+          <Suspense fallback={null}>
+            <Settings />
+          </Suspense>
+        </ViewBoundary>
+      )}
       <footer className="wl-footnote">
         <a href="https://github.com/epk/wayline" target="_blank" rel="noopener noreferrer">
           Wayline

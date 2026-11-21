@@ -132,7 +132,13 @@ nix run -f nix/bootstrap.nix devenv -- shell
 - `cargo xtask test` runs the existing critical unit checks.
 - `cargo xtask build` builds the ARM64 binaries and UI bundle.
 - `cargo xtask package [version]` creates the IPK in `dist/`.
-- `cargo xtask preview` serves the UI with synthetic data. Add `?wifi=off`, `?wifi=disconnected`, or `?wifi=none` to preview the Wi-Fi states.
+- `cargo xtask preview` serves the UI with synthetic data at http://127.0.0.1:8787/preview/index.html after `pnpm --dir ui build`. Add `?wifi=off`, `?wifi=disconnected`, `?wifi=none`, `?telemetry=off`, `?compat=monitoring`, `?fail=1` or `?transport=rpc` to preview other states.
+
+The page is React 19 with UI SDK components in TypeScript under `ui/src`. rolldown bundles it, lightningcss minifies the CSS, oxlint and oxfmt lint and format it, `tsc` type-checks it, and `node --test` runs the unit tests in `ui/test`. `pnpm --dir ui build` writes:
+
+- `ui/dist/gl-sdk4-ui-wayline.common.js`: the small loader GL.iNet loads from `/views/`. It holds the Vue-shaped shim, the zstd decoder and the chunk manifest.
+- `ui/views/wayline/<name>-<hash>.js.zst` and `.js`: the content-hashed page chunks, served from `/views/wayline/`. The loader fetches the zstd copy and falls back to the plain copy when the page blocks `blob:` scripts.
+- `ui/dist/size-report.json`: first-load and total sizes. The build fails over the first-load or total budget.
 - `cargo xtask lab` runs the isolated closed-box checks.
 
 CI uses separate lint, build, and test jobs on native ARM64 runners. Tests use the binaries and package from the build job. A version change on `main` publishes those same artifacts after all checks pass. Other branches do not publish releases.

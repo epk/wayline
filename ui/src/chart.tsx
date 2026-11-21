@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, type KeyboardEvent, type ReactNode } from 'react';
-import type uPlot from 'uplot';
+import uPlot from 'uplot';
+import './uplot.css';
 import { finite, kept, resolution, stamp } from './format.ts';
 import {
   goNow,
@@ -7,19 +8,15 @@ import {
   resetZoom,
   shift,
   step,
+  themeKey,
   tier,
   windowEnd,
   windowStart,
   zoom,
 } from './store.ts';
-import { signal } from './signal.ts';
 import type { Column } from './types.ts';
 
-let lib: Promise<typeof uPlot> | null = null;
-const loadPlot = (): Promise<typeof uPlot> =>
-  (lib ||= import('uplot').then((m) => (m as unknown as { default: typeof uPlot }).default));
-
-export const themeKey = signal<'light' | 'dark' | ''>('');
+const loadPlot = (): Promise<typeof uPlot> => Promise.resolve(uPlot);
 
 export interface Line {
   label: string;

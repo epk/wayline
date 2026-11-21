@@ -1,12 +1,14 @@
-import { readFileSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { gzipSync } from 'node:zlib';
+import { constants, gzipSync, zstdCompressSync } from 'node:zlib';
 import { transform } from 'lightningcss';
 import { build } from 'rolldown';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
-const output = root + 'dist/gl-sdk4-ui-wayline.common.js';
-const budget = { minified: 600 * 1000, gzip: 200 * 1000 };
+const entry = root + 'dist/gl-sdk4-ui-wayline.common.js';
+const chunkDir = root + 'views/wayline/';
+const base = '/views/wayline/';
+const budget = { total: 600 * 1000, firstLoad: 125 * 1000 };
 const version = readFileSync(root + '../monitor/Cargo.toml', 'utf8').match(
   /^version = "([^"]+)"/m,
 )[1];
@@ -93,14 +95,29 @@ const scopeWebCss = (code) => {
   );
 };
 
+const styleCode = `
+const sheets = [];
+let element = null;
+export const add = (css) => {
+  sheets.push(css);
+  if (typeof document === 'undefined' || !document.head) return;
+  element ||= document.getElementById('wayline-style');
+  if (!element) {
+    element = document.createElement('style');
+    element.id = 'wayline-style';
+    document.head.appendChild(element);
+  }
+  element.textContent = sheets.join('\\n');
+};
+`;
+
 const css = {
   name: 'wayline-css',
   resolveId(id) {
     return id === styles ? id : null;
   },
   load(id) {
-    if (id !== styles) return null;
-    return 'export const sheets = []; export const add = (css) => { sheets.push(css); };';
+    return id === styles ? styleCode : null;
   },
   transform(code, id) {
     if (!id.endsWith('.css')) return null;
@@ -138,17 +155,120 @@ const shared = {
   },
 };
 
+const minify = { compress: { target: 'es2022', maxIterations: 10 }, mangle: { toplevel: true } };
+const comments = { legal: false, annotation: false, jsdoc: false };
+
+rmSync(chunkDir, { recursive: true, force: true });
+mkdirSync(chunkDir, { recursive: true });
+
+const input = {
+  core: root + 'src/core.tsx',
+  paths: root + 'src/views/paths.tsx',
+  wifi: root + 'src/views/wifi.tsx',
+  traffic: root + 'src/views/traffic.tsx',
+  router: root + 'src/views/router.tsx',
+  events: root + 'src/views/events.tsx',
+  settings: root + 'src/settings.tsx',
+};
+
+const probe = await build({
+  ...shared,
+  input,
+  plugins: [css],
+  write: false,
+  output: { dir: chunkDir, format: 'esm' },
+});
+const probeChunks = probe.output.filter((item) => item.type === 'chunk');
+const byFile = new Map(probeChunks.map((item) => [item.fileName, item]));
+const coreModules = new Set();
+const visit = (file) => {
+  const item = byFile.get(file);
+  if (!item || item.seen) return;
+  item.seen = true;
+  item.moduleIds.forEach((id) => coreModules.add(id));
+  item.imports.forEach(visit);
+};
+visit(probeChunks.find((item) => item.isEntry && item.name === 'core').fileName);
+const chartModule = /[\\/](uplot[\\/]|chart\.tsx|uplot\.css)/;
+
+const chunks = await build({
+  ...shared,
+  preserveEntrySignatures: 'allow-extension',
+  input: {
+    core: root + 'src/core.tsx',
+    paths: root + 'src/views/paths.tsx',
+    wifi: root + 'src/views/wifi.tsx',
+    traffic: root + 'src/views/traffic.tsx',
+    router: root + 'src/views/router.tsx',
+    events: root + 'src/views/events.tsx',
+    settings: root + 'src/settings.tsx',
+  },
+  plugins: [css],
+  output: {
+    dir: chunkDir,
+    format: 'esm',
+    entryFileNames: '[name]-[hash].js',
+    chunkFileNames: '[name]-[hash].js',
+    codeSplitting: {
+      groups: [
+        {
+          name: 'chart',
+          test: (id) => chartModule.test(id),
+          priority: 3,
+          includeDependenciesRecursively: false,
+        },
+        { name: 'core', test: (id) => coreModules.has(id), priority: 2 },
+      ],
+    },
+    minify,
+    comments,
+  },
+});
+
+const files = chunks.output.filter((item) => item.type === 'chunk');
+const entries = Object.fromEntries(
+  files.filter((item) => item.isEntry).map((item) => [item.name, item.fileName]),
+);
+const deps = Object.fromEntries(
+  files.map((item) => [item.fileName, [...new Set([...item.imports, ...item.dynamicImports])]]),
+);
+const sizes = {};
+for (const item of files) {
+  const code = Buffer.from(item.code);
+  for (const dep of deps[item.fileName])
+    if (!['"', "'", '`'].some((q) => code.includes(q + './' + dep + q)))
+      throw Error(`${item.fileName} refers to ${dep} in a form the loader does not rewrite.`);
+  const zstd = zstdCompressSync(code, { params: { [constants.ZSTD_c_compressionLevel]: 19 } });
+  writeFileSync(chunkDir + item.fileName + '.zst', zstd);
+  sizes[item.fileName] = {
+    minified: code.length,
+    zstd: zstd.length,
+    gzip: gzipSync(code, { level: 9 }).length,
+  };
+}
+
+const { core, ...lazy } = entries;
+const manifest = { base, core, entries: lazy, deps };
+const manifestId = '\0wayline-manifest';
+
 await build({
   ...shared,
   input: root + 'src/glinet.ts',
-  plugins: [css],
+  plugins: [
+    {
+      name: 'wayline-manifest',
+      resolveId: (id) => (id === manifestId ? id : null),
+      load: (id) =>
+        id === manifestId ? `export const manifest = ${JSON.stringify(manifest)};` : null,
+    },
+  ],
   output: {
-    file: output,
+    file: entry,
     format: 'cjs',
     exports: 'default',
     codeSplitting: false,
-    minify: { compress: { target: 'es2022', maxIterations: 10 }, mangle: { toplevel: true } },
-    comments: { legal: false, annotation: false, jsdoc: false },
+    minify,
+    comments,
   },
 });
 
@@ -160,16 +280,57 @@ await build({
     format: 'iife',
     codeSplitting: false,
     minify: true,
-    comments: { legal: false, annotation: false, jsdoc: false },
+    comments,
   },
 });
 
-const bytes = readFileSync(output);
-const size = statSync(output).size;
-const gzip = gzipSync(bytes, { level: 9 }).length;
-const report = `${size} bytes minified (budget ${budget.minified}), ${gzip} bytes gzip (budget ${budget.gzip})`;
-if (size > budget.minified || gzip > budget.gzip) {
-  console.error(`The bundle is over budget: ${report}.`);
+const loaderCode = readFileSync(entry);
+const loader = {
+  minified: loaderCode.length,
+  zstd: zstdCompressSync(loaderCode, { params: { [constants.ZSTD_c_compressionLevel]: 19 } })
+    .length,
+  gzip: gzipSync(loaderCode, { level: 9 }).length,
+};
+const closure = (file, seen = new Set()) => {
+  if (seen.has(file)) return seen;
+  seen.add(file);
+  deps[file].forEach((dep) => closure(dep, seen));
+  return seen;
+};
+const sum = (list, key) => list.reduce((total, file) => total + sizes[file][key], 0);
+const first = [...closure(core)];
+const all = Object.keys(sizes);
+const report = {
+  version,
+  loader,
+  firstLoad: {
+    files: first,
+    minified: loader.minified + sum(first, 'minified'),
+    zstd: loader.gzip + sum(first, 'zstd'),
+    gzip: loader.gzip + sum(first, 'gzip'),
+  },
+  total: {
+    minified: loader.minified + sum(all, 'minified'),
+    zstd: loader.gzip + sum(all, 'zstd'),
+    gzip: loader.gzip + sum(all, 'gzip'),
+  },
+  chunks: sizes,
+  entries,
+};
+writeFileSync(root + 'dist/size-report.json', JSON.stringify(report, null, 2) + '\n');
+
+const failures = [];
+if (report.total.minified > budget.total)
+  failures.push(`all chunks are ${report.total.minified} bytes minified (budget ${budget.total})`);
+if (report.firstLoad.zstd > budget.firstLoad)
+  failures.push(
+    `the first load is ${report.firstLoad.zstd} bytes (budget ${budget.firstLoad}; loader gzip, chunks zstd)`,
+  );
+if (failures.length) {
+  console.error('The UI is over budget: ' + failures.join('; ') + '.');
   process.exit(1);
 }
-console.log(`Built ${output} for Wayline ${version}: ${report}.`);
+console.log(
+  `Built Wayline ${version}: loader ${loader.minified} B, first load ${report.firstLoad.zstd} B zstd ` +
+    `(${report.firstLoad.gzip} B as gzip), ${all.length} chunks ${report.total.minified} B minified.`,
+);
