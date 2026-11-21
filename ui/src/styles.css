@@ -1326,3 +1326,28 @@ th[aria-sort='descending'] .wl-sort::after {
 .wl-card .wl-strip-row {
   grid-template-columns: auto minmax(0, 1fr) 64px;
 }
+.wl-device {
+  font-size: 12px;
+  margin: 14px 0 4px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+.wl-mono {
+  font-family: var(--wl-mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.wl-clock {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-color: color-mix(in srgb, var(--wl-warning) 55%, var(--wl-card));
+  background: color-mix(in srgb, var(--wl-warning) 10%, var(--wl-card));
+}
+.wl-tip-extra {
+  padding-left: 16px;
+  font-variant-numeric: tabular-nums;
+  color: var(--wl-muted);
+}

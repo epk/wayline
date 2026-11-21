@@ -25,6 +25,7 @@ export interface Line {
   dash?: number[];
   fill?: number;
   helper?: boolean;
+  quiet?: boolean;
   show?: boolean;
 }
 
@@ -65,6 +66,7 @@ export interface ChartProps {
   focus?: number;
   legend?: boolean;
   onCursor?: (index: number) => void;
+  extra?: (line: number, index: number) => string;
   children?: ReactNode;
 }
 
@@ -118,6 +120,8 @@ const solo = (values: Column): number[] => {
   return found;
 };
 
+let hovered: uPlot | null = null;
+
 const applyShow = (u: uPlot | null, visible: boolean[] | undefined): void => {
   if (!u || !visible) return;
   visible.forEach((show, i) => {
@@ -164,7 +168,8 @@ export function Chart(props: ChartProps) {
     if (p.onCursor) p.onCursor(idx);
     const el = tip.current;
     if (!el || !box.current) return;
-    if (idx < 0 || u.cursor.left == null || u.cursor.left < 0) {
+    const here = hovered === u || (!hovered && box.current.contains(document.activeElement));
+    if (!here || idx < 0 || u.cursor.left == null || u.cursor.left < 0) {
       el.hidden = true;
       return;
     }
@@ -173,7 +178,7 @@ export function Chart(props: ChartProps) {
     const rows: { line: Line; value: number; i: number }[] = [];
     p.lines.forEach((line, i) => {
       const value = u.data[i + 1][idx];
-      if (line.helper || !u.series[i + 1].show || !finite(value)) return;
+      if (line.helper || line.quiet || !u.series[i + 1].show || !finite(value)) return;
       rows.push({ line, value, i });
     });
     let nearest = -1;
@@ -204,6 +209,13 @@ export function Chart(props: ChartProps) {
       value.textContent = p.format(row.value);
       line.append(swatch, name, value);
       children.push(line);
+      const more = p.extra && n === nearest ? p.extra(row.i, idx) : '';
+      if (more) {
+        const detail = document.createElement('div');
+        detail.className = 'wl-tip-extra';
+        detail.textContent = more.replace(/^ · /, '');
+        children.push(detail);
+      }
     });
     const bucket = step.value * 1000;
     (p.markers || [])
@@ -378,7 +390,14 @@ export function Chart(props: ChartProps) {
         host.current,
       );
       plot.current.over.addEventListener('dblclick', resetZoom);
-      plot.current.over.addEventListener('mouseleave', hideTip);
+      const over = plot.current;
+      over.over.addEventListener('mouseenter', () => {
+        hovered = over;
+      });
+      over.over.addEventListener('mouseleave', () => {
+        if (hovered === over) hovered = null;
+        hideTip();
+      });
       built.current = key;
       fed.current = feed;
       applyShow(plot.current, p.visible);
@@ -429,7 +448,7 @@ export function Chart(props: ChartProps) {
   };
 
   const shown = props.lines.filter(
-    (l, i) => !l.helper && (!props.visible || props.visible[i] !== false),
+    (l, i) => !l.helper && !l.quiet && (!props.visible || props.visible[i] !== false),
   );
   return (
     <figure className="wl-chart">

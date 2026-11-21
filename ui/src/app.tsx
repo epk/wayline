@@ -250,6 +250,12 @@ function Dashboard() {
       <p className="wl-statusline wl-muted" role="status">
         {statusLine.value}
       </p>
+      {s.clock && !s.clock.synced && (
+        <p className="wl-notice wl-clock" role="status">
+          Router clock not yet synced, times are provisional.
+          {s.clock.pending && ' Data recorded before sync will be re-timed and stored.'}
+        </p>
+      )}
       {!can.value.configure && ready.value && (
         <p className="wl-muted wl-hint">{configureReason.value}</p>
       )}

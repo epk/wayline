@@ -1,12 +1,57 @@
-import { useMemo } from 'react';
+import { Button } from '@ui-sdk/react/button';
+import { useMemo, useRef } from 'react';
 import { Chart } from '../chart.tsx';
 import { memUsed, routerLimits } from '../derived.ts';
 import { bytes, dash, finite, percent, span } from '../format.ts';
 import { column, times } from '../series.ts';
 import type { Column } from '../types.ts';
-import { state, telemetryData } from '../store.ts';
+import { say, state, telemetryData } from '../store.ts';
 import { Explain, Facts, Panel } from '../ui.tsx';
 import { HistoryStatus, TelemetryOff } from './traffic.tsx';
+
+const clockSource: Record<string, string> = {
+  ntp: 'NTP',
+  step: 'a clock step',
+  connectivity: 'connectivity check',
+};
+
+function Device() {
+  const s = state.value;
+  const code = useRef<HTMLElement>(null);
+  const clock = s.clock;
+  const copy = () => {
+    const id = s.device || '';
+    const select = () => {
+      if (code.current) window.getSelection()?.selectAllChildren(code.current);
+      say('Device id selected. Press Ctrl+C or Cmd+C to copy it.');
+    };
+    if (navigator.clipboard)
+      navigator.clipboard.writeText(id).then(() => say('Device id copied.'), select);
+    else select();
+  };
+  return (
+    <section className="wl-device" aria-label="Device">
+      <span className="wl-muted">Device id</span>{' '}
+      <code ref={code} className="wl-mono">
+        {s.device || dash}
+      </code>
+      {s.device && (
+        <Button className="wl-link" onClick={copy}>
+          Copy device id
+        </Button>
+      )}
+      <span className="wl-muted">
+        {' '}
+        · Clock{' '}
+        {!clock
+          ? 'status unknown'
+          : clock.synced
+            ? 'synced' + (clock.source ? ' by ' + (clockSource[clock.source] || clock.source) : '')
+            : 'not yet synced'}
+      </span>
+    </section>
+  );
+}
 
 export function RouterView() {
   const s = state.value;
@@ -27,7 +72,13 @@ export function RouterView() {
       max,
     };
   }, [doc]);
-  if (!s.config.telemetry) return <TelemetryOff title="Router" />;
+  if (!s.config.telemetry)
+    return (
+      <>
+        <TelemetryOff title="Router" />
+        <Device />
+      </>
+    );
   const mem = memUsed(sys);
   const pct = (v: number) => v.toFixed(1) + ' %';
   return (
@@ -174,6 +225,7 @@ export function RouterView() {
           />
         </div>
       )}
+      <Device />
     </>
   );
 }

@@ -55,6 +55,9 @@ test('decodes a zstd-compressed stream written by flechette with a Node codec', 
     '0.min': [11000, null, 14000, 8000],
     '0.max': [14000, null, 19000, 9900],
     '0.jitter': [800, null, 1200, 400],
+    '0.p50': [12100, null, 15600, 9100],
+    '0.p95': [13500, null, 18000, 9800],
+    '0.p99': [13900, null, 18900, 9900],
     '0.sent': [4, 4, 4, 0],
     '0.lost': [0, 4, 1, 0],
   };
@@ -63,6 +66,9 @@ test('decodes a zstd-compressed stream written by flechette with a Node codec', 
     '0.min': int32(),
     '0.max': int32(),
     '0.jitter': int32(),
+    '0.p50': int32(),
+    '0.p95': int32(),
+    '0.p99': int32(),
     '0.sent': uint32(),
     '0.lost': uint32(),
   };
@@ -78,6 +84,8 @@ test('decodes a zstd-compressed stream written by flechette with a Node codec', 
   assert.equal(doc.series[0].name, 'Tunnel A');
   assert.deepEqual(Array.from(doc.series[0].median), columns['0.median']);
   assert.deepEqual(Array.from(doc.series[0].lost), columns['0.lost']);
+  assert.deepEqual(Array.from(doc.series[0].p95), columns['0.p95']);
+  assert.deepEqual(Array.from(doc.series[0].p99), columns['0.p99']);
 });
 
 test('maps wifi columns and keeps the summary from metadata', async () => {

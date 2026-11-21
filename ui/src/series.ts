@@ -49,6 +49,9 @@ export interface LatencyLine {
   min: Column;
   max: Column;
   jitter: Column;
+  p50: Column;
+  p95: Column;
+  p99: Column;
   sent: Column;
   lost: Column;
   loss: Column;
@@ -64,6 +67,9 @@ export const latencyLine = (doc: Doc, s: LatencySeries): LatencyLine => {
     min: micros(column(doc, s.min)),
     max: micros(column(doc, s.max)),
     jitter: micros(column(doc, s.jitter)),
+    p50: micros(column(doc, s.p50)),
+    p95: micros(column(doc, s.p95)),
+    p99: micros(column(doc, s.p99)),
     sent,
     lost,
     loss: lossColumn(sent, lost),

@@ -82,6 +82,11 @@ const state = {
     update: true,
   },
   probe: { interval: 5, timeout: 2000 },
+  device: '3f9c2a7e5b1d4c608a2e9f17c4b3d5e8',
+  clock:
+    query.get('clock') === 'unsynced'
+      ? { synced: false, source: null, pending: true }
+      : { synced: true, source: 'ntp', pending: false },
   history: {
     days: 7,
     tiers: [
@@ -164,6 +169,8 @@ const state = {
       state: wanDown ? 'route_unavailable' : 'reachable',
       median: wanMs,
       jitter: wanDown ? null : 0.84,
+      samples: wanDown ? 0 : 64,
+      lost: wanDown ? 0 : 1,
     },
     {
       id: 'uplink:wwan',
@@ -174,6 +181,8 @@ const state = {
       state: 'reachable',
       median: 21.84,
       jitter: 2.61,
+      samples: 64,
+      lost: 0,
     },
     {
       id: 'uplink:secondwan',
@@ -184,18 +193,22 @@ const state = {
       state: 'route_mismatch',
       median: null,
       jitter: null,
+      samples: 0,
+      lost: 0,
     },
   ],
   events: [
     {
       at: now() - 20 * 60000,
       subject: 'home',
+      seq: 41,
       kind: 'egress',
       text: 'Tunnel A public exit IP changed from 203.0.113.4 to 203.0.113.5.',
     },
     {
       at: now() - 3 * 3600000,
       subject: 'wan',
+      seq: 40,
       kind: 'uplink',
       text: 'Active uplink changed from wwan to eth1',
     },
@@ -498,7 +511,17 @@ function latencySeries(id, target, frame) {
   const bias = target === 'example.com' ? 7 : target === '9.9.9.9' ? 4 : 0;
   const base =
     { home: 32, backup: 24, tokyo: 130, zurich: 62, wan: 14, 'uplink:wwan': 22 }[id] || 32;
-  const out = { median: [], min: [], max: [], jitter: [], sent: [], lost: [] };
+  const out = {
+    median: [],
+    min: [],
+    max: [],
+    jitter: [],
+    p50: [],
+    p95: [],
+    p99: [],
+    sent: [],
+    lost: [],
+  };
   const per = Math.max(1, Math.round(frame.step / 5));
   for (let i = 0; i < frame.count; i++) {
     const at = frame.at(i);
@@ -517,7 +540,7 @@ function latencySeries(id, target, frame) {
             ? 1
             : 0;
     if (before) {
-      ['median', 'min', 'max', 'jitter'].forEach((k) => out[k].push(null));
+      ['median', 'min', 'max', 'jitter', 'p50', 'p95', 'p99'].forEach((k) => out[k].push(null));
       out.sent.push(0);
       out.lost.push(0);
       continue;
@@ -529,6 +552,10 @@ function latencySeries(id, target, frame) {
     out.jitter.push(
       dead ? null : Math.round((id === 'tokyo' ? 14 : 1.2) * (1 + 0.4 * Math.sin(n / 9)) * 1000),
     );
+    const spread = id === 'tokyo' ? 3.5 : 1;
+    out.p50.push(dead ? null : Math.round((v + 0.4) * 1000));
+    out.p95.push(dead ? null : Math.round((v + 3.5 * spread + (n % 91 === 0 ? 20 : 0)) * 1000));
+    out.p99.push(dead ? null : Math.round((v + 4.8 * spread + (n % 91 === 0 ? 33 : 0)) * 1000));
     out.sent.push(per);
     out.lost.push(lost);
   }
@@ -544,6 +571,9 @@ function serverSeries(id, target, frame) {
     min: scaleCol(through.min),
     max: scaleCol(through.max),
     jitter: scaleCol(through.jitter),
+    p50: scaleCol(through.p50),
+    p95: scaleCol(through.p95),
+    p99: scaleCol(through.p99),
     sent: through.sent,
     lost: through.sent.map(() => 0),
   };
@@ -949,7 +979,7 @@ window.previewApi = {
     const cols = {};
     const types = {};
     series.forEach((s, k) => {
-      ['median', 'min', 'max', 'jitter'].forEach((key) => {
+      ['median', 'min', 'max', 'jitter', 'p50', 'p95', 'p99'].forEach((key) => {
         cols[k + '.' + key] = s.data[key];
         types[k + '.' + key] = int32();
       });

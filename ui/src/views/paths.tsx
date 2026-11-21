@@ -496,6 +496,7 @@ function History() {
     const owners: string[] = [];
     const bandOwner: (string | null)[] = [];
     const rows: Row[] = [];
+    const lineAt: LatencyLine[] = [];
     sorted.forEach((l) => {
       const server = isServer(l.id);
       const muted = l.id === 'wan' || isUplink(l.id);
@@ -523,7 +524,16 @@ function History() {
         owners.push(owner);
         bandOwner.push(owner);
         bands.push({ upper: index + 2, lower: index + 1, color, alpha: 0.15 });
+        latency.push({ label: name + ' p95', color, width: 1, dash: [5, 3], quiet: true });
+        ys.push(l.p95);
+        owners.push(owner);
+        bandOwner.push(owner);
+        latency.push({ label: name + ' p99', color, width: 1, dash: [1, 3], quiet: true });
+        ys.push(l.p99);
+        owners.push(owner);
+        bandOwner.push(owner);
       }
+      lineAt[index] = l;
       rows.push({
         key: l.id,
         owner,
@@ -552,6 +562,7 @@ function History() {
       owners,
       bandOwner,
       rows,
+      lineAt,
       jitter: simple((l) => l.jitter),
       loss: simple((l) => l.loss),
     };
@@ -723,8 +734,16 @@ function History() {
           </div>
         )}
         <Chart
-          title="Median latency (ms) with min–max band"
+          title="Median latency (ms) with min–max band, p95 and p99"
+          detail={scaleNote('medians') + ' · p95 dashed, p99 dotted for the highlighted path'}
           label={'Latency to ' + target + ' through each path'}
+          extra={(i, at) => {
+            const l = built.lineAt[i];
+            if (!l) return '';
+            const p = (name: string, col: Column) =>
+              finite(col[at]) ? ' · ' + name + ' ' + (col[at] as number).toFixed(1) : '';
+            return p('p50', l.p50) + p('p95', l.p95) + p('p99', l.p99);
+          }}
           x={x}
           ys={built.ys}
           lines={built.latency}
@@ -740,7 +759,15 @@ function History() {
           onCursor={(i) => {
             if (cursor.value !== i) cursor.value = i;
           }}
-        />
+        >
+          <p
+            className="wl-muted wl-small"
+            title="Percentiles from a histogram; error within one bin"
+          >
+            Percentiles from a 16-bin RTT histogram; error within one bin (under 1 ms below 3 ms,
+            under 5 ms below 20 ms, 50 ms between 100 and 150 ms).
+          </p>
+        </Chart>
         <Chart
           title="Jitter (ms)"
           detail={scaleNote('buckets') + ' · mean |RTTᵢ − RTTᵢ₋₁|'}

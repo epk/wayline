@@ -56,6 +56,7 @@ export interface ChangeEvent {
   subject: string;
   kind: string;
   text: string;
+  seq?: number;
 }
 
 export interface Incident {
@@ -221,6 +222,8 @@ export interface State {
   probe?: { interval?: number; timeout?: number };
   wifi: WifiView;
   telemetry: Telemetry;
+  device?: string;
+  clock?: { synced: boolean; source: string | null; pending: boolean };
 }
 
 export interface Doc {
@@ -236,6 +239,9 @@ export interface LatencySeries {
   min: Column;
   max: Column;
   jitter: Column;
+  p50?: Column;
+  p95?: Column;
+  p99?: Column;
   sent: Column;
   lost: Column;
 }

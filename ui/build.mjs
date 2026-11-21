@@ -137,6 +137,15 @@ const css = {
   },
 };
 
+const geoStub = {
+  name: 'wayline-no-geoarrow',
+  resolveId: (id) => (id === '@uwdata/wk-geojson' ? '\0wk-geojson' : null),
+  load: (id) =>
+    id === '\0wk-geojson'
+      ? 'export const wkbToGeoJSON = () => { throw Error("GeoArrow is not supported."); }; export const wktToGeoJSON = wkbToGeoJSON;'
+      : null,
+};
+
 const shared = {
   platform: 'browser',
   resolve: { conditionNames: ['browser', 'import', 'production', 'default'] },
@@ -174,7 +183,7 @@ const input = {
 const probe = await build({
   ...shared,
   input,
-  plugins: [css],
+  plugins: [css, geoStub],
   write: false,
   output: { dir: chunkDir, format: 'esm' },
 });
@@ -203,7 +212,7 @@ const chunks = await build({
     events: root + 'src/views/events.tsx',
     settings: root + 'src/settings.tsx',
   },
-  plugins: [css],
+  plugins: [css, geoStub],
   output: {
     dir: chunkDir,
     format: 'esm',
@@ -275,6 +284,7 @@ await build({
 await build({
   ...shared,
   input: root + 'preview/demo.js',
+  plugins: [geoStub],
   output: {
     file: root + 'preview/dist/demo.js',
     format: 'iife',
