@@ -1,12 +1,5 @@
 import { Button } from '@ui-sdk/react/button';
-import {
-  AlertDialog,
-  AlertDialogBackdrop,
-  AlertDialogClose,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogTitle,
-} from '@ui-sdk/react/alert-dialog';
+import { Modal } from '../modal.tsx';
 import {
   SegmentedControl,
   SegmentedControlIndicator,
@@ -14,7 +7,7 @@ import {
 } from '@ui-sdk/react/segmented-control';
 import { Switch, SwitchThumb } from '@ui-sdk/react/switch';
 import { Toggle } from '@ui-sdk/react/toggle';
-import { useMemo, useState, type KeyboardEvent, type MouseEvent } from 'react';
+import { useMemo, useState } from 'react';
 import { Chart, type Band, type Line, type Marker } from '../chart.tsx';
 import { changeFor, IncidentList, rangeIncidents, tunnelName } from '../common.tsx';
 import {
@@ -105,36 +98,33 @@ interface Row {
 
 function StopDialog() {
   const t = state.value.tunnels.find((row) => row.id === pendingStop.value) || null;
+  const name = t ? t.name : 'the tunnel';
   return (
-    <AlertDialog
+    <Modal
       open={!!t}
-      onOpenChange={(open) => {
-        if (!open) pendingStop.value = '';
-      }}
+      onClose={() => (pendingStop.value = '')}
+      title={'Stop ' + name + '?'}
+      className="wl-alert"
+      alert
     >
-      <AlertDialogBackdrop className="wl-backdrop" />
-      <AlertDialogContent className="wl-alert" keepMounted>
-        <AlertDialogTitle>Stop {t ? t.name : 'the tunnel'}?</AlertDialogTitle>
-        <AlertDialogDescription>
-          Traffic may use WAN. GL.iNet traffic policy applies while the tunnel is stopped.
-        </AlertDialogDescription>
-        <div className="wl-actions">
-          <AlertDialogClose className="wl-button">Keep running</AlertDialogClose>
-          <AlertDialogClose
-            className="wl-button wl-danger"
-            value="confirm"
-            data-agent-confirm={'Stops the VPN tunnel ' + (t ? t.name : '')}
-            action={() => {
-              const tunnel = t;
-              pendingStop.value = '';
-              if (tunnel) void setTunnelEnabled(tunnel);
-            }}
-          >
-            Stop tunnel
-          </AlertDialogClose>
-        </div>
-      </AlertDialogContent>
-    </AlertDialog>
+      <h2>Stop {name}?</h2>
+      <p>Traffic may use WAN. GL.iNet traffic policy applies while the tunnel is stopped.</p>
+      <div className="wl-actions">
+        <Button className="wl-button" onClick={() => (pendingStop.value = '')}>
+          Keep running
+        </Button>
+        <Button
+          className="wl-button wl-danger"
+          data-agent-confirm={'Stops the VPN tunnel ' + name + '; traffic may leave over WAN'}
+          onClick={() => {
+            pendingStop.value = '';
+            if (t) void setTunnelEnabled(t);
+          }}
+        >
+          Stop {name}
+        </Button>
+      </div>
+    </Modal>
   );
 }
 
@@ -252,6 +242,7 @@ function TunnelTable() {
                       pressed={selectedTunnel.value === t.id}
                       onPressedChange={() => highlight(t.id)}
                     >
+                      <span className="wl-sr">Band of </span>
                       {t.name}
                     </Toggle>
                     {t.preferred && <Tag>Active exit</Tag>}
@@ -339,6 +330,12 @@ function TunnelTable() {
                               : undefined
                         }
                         disabled={busy.value || !selectable(t) || !can.value.select}
+                        data-agent-confirm={
+                          'Makes ' +
+                          t.name +
+                          ' the VPN exit for new connections, replacing ' +
+                          (exitTunnel.value ? exitTunnel.value.name : 'the direct WAN exit')
+                        }
                         onClick={() => void selectExit(t)}
                       >
                         {busyTunnel.value === t.id && busyAction.value === 'select'
@@ -364,6 +361,11 @@ function TunnelTable() {
                         <Switch
                           checked={t.enabled}
                           disabled={busy.value || !t.controllable || !can.value.control}
+                          data-agent-confirm={
+                            t.enabled
+                              ? undefined
+                              : 'Starts the VPN tunnel ' + t.name + ' on the router'
+                          }
                           onCheckedChange={(on, details) => {
                             details.cancel();
                             if (on !== t.enabled) askToggle(t);
@@ -623,8 +625,10 @@ function History() {
   const target = selectedTarget.value;
   const fmt = (v: number) => v.toFixed(2) + ' ms';
   const active = (row: Row) => row.tunnel && !!tunnels.find((t) => t.id === row.owner)?.preferred;
-  const pick = (row: Row, e: MouseEvent | KeyboardEvent) =>
-    isolate(row.owner, row.tunnel, e.ctrlKey || e.metaKey || e.shiftKey);
+  const pick = (row: Row, e: Event | undefined) => {
+    const k = e as KeyboardEvent | MouseEvent | undefined;
+    isolate(row.owner, row.tunnel, !!k && (k.ctrlKey || k.metaKey || k.shiftKey));
+  };
   return (
     <Panel
       id="wl-latency-title"
@@ -644,12 +648,14 @@ function History() {
               <tr>
                 <th scope="col" aria-sort={ariaSort('name')}>
                   <Button className="wl-sort" onClick={() => sortBy('name')}>
+                    <span className="wl-sr">Sort by </span>
                     Series <span className="wl-muted">(ms)</span>
                   </Button>
                 </th>
                 {columns.map((c) => (
                   <th key={c.key} scope="col" className="wl-n" aria-sort={ariaSort(c.key)}>
                     <Button className="wl-sort" onClick={() => sortBy(c.key)}>
+                      <span className="wl-sr">Sort by </span>
                       {c.label}
                     </Button>
                   </th>
@@ -660,19 +666,10 @@ function History() {
               {sorted.map((row) => (
                 <tr
                   key={row.key}
-                  tabIndex={0}
-                  aria-selected={isolated.value.includes(row.owner) ? 'true' : 'false'}
                   className={
                     (isolated.value.includes(row.owner) ? 'wl-on ' : '') +
                     (isolated.value.length && !isolated.value.includes(row.owner) ? 'wl-dim' : '')
                   }
-                  onClick={(e) => pick(row, e)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      pick(row, e);
-                    }
-                  }}
                   onMouseEnter={() => setFocus(row.index)}
                   onMouseLeave={() => setFocus(-1)}
                   onFocus={() => setFocus(row.index)}
@@ -695,7 +692,18 @@ function History() {
                         strokeDasharray={row.dashed ? '4 3' : undefined}
                       />
                     </svg>
-                    {row.name}
+                    <Toggle
+                      className="wl-sort"
+                      pressed={isolated.value.includes(row.owner)}
+                      onPressedChange={(_on, details) => {
+                        details.cancel();
+                        pick(row, details.event);
+                      }}
+                    >
+                      <span className="wl-sr">Show only </span>
+                      {row.name}
+                      {row.dashed ? '' : <span className="wl-sr"> path</span>}
+                    </Toggle>
                     {active(row) && <Tag>Active exit</Tag>}
                   </th>
                   <td className="wl-n wl-num">{fixed(row.stats.last)}</td>
@@ -724,8 +732,8 @@ function History() {
         </div>
       )}
       <p className="wl-muted wl-hint">
-        Click a row to show only that line. Ctrl- or Cmd-click adds more. MOS uses the range mean
-        latency and jitter and the range loss.
+        Press a series name to show only that line. Ctrl- or Cmd-click adds more. MOS uses the range
+        mean latency and jitter and the range loss.
       </p>
       <div className="wl-chart-area">
         {note && (

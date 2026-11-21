@@ -140,23 +140,25 @@
       <div id="app"></div>
     </div>
     <script src="../node_modules/vue/dist/vue.runtime.min.js"></script>
-    <script>
-      var module = { exports: {} };
-      var exports = module.exports;
-      function require(name) {
-        throw Error('Unexpected dependency: ' + name);
-      }
-    </script>
-    <script src="../dist/gl-sdk4-ui-wayline.common.js"></script>
     <script src="dist/demo.js"></script>
     <script>
-      Vue.prototype.$rpcRequest = window.previewRpc;
-      new Vue({
-        render: (h) =>
-          h(module.exports.default || module.exports, {
-            props: { preview: true, source: window.previewSource },
-          }),
-      }).$mount('#app');
+      // The GL.iNet host fetches the entry with axios and runs eval(res.data) on the package's wrapped copy.
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '../dist/gl-sdk4-ui-wayline.common.js?_t=' + Date.now());
+      xhr.onload = function () {
+        var wrapped =
+          '(function(){var module={exports:{}};var exports=module.exports;' +
+          xhr.responseText +
+          '\nreturn (module.exports && module.exports.default) || module.exports;})()';
+        var component = eval(wrapped);
+        Vue.prototype.$rpcRequest = window.previewRpc;
+        new Vue({
+          render: function (h) {
+            return h(component, { props: { preview: true, source: window.previewSource } });
+          },
+        }).$mount('#app');
+      };
+      xhr.send();
     </script>
   </body>
 </html>

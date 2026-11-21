@@ -1,15 +1,7 @@
-import {
-  AlertDialog,
-  AlertDialogBackdrop,
-  AlertDialogClose,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@ui-sdk/react/alert-dialog';
 import { Button } from '@ui-sdk/react/button';
 import { Input } from '@ui-sdk/react/input';
-import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { useId, useState } from 'react';
+import { Modal } from './modal.tsx';
 import { Check, Pick } from './kit.tsx';
 import {
   busy,
@@ -25,6 +17,7 @@ import {
   state,
   updateDraft,
 } from './store.ts';
+import type { Settings } from './types.ts';
 import { UpdatePanel } from './update-panel.tsx';
 
 const intervals = [1, 5, 15, 30, 60].map((n) => ({ value: String(n), label: n + ' s' }));
@@ -35,46 +28,41 @@ const keep = [
   { value: '0', label: 'Memory only' },
 ];
 
-function Sheet(props: { open: boolean; onClose: () => void; children: ReactNode }) {
-  const ref = useRef<HTMLDialogElement>(null);
-  const { open } = props;
-  const { onClose } = props;
-  useEffect(() => {
-    const dialog = ref.current;
-    if (!dialog) return;
-    if (open && !dialog.open) dialog.showModal();
-    else if (!open && dialog.open) dialog.close();
-  }, [open]);
-  useEffect(() => {
-    const dialog = ref.current;
-    if (!dialog) return undefined;
-    const outside = (e: MouseEvent) => {
-      if (e.target === dialog) onClose();
-    };
-    dialog.addEventListener('click', outside);
-    return () => dialog.removeEventListener('click', outside);
-  }, [onClose]);
-  return (
-    <dialog
-      ref={ref}
-      id="wl-settings"
-      className="wl-drawer"
-      aria-labelledby="wl-settings-title"
-      aria-describedby="wl-settings-description"
-      onCancel={(e) => {
-        e.preventDefault();
-        onClose();
-      }}
-    >
-      {open && props.children}
-    </dialog>
-  );
-}
-
 const toggle = (list: string[], value: string, on: boolean): string[] =>
   on ? (list.includes(value) ? list : list.concat(value)) : list.filter((v) => v !== value);
 
 let nextKey = 0;
+
+const settingNames: Record<keyof Settings, string> = {
+  enabled: 'latency measurement',
+  interval: 'probe interval',
+  targets: 'destinations',
+  tunnels: 'monitored tunnels',
+  directWan: 'direct internet probes',
+  endpointDiagnostics: 'VPN server probes',
+  upstreamWifi: 'upstream Wi-Fi sampling',
+  telemetry: 'router telemetry',
+  autoExit: 'automatic exit switching',
+  autoTunnels: 'automatic switching pool',
+  historyDays: 'history retention',
+  autoUpdates: 'automatic updates',
+};
+
+const shown = (value: unknown): string =>
+  Array.isArray(value)
+    ? value.join(', ') || 'none'
+    : typeof value === 'boolean'
+      ? value
+        ? 'on'
+        : 'off'
+      : String(value);
+
+const changeSummary = (next: Settings, current: Settings): string | undefined => {
+  const parts = (Object.keys(settingNames) as (keyof Settings)[])
+    .filter((key) => JSON.stringify(next[key]) !== JSON.stringify(current[key]))
+    .map((key) => settingNames[key] + ' ' + shown(current[key]) + ' → ' + shown(next[key]));
+  return parts.length ? 'Saves router settings: ' + parts.join('; ') : undefined;
+};
 
 function Destinations() {
   const d = draft.value;
@@ -172,34 +160,42 @@ function Destinations() {
 }
 
 function Purge() {
+  const [open, setOpen] = useState(false);
   return (
-    <AlertDialog>
-      <AlertDialogTrigger className="wl-button" disabled={busy.value}>
+    <>
+      <Button className="wl-button" disabled={busy.value} onClick={() => setOpen(true)}>
         Purge history
-      </AlertDialogTrigger>
-      <AlertDialogBackdrop className="wl-backdrop" />
-      <AlertDialogContent className="wl-alert">
-        <AlertDialogTitle>Delete all stored history?</AlertDialogTitle>
-        <AlertDialogDescription>
+      </Button>
+      <Modal
+        open={open}
+        onClose={() => setOpen(false)}
+        title="Delete all stored history?"
+        className="wl-alert"
+        alert
+      >
+        <h2>Delete all stored history?</h2>
+        <p>
           This permanently deletes all stored latency, Wi-Fi and telemetry history and change
           events, including recovery copies. Live measurements continue.
-        </AlertDialogDescription>
+        </p>
         <div className="wl-actions">
-          <AlertDialogClose className="wl-button">Cancel purge</AlertDialogClose>
-          <AlertDialogClose
+          <Button className="wl-button" onClick={() => setOpen(false)}>
+            Cancel purge
+          </Button>
+          <Button
             className="wl-button wl-danger"
-            value="confirm"
-            data-agent-confirm="Deletes all stored Wayline history on the router"
-            action={() => {
+            data-agent-confirm="Deletes all stored Wayline history on the router, including recovery copies"
+            onClick={() => {
+              setOpen(false);
               purgeConfirm.value = true;
               return purgeHistory();
             }}
           >
             {busyAction.value === 'purge' ? 'Purging…' : 'Delete all history'}
-          </AlertDialogClose>
+          </Button>
         </div>
-      </AlertDialogContent>
-    </AlertDialog>
+      </Modal>
+    </>
   );
 }
 
@@ -208,7 +204,13 @@ export function SettingsDrawer() {
   const d = draft.value;
   const s = state.value;
   return (
-    <Sheet open={open} onClose={closeSettings}>
+    <Modal
+      open={open}
+      onClose={closeSettings}
+      title="Settings"
+      className="wl-drawer"
+      id="wl-settings"
+    >
       <form
         className="wl-drawer-form"
         noValidate
@@ -386,11 +388,16 @@ export function SettingsDrawer() {
           <Button className="wl-button" disabled={busy.value} onClick={closeSettings}>
             Cancel
           </Button>
-          <Button type="submit" className="wl-button wl-primary" disabled={busy.value}>
+          <Button
+            type="submit"
+            className="wl-button wl-primary"
+            disabled={busy.value}
+            data-agent-confirm={changeSummary(d, s.config)}
+          >
             {busy.value && busyAction.value !== 'purge' ? 'Saving…' : 'Save settings'}
           </Button>
         </footer>
       </form>
-    </Sheet>
+    </Modal>
   );
 }

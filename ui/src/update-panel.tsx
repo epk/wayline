@@ -91,6 +91,12 @@ export function UpdatePanel(props: { compact?: boolean }) {
           <Button
             className="wl-button wl-primary"
             disabled={working}
+            data-agent-confirm={
+              'Installs Wayline ' +
+              u.latest +
+              ' on the router, replacing ' +
+              (u.current || 'the installed version')
+            }
             onClick={() => void installUpdate()}
           >
             Install {u.latest}

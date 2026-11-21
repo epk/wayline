@@ -61,7 +61,7 @@ export function Header() {
             >
               <Badge tone={c.tone as Tone}>{c.label}</Badge>
               <span className="wl-chip-text">
-                <span className="wl-sr">{toneLabel[c.tone]}: </span>
+                <span className="wl-sr">: {toneLabel[c.tone]}, </span>
                 {c.text}
               </span>
             </Button>

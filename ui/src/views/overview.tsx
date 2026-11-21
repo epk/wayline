@@ -216,6 +216,7 @@ function Enable(props: { text: string; label: string; onClick: () => void }) {
       <Button
         className="wl-button wl-primary"
         disabled={!can.value.configure || busy.value}
+        data-agent-confirm={'Changes router settings: ' + props.label.toLowerCase()}
         onClick={props.onClick}
       >
         {props.label}
