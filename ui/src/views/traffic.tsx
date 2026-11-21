@@ -22,6 +22,7 @@ export function TelemetryOff(props: { title: string }) {
         <Button
           className="wl-button wl-primary"
           disabled={!can.value.configure || busy.value}
+          data-agent-confirm="Turns on router and interface telemetry sampling on the router"
           onClick={() =>
             void enableSetting(
               'telemetry',

@@ -178,6 +178,7 @@ const input = {
   router: root + 'src/views/router.tsx',
   events: root + 'src/views/events.tsx',
   settings: root + 'src/settings.tsx',
+  agent: root + 'src/agent.tsx',
 };
 
 const probe = await build({
@@ -203,15 +204,7 @@ const chartModule = /[\\/](uplot[\\/]|chart\.tsx|uplot\.css)/;
 const chunks = await build({
   ...shared,
   preserveEntrySignatures: 'allow-extension',
-  input: {
-    core: root + 'src/core.tsx',
-    paths: root + 'src/views/paths.tsx',
-    wifi: root + 'src/views/wifi.tsx',
-    traffic: root + 'src/views/traffic.tsx',
-    router: root + 'src/views/router.tsx',
-    events: root + 'src/views/events.tsx',
-    settings: root + 'src/settings.tsx',
-  },
+  input,
   plugins: [css, geoStub],
   output: {
     dir: chunkDir,

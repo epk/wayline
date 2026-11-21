@@ -102,6 +102,7 @@ export function WifiView() {
           <Button
             className="wl-button wl-primary"
             disabled={!can.value.configure || busy.value}
+            data-agent-confirm="Turns on upstream Wi-Fi sampling on the router"
             onClick={() =>
               void enableSetting(
                 'upstreamWifi',

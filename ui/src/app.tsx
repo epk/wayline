@@ -13,7 +13,7 @@ import {
   type ReactNode,
 } from 'react';
 import { Header } from './header.tsx';
-import { loadChunk, prefetch, type ChunkName } from './runtime.ts';
+import { loadChunk, prefetch, startAgentBridge, type ChunkName } from './runtime.ts';
 import { useStore } from './signal.ts';
 import {
   bundleVersion,
@@ -208,6 +208,10 @@ function Dashboard() {
   useStore();
   const probe = useRef<HTMLSpanElement>(null);
   useEffect(prefetch, []);
+  useEffect(() => {
+    const host = probe.current?.closest('.wl');
+    return host ? startAgentBridge(host) : undefined;
+  }, []);
   const current = view.value;
   const shown = ready.value;
   useEffect(() => {
