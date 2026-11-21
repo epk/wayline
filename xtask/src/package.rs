@@ -199,6 +199,7 @@ pub fn build(version: &str) -> Result<()> {
         views.join("gl-sdk4-ui-wayline.common.js.gz"),
         gzip.finish()?,
     )?;
+    install_chunks(Path::new("ui/views/wayline"), &views.join("wayline"))?;
     let metadata = root.join("usr/share/wayline");
     fs::create_dir_all(&metadata)?;
     fs::write(metadata.join("version"), format!("{version}\n"))?;
@@ -365,13 +366,62 @@ fn licenses(version: &str) -> Result<()> {
             &["LICENSE", "COPYING", "NOTICE"],
         )?;
     }
-    for name in ["vue-style-loader", "css-loader", "uplot"] {
-        copy_licenses(
-            &Path::new("ui/node_modules").join(name),
-            &output.join(name),
-            &["LICENSE"],
-        )?;
+    for name in UI_PACKAGES {
+        let direct = Path::new("ui/node_modules").join(name);
+        let source = if direct.exists() {
+            direct
+        } else {
+            Path::new("ui/node_modules/.pnpm/node_modules").join(name)
+        };
+        copy_licenses(&source, &output.join(name), &["LICENSE"])?;
+        ensure!(
+            fs::read_dir(output.join(name))?.next().is_some(),
+            "No license file found for {name}."
+        );
     }
+    Ok(())
+}
+
+const UI_PACKAGES: [&str; 9] = [
+    "react",
+    "react-dom",
+    "scheduler",
+    "@ui-sdk/core",
+    "@ui-sdk/react",
+    "@uwdata/flechette",
+    "@uwdata/wk-geojson",
+    "fzstd",
+    "uplot",
+];
+
+fn install_chunks(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    let mut core = false;
+    for item in
+        fs::read_dir(source).context("Build the page first: ui/views/wayline is missing.")?
+    {
+        let path = item?.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Invalid page chunk name.")?
+            .to_owned();
+        if Path::new(&name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("zst"))
+        {
+            core |= name.starts_with("core-");
+            fs::copy(&path, destination.join(&name))?;
+        } else if Path::new(&name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("js"))
+        {
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::best());
+            gzip.write_all(&fs::read(&path)?)?;
+            fs::write(destination.join(format!("{name}.gz")), gzip.finish()?)?;
+        }
+    }
+    ensure!(core, "The page build has no core chunk.");
     Ok(())
 }
 

@@ -27,6 +27,34 @@ fn warn(warnings: &mut usize, label: &str, detail: &str) {
     println!("[WARN] {label}: {detail}");
 }
 
+fn chunks(path: &str) -> usize {
+    fs::read_dir(path).map_or(0, |items| {
+        items
+            .filter_map(std::result::Result::ok)
+            .filter(|item| item.file_name().to_string_lossy().ends_with(".zst"))
+            .count()
+    })
+}
+
+fn installed() -> bool {
+    let mut ok = true;
+    for path in FILES {
+        ok &= show(Path::new(path).exists(), path, &size(path));
+    }
+    let chunks = chunks("/www/views/wayline");
+    ok &= show(
+        chunks > 0,
+        "/www/views/wayline",
+        &format!("{chunks} page chunks"),
+    );
+    ok &= show(
+        Path::new("/etc/rc.d/S95wayline").exists(),
+        "startup entry",
+        "/etc/rc.d/S95wayline",
+    );
+    ok
+}
+
 fn size(path: &str) -> String {
     fs::metadata(path).map_or_else(|_| "missing".into(), |meta| format!("{} bytes", meta.len()))
 }
@@ -235,14 +263,7 @@ pub fn run() -> bool {
         "firmware support",
         &format!("{level}. {}", compat.message),
     );
-    for path in FILES {
-        healthy &= show(Path::new(path).exists(), path, &size(path));
-    }
-    healthy &= show(
-        Path::new("/etc/rc.d/S95wayline").exists(),
-        "startup entry",
-        "/etc/rc.d/S95wayline",
-    );
+    healthy &= installed();
     let settings = Settings::read();
     healthy &= show(
         settings.is_ok(),
