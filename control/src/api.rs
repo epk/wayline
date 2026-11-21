@@ -4,7 +4,7 @@ use crate::runtime;
 use crate::runtime::SETTINGS;
 use crate::service;
 use crate::settings::{self, Settings, Target};
-use crate::{auto, changes, egress, history, native, update, wifi};
+use crate::{auto, changes, clock, egress, history, native, telemetry, update, wifi};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::thread;
 use std::time::Duration;
-use wayline_protocol::{Series, State as Measurement, WifiStatus};
+use wayline_protocol::{Series, State as Measurement, TelemetryStatus, WifiStatus};
 
 const RECENT: usize = 8;
 const MAX_RECENT_LOSS: usize = 2;
@@ -41,6 +41,25 @@ pub struct State {
     monitoring_issue: Option<String>,
     update: update::Status,
     wifi: wifi::View,
+    telemetry: telemetry::View,
+    probe: Probe,
+    incidents: Vec<history::Incident>,
+    clock: ClockView,
+    device: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClockView {
+    synced: bool,
+    source: Option<clock::Source>,
+    pending: bool,
+}
+
+#[derive(Serialize)]
+struct Probe {
+    interval: u32,
+    timeout: u64,
 }
 
 #[derive(Serialize)]
@@ -68,6 +87,9 @@ struct UplinkView {
     active: bool,
     state: Option<Measurement>,
     median: Option<f64>,
+    jitter: Option<f64>,
+    samples: usize,
+    lost: usize,
 }
 
 #[derive(Serialize)]
@@ -115,6 +137,7 @@ pub struct Tunnel {
     measurement_state: Option<Measurement>,
     age: String,
     pub median: Option<f64>,
+    jitter: Option<f64>,
     samples: usize,
     lost: usize,
 }
@@ -149,6 +172,8 @@ struct Discovery {
     inventory: Inventory,
     snapshot: Vec<Series>,
     wifi: Option<WifiStatus>,
+    telemetry: Option<TelemetryStatus>,
+    clock: Option<clock::Clock>,
     native: Result<native::List>,
     compat: native::Compat,
 }
@@ -164,7 +189,28 @@ impl Discovery {
         };
         let inventory = router::inventory_with(endpoints)?;
         router::normalize(&mut config, &inventory);
-        let (snapshot, wifi) = runtime::current();
+        let runtime::Parts {
+            series: snapshot,
+            wifi,
+            telemetry,
+            boot_id,
+            boot_ms,
+            wall_ms,
+        } = runtime::current();
+        let reachable = snapshot
+            .iter()
+            .any(|series| series.state.live() && series.received > 0);
+        let clock = (!boot_id.is_empty())
+            .then(|| {
+                clock::observe(&clock::Observation {
+                    boot: &boot_id,
+                    boot_ms,
+                    wall_ms,
+                    reachable,
+                })
+                .ok()
+            })
+            .flatten();
         let native = native::List::read();
         if compat.level == native::Level::Full && native.is_err() {
             compat.monitoring_only();
@@ -175,6 +221,8 @@ impl Discovery {
             inventory,
             snapshot,
             wifi,
+            telemetry,
+            clock,
             native,
             compat,
         })
@@ -254,6 +302,9 @@ impl Discovery {
                         .map_or_else(|| "unknown".into(), |age| format!("{}s", age / 1000)),
                     median: item
                         .and_then(|item| item.median_us)
+                        .map(runtime::milliseconds),
+                    jitter: item
+                        .and_then(|item| item.jitter_us)
                         .map(runtime::milliseconds),
                     samples: item.map_or(0, |item| item.history.len()),
                     lost: item.map_or(0, Series::lost),
@@ -404,9 +455,63 @@ fn uplink_views(config: &Settings, inventory: &Inventory, snapshot: &[Series]) -
                 median: item
                     .and_then(|item| item.median_us)
                     .map(runtime::milliseconds),
+                jitter: item
+                    .and_then(|item| item.jitter_us)
+                    .map(runtime::milliseconds),
+                samples: item.map_or(0, |item| item.history.len()),
+                lost: item.map_or(0, Series::lost),
             }
         })
         .collect()
+}
+
+const INCIDENT_WINDOW: u64 = 6 * 3_600_000;
+
+fn incidents(
+    config: &Settings,
+    inventory: &Inventory,
+    snapshot: &[Series],
+    wifi: Option<&WifiStatus>,
+) -> Vec<history::Incident> {
+    let names: BTreeMap<String, (String, String, String)> =
+        crate::dimensions::current(config, inventory)
+            .into_iter()
+            .filter(|item| item.table == history::LATENCY.name || item.table == wifi::KIND.name)
+            .map(|item| {
+                let detail = match (item.kind.as_str(), &item.target) {
+                    ("wifi", _) => "The repeater was not connected".to_owned(),
+                    ("endpoint", _) => "Every probe to the VPN server was lost".to_owned(),
+                    (_, Some(target)) => format!("Every probe to {target} was lost"),
+                    (_, None) => "Every probe was lost".to_owned(),
+                };
+                let key = if item.table == wifi::KIND.name {
+                    "wifi".to_owned()
+                } else {
+                    item.series
+                };
+                (key, (item.subject, item.name, detail))
+            })
+            .collect();
+    let buckets = wifi.map(|wifi| wifi.buckets.as_slice()).unwrap_or_default();
+    let since = (runtime::now() * 1_000).saturating_sub(INCIDENT_WINDOW);
+    let mut found: Vec<history::Incident> = history::logged_incidents(config, snapshot, buckets)
+        .into_iter()
+        .filter(|logged| logged.end.is_none_or(|end| end >= since))
+        .filter_map(|logged| {
+            let (subject, name, detail) = names.get(&logged.series)?.clone();
+            Some(history::Incident {
+                subject,
+                name,
+                kind: logged.kind,
+                start: logged.start,
+                end: logged.end,
+                detail,
+            })
+        })
+        .collect();
+    found.sort_by_key(|incident| std::cmp::Reverse(incident.start));
+    found.truncate(50);
+    found
 }
 
 fn wan_view(inventory: &Inventory) -> WanView {
@@ -454,6 +559,18 @@ fn unsupported(compat: native::Compat) -> State {
         monitoring_issue: None,
         update: update::view(),
         wifi: wifi::disabled(),
+        telemetry: telemetry::disabled(),
+        probe: Probe {
+            interval: 0,
+            timeout: 0,
+        },
+        incidents: Vec::new(),
+        clock: ClockView {
+            synced: true,
+            source: None,
+            pending: false,
+        },
+        device: crate::identity::device(),
     }
 }
 
@@ -471,6 +588,8 @@ pub fn state() -> Result<State> {
         inventory,
         snapshot,
         wifi,
+        telemetry,
+        clock,
         compat,
         ..
     } = discovery;
@@ -521,7 +640,19 @@ pub fn state() -> Result<State> {
             reason: compat.message.clone(),
         },
         compat,
+        incidents: incidents(&config, &inventory, &snapshot, wifi.as_ref()),
         wifi: wifi::view(&config, Some(&inventory), wifi),
+        telemetry: telemetry::view(&config, telemetry),
+        clock: ClockView {
+            synced: clock.as_ref().is_none_or(|clock| clock.synced),
+            source: clock.as_ref().and_then(|clock| clock.source),
+            pending: history::pending(&config),
+        },
+        device: crate::identity::device(),
+        probe: Probe {
+            interval: config.interval,
+            timeout: 2_000,
+        },
         config,
         update: update::view(),
     };
@@ -552,6 +683,14 @@ pub fn history(query: &history::Query) -> Result<history::Response> {
 
 pub fn wifi_history(query: &wifi::Query) -> Result<wifi::Response> {
     wifi::query(&Settings::read()?, query)
+}
+
+pub fn telemetry_history(query: &telemetry::Query) -> Result<telemetry::Response> {
+    telemetry::query(
+        &Settings::read()?,
+        &router::inventory_with(router::Endpoints::Omit)?,
+        query,
+    )
 }
 
 #[derive(Deserialize)]

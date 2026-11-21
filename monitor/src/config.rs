@@ -39,7 +39,9 @@ pub fn read(path: &Path) -> Result<Config, Box<dyn Error>> {
         return Err("configuration exceeds 32 KiB".into());
     }
     let config: Config = serde_json::from_slice(&bytes)?;
-    if (config.tunnels.is_empty() && config.wifi.is_none()) || config.tunnels.len() > MAX_SERIES {
+    if (config.tunnels.is_empty() && config.wifi.is_none() && config.telemetry.is_none())
+        || config.tunnels.len() > MAX_SERIES
+    {
         return Err(format!("configure between one and {MAX_SERIES} measurement series").into());
     }
     if config
@@ -48,6 +50,24 @@ pub fn read(path: &Path) -> Result<Config, Box<dyn Error>> {
         .is_some_and(|wifi| !(1_000..=60_000).contains(&wifi.interval_ms))
     {
         return Err("the Wi-Fi interval must be 1000..60000 ms".into());
+    }
+    if let Some(telemetry) = &config.telemetry {
+        let mut seen = std::collections::HashSet::new();
+        if !(1_000..=60_000).contains(&telemetry.interval_ms)
+            || telemetry.interfaces.len() > 32
+            || !telemetry.interfaces.iter().all(|counter| {
+                valid_path_id(&counter.id)
+                    && valid_name(&counter.device, 15)
+                    && counter.device != "lo"
+                    && !counter.name.is_empty()
+                    && counter.name.len() <= 80
+                    && !counter.name.chars().any(char::is_control)
+                    && ["uplink", "tunnel", "wifi"].contains(&counter.kind.as_str())
+                    && seen.insert(counter.id.as_str())
+            })
+        {
+            return Err("invalid telemetry interval or interface list".into());
+        }
     }
     if !(1_000..=300_000).contains(&config.interval_ms)
         || !(50..=5_000).contains(&config.timeout_ms)

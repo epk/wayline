@@ -1,0 +1,5 @@
+#!/bin/sh
+[ "$ACTION" = stratum ] || exit 0
+[ "${stratum:-16}" != 16 ] || exit 0
+mkdir -p /var/run/wayline
+cat /proc/sys/kernel/random/boot_id >/var/run/wayline/clock-synced

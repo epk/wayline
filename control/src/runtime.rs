@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use wayline_protocol::{MAX_STATUS, Series, Status, WifiStatus};
+use wayline_protocol::{MAX_STATUS, Series, Status, TelemetryStatus, WifiStatus};
 
 pub const RUNTIME: &str = "/var/run/wayline";
 pub const MONITOR_CONFIG: &str = "/var/run/wayline/monitor.json";
@@ -73,19 +73,33 @@ fn private(path: &Path, owner: u32) -> Result<()> {
     Ok(())
 }
 
-pub fn current() -> (Vec<Series>, Option<WifiStatus>) {
+#[derive(Default)]
+pub struct Parts {
+    pub series: Vec<Series>,
+    pub wifi: Option<WifiStatus>,
+    pub telemetry: Option<TelemetryStatus>,
+    pub boot_id: String,
+    pub boot_ms: u64,
+    pub wall_ms: u64,
+}
+
+pub fn current() -> Parts {
     parts(full(Path::new(STATUS_SOCKET), ""))
 }
 
-pub fn ring() -> (Vec<Series>, Option<WifiStatus>) {
+pub fn ring() -> Parts {
     parts(full(Path::new(STATUS_SOCKET), "since=0"))
 }
 
-fn parts(status: Option<Status>) -> (Vec<Series>, Option<WifiStatus>) {
-    status.map_or_else(
-        || (Vec::new(), None),
-        |status| (status.tunnels, status.wifi),
-    )
+fn parts(status: Option<Status>) -> Parts {
+    status.map_or_else(Parts::default, |status| Parts {
+        series: status.tunnels,
+        wifi: status.wifi,
+        telemetry: status.telemetry,
+        boot_id: status.boot_id,
+        boot_ms: status.boot_ms,
+        wall_ms: status.wall_ms,
+    })
 }
 
 fn full(socket: &Path, request: &str) -> Option<Status> {
@@ -96,7 +110,7 @@ fn full(socket: &Path, request: &str) -> Option<Status> {
 
 #[cfg(test)]
 fn status(socket: &Path, request: &str) -> Vec<Series> {
-    parts(full(socket, request)).0
+    parts(full(socket, request)).series
 }
 
 fn fetch(socket: &Path, request: &str) -> Result<Vec<u8>> {

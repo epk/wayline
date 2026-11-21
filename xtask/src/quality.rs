@@ -9,10 +9,11 @@ const LUA: [&str; 2] = [
     "package/files/usr/share/gl-validator.d/wayline.lua",
 ];
 const NIX: [&str; 3] = ["devenv.nix", "nix/bootstrap.nix", "nix/usign.nix"];
-const SHELL_SCRIPTS: [&str; 4] = [
+const SHELL_SCRIPTS: [&str; 5] = [
     "package/postinst",
     "package/prerm",
     "package/files/etc/hotplug.d/iface/95-wayline",
+    "package/files/etc/hotplug.d/ntp/95-wayline",
     "install.sh",
 ];
 
@@ -40,7 +41,7 @@ pub fn test() -> Result<()> {
     let sh = Shell::new()?;
     cmd!(
         sh,
-        "cargo test --locked --offline --package wayline-control --package waylined --package xtask"
+        "cargo test --locked --offline --package wayline-control --package waylined --package wayline-protocol --package xtask"
     )
     .run()?;
     Ok(())

@@ -16,6 +16,8 @@ const MAX_EVENTS: usize = 100;
 #[derive(Serialize, Deserialize)]
 pub struct Event {
     pub at: u64,
+    #[serde(default)]
+    pub seq: u64,
     pub subject: String,
     pub kind: String,
     pub text: String,
@@ -29,8 +31,7 @@ pub struct Fact<'subject> {
 }
 
 pub fn read(config: &Settings) -> Vec<Event> {
-    let mut events: Vec<Event> =
-        runtime::load(history::database(config).with_file_name("events.json"));
+    let mut events: Vec<Event> = runtime::load(history::root(config).join("events.json"));
     for event in &mut events {
         if event.kind == "server" {
             event.text =
@@ -140,6 +141,7 @@ pub fn diff(at: u64, stored: &mut BTreeMap<String, String>, facts: &[Fact]) -> (
                         let old = before.get(*field).filter(|old| *old != after)?;
                         Some(Event {
                             at,
+                            seq: 0,
                             subject: fact.subject.into(),
                             kind: (*field).into(),
                             text: describe(fact.label, field, old, after),
@@ -167,8 +169,8 @@ pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
 }
 
 fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
-    let database = history::database(config);
-    let facts_path = database.with_file_name("facts.json");
+    let root = history::root(config);
+    let facts_path = root.join("facts.json");
     runtime::directory(facts_path.parent().context("Invalid history directory.")?)?;
     let mut stored: BTreeMap<String, String> = runtime::load(&facts_path);
     let cache = Cache::view(config, inventory);
@@ -189,7 +191,7 @@ fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
         ))
     }));
     if config.upstream_wifi
-        && let (_, Some(status)) = runtime::current()
+        && let Some(status) = runtime::current().wifi
         && let Some(link) = status.link
     {
         let network = if link.ssid.is_empty() {
@@ -213,15 +215,40 @@ fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
         runtime::store(&facts_path, &stored)?;
     }
     if !added.is_empty() {
-        append(&database, added)?;
+        append(&root, added)?;
     }
     Ok(())
 }
 
-pub fn append(database: &Path, added: impl IntoIterator<Item = Event>) -> Result<()> {
-    let path = database.with_file_name("events.json");
+#[cfg(not(test))]
+fn sequence_path(_: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/wayline/sequence.json")
+}
+
+#[cfg(test)]
+fn sequence_path(root: &Path) -> std::path::PathBuf {
+    root.join("sequence.json")
+}
+
+pub fn append(root: &Path, added: impl IntoIterator<Item = Event>) -> Result<()> {
+    let path = root.join("events.json");
     let mut events: Vec<Event> = runtime::load(&path);
-    events.extend(added);
+    let counter = sequence_path(root);
+    let last: u64 =
+        runtime::load::<u64>(&counter).max(events.iter().map(|event| event.seq).max().unwrap_or(0));
+    let mut next = last;
+    events.extend(added.into_iter().map(|mut event| {
+        next += 1;
+        event.seq = next;
+        event
+    }));
+    if next == last {
+        return Ok(());
+    }
+    if let Some(parent) = counter.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    runtime::store(&counter, &next)?;
     let excess = events.len().saturating_sub(MAX_EVENTS);
     events.drain(..excess);
     runtime::store(&path, &events)
@@ -316,6 +343,27 @@ mod tests {
         ensure!(
             events.len() == 1
                 && events[0].text == "Upstream Wi-Fi network changed from Hotel to Cafe."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn appended_events_get_increasing_sequence_numbers() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let event = |text: &str| super::Event {
+            at: 1,
+            seq: 0,
+            subject: "a".into(),
+            kind: "k".into(),
+            text: text.into(),
+        };
+        super::append(directory.path(), [event("one"), event("two")])?;
+        std::fs::remove_file(directory.path().join("events.json"))?;
+        super::append(directory.path(), [event("three")])?;
+        let events: Vec<super::Event> = crate::runtime::load(directory.path().join("events.json"));
+        ensure!(
+            events.len() == 1 && events[0].seq == 3,
+            "Sequence restarted after a purge."
         );
         Ok(())
     }

@@ -1,37 +1,43 @@
 use crate::changes::{self, Event};
+use crate::columnar::{self, Entry};
 use crate::router;
 use crate::router::Inventory;
 use crate::runtime;
 use crate::runtime::RUNTIME;
 use crate::settings::{Settings, Target};
-use crate::wifi;
-use anyhow::{Context, Error, Result, ensure};
-use rusqlite::types::{FromSql, ToSql};
-use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
+use crate::{clock, encoding, telemetry, wifi};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
-use wayline_protocol::{BUCKET_SECONDS, MAX_SERIES, Series, WifiBucket};
+use wayline_protocol::schema::{RTT_BINS, RTT_EDGES_US, RTT_FIRST};
+use wayline_protocol::{BUCKET_SECONDS, MAX_SERIES, Series, TelemetryStatus, WifiBucket};
 
 pub const HOUR: u64 = 3_600;
 const DAY: u64 = 86_400;
 const MINUTE_MS: u64 = 60_000;
 pub const MIN_CLOCK: u64 = 1_704_067_200;
 const MAX_POINTS: u64 = 2_500;
-const MEMORY_PAGES: u64 = 1_024;
-const PAGES: u64 = 8_192;
-pub const PAGE_BYTES: u64 = 4_096;
-const VERSION: u32 = 4;
-const COLUMNS: &str = "min_us,median_us,max_us,sent,lost";
-const DAMAGED: &str = "The history database was damaged and was reset.";
 pub const LEVELS: [(u64, &str); 4] = [
     (BUCKET_SECONDS, "s15"),
     (60, "s1m"),
     (300, "s5m"),
     (3_600, "s1h"),
 ];
+const LEGACY: [&str; 9] = [
+    "latency.sqlite",
+    "latency.sqlite-journal",
+    "latency.sqlite-wal",
+    "latency.sqlite-shm",
+    "latency.sqlite.broken",
+    "telemetry.sqlite",
+    "telemetry.sqlite-journal",
+    "telemetry.sqlite.broken",
+    "series.json",
+];
+
+pub use wayline_protocol::schema::LATENCY;
 
 #[derive(Deserialize)]
 #[expect(
@@ -57,25 +63,230 @@ pub struct Query {
 
 #[derive(Serialize)]
 pub struct Response {
+    start: u64,
+    step: u64,
+    count: usize,
     series: Vec<Line>,
     events: Vec<Event>,
+    incidents: Vec<Incident>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Incident {
+    pub subject: String,
+    pub name: String,
+    pub kind: String,
+    pub start: u64,
+    pub end: Option<u64>,
+    pub detail: String,
 }
 
 #[derive(Serialize)]
 struct Line {
     id: String,
     name: String,
+    median: Vec<Option<u32>>,
+    min: Vec<Option<u32>>,
+    max: Vec<Option<u32>>,
+    jitter: Vec<Option<u32>>,
+    p50: Vec<Option<u32>>,
+    p95: Vec<Option<u32>>,
+    p99: Vec<Option<u32>>,
+    sent: Vec<u32>,
+    lost: Vec<u32>,
+}
+
+struct Track {
+    id: String,
+    name: String,
     points: Vec<Point>,
 }
 
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Copy, Default)]
 struct Point {
-    at: u64,
-    median: Option<f64>,
-    min: Option<f64>,
-    max: Option<f64>,
+    median: Option<u32>,
+    min: Option<u32>,
+    max: Option<u32>,
     sent: u32,
     lost: u32,
+    jitter_sum: u64,
+    jitter_n: u32,
+    rtt: [u64; RTT_BINS],
+}
+
+pub fn percentile(
+    rtt: &[u64; RTT_BINS],
+    permille: u64,
+    min: Option<u32>,
+    max: Option<u32>,
+) -> Option<u32> {
+    let total: u64 = rtt.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let rank = (total * permille).div_ceil(1_000).max(1);
+    let mut before = 0;
+    for (bin, count) in rtt.iter().enumerate() {
+        if *count == 0 || before + count < rank {
+            before += count;
+            continue;
+        }
+        let low = bin
+            .checked_sub(1)
+            .map_or(0, |edge| u64::from(RTT_EDGES_US[edge]));
+        let high = RTT_EDGES_US
+            .get(bin)
+            .map(|edge| u64::from(*edge))
+            .or_else(|| max.map(u64::from))
+            .unwrap_or(low);
+        let low = min.map_or(low, |min| low.max(u64::from(min)).min(high));
+        let high = max.map_or(high, |max| high.min(u64::from(max)).max(low));
+        let value = low + (high - low) * (2 * (rank - before) - 1) / (2 * count);
+        return u32::try_from(value).ok();
+    }
+    None
+}
+
+impl Point {
+    fn percentile(&self, permille: u64) -> Option<u32> {
+        percentile(&self.rtt, permille, self.min, self.max)
+    }
+
+    fn jitter(&self) -> Option<u32> {
+        (self.jitter_n > 0)
+            .then(|| u32::try_from(self.jitter_sum / u64::from(self.jitter_n)).unwrap_or(u32::MAX))
+    }
+
+    const fn down(&self) -> bool {
+        self.sent > 0 && self.lost == self.sent
+    }
+}
+
+impl From<Track> for Line {
+    fn from(track: Track) -> Self {
+        let column = |read: fn(&Point) -> Option<u32>| track.points.iter().map(read).collect();
+        Self {
+            median: column(|point| point.median),
+            min: column(|point| point.min),
+            max: column(|point| point.max),
+            jitter: column(Point::jitter),
+            p50: track
+                .points
+                .iter()
+                .map(|point| point.percentile(500))
+                .collect(),
+            p95: track
+                .points
+                .iter()
+                .map(|point| point.percentile(950))
+                .collect(),
+            p99: track
+                .points
+                .iter()
+                .map(|point| point.percentile(990))
+                .collect(),
+            sent: track.points.iter().map(|point| point.sent).collect(),
+            lost: track.points.iter().map(|point| point.lost).collect(),
+            id: track.id,
+            name: track.name,
+        }
+    }
+}
+
+impl encoding::Document for Response {
+    fn frame(&self) -> Result<encoding::Frame> {
+        let mut meta = serde_json::Map::new();
+        meta.insert("start".into(), self.start.into());
+        meta.insert("step".into(), self.step.into());
+        meta.insert("count".into(), self.count.into());
+        meta.insert(
+            "series".into(),
+            self.series
+                .iter()
+                .map(|line| serde_json::json!({"id": line.id, "name": line.name}))
+                .collect(),
+        );
+        meta.insert("events".into(), serde_json::to_value(&self.events)?);
+        meta.insert("incidents".into(), serde_json::to_value(&self.incidents)?);
+        let micros = |values: &[Option<u32>]| {
+            encoding::Column::I32(
+                values
+                    .iter()
+                    .map(|value| value.and_then(|value| i32::try_from(value).ok()))
+                    .collect(),
+            )
+        };
+        let columns = self
+            .series
+            .iter()
+            .enumerate()
+            .flat_map(|(index, line)| {
+                [
+                    (format!("{index}.median"), micros(&line.median)),
+                    (format!("{index}.min"), micros(&line.min)),
+                    (format!("{index}.max"), micros(&line.max)),
+                    (format!("{index}.jitter"), micros(&line.jitter)),
+                    (format!("{index}.p50"), micros(&line.p50)),
+                    (format!("{index}.p95"), micros(&line.p95)),
+                    (format!("{index}.p99"), micros(&line.p99)),
+                    (
+                        format!("{index}.sent"),
+                        encoding::Column::U32(line.sent.clone()),
+                    ),
+                    (
+                        format!("{index}.lost"),
+                        encoding::Column::U32(line.lost.clone()),
+                    ),
+                ]
+            })
+            .collect();
+        Ok(encoding::Frame { meta, columns })
+    }
+}
+
+pub fn outages(
+    subject: &str,
+    name: &str,
+    detail: &str,
+    start: u64,
+    step: u64,
+    down: impl IntoIterator<Item = Option<bool>>,
+    now: u64,
+) -> Vec<Incident> {
+    let mut found: Vec<Incident> = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut last_end = start;
+    for (index, state) in down.into_iter().enumerate() {
+        let at = start + u64::try_from(index).unwrap_or(u64::MAX) * step * 1_000;
+        let end = at + step * 1_000;
+        match state {
+            Some(true) => {
+                if open.is_none() {
+                    found.push(Incident {
+                        subject: subject.into(),
+                        name: name.into(),
+                        kind: "loss".into(),
+                        start: at,
+                        end: None,
+                        detail: detail.into(),
+                    });
+                    open = Some(found.len() - 1);
+                }
+                last_end = end;
+            }
+            Some(false) | None => {
+                if let Some(index) = open.take() {
+                    found[index].end = Some(last_end);
+                }
+            }
+        }
+    }
+    if let Some(index) = open
+        && last_end + 2 * step * 1_000 < now
+    {
+        found[index].end = Some(last_end);
+    }
+    found
 }
 
 #[derive(Serialize)]
@@ -104,11 +315,11 @@ struct Subject {
     identity: String,
 }
 
-pub fn database(config: &Settings) -> PathBuf {
+pub fn root(config: &Settings) -> PathBuf {
     if config.history_days == 0 {
-        Path::new(RUNTIME).join("history/latency.sqlite")
+        Path::new(RUNTIME).join("history")
     } else {
-        PathBuf::from("/etc/wayline/history/latency.sqlite")
+        PathBuf::from("/etc/wayline/history")
     }
 }
 
@@ -131,12 +342,291 @@ fn fresh_ring() -> Result<Vec<Series>> {
 }
 
 pub fn fresh() -> Result<(Vec<Series>, Vec<WifiBucket>)> {
+    let (series, wifi, _) = fresh_all()?;
+    Ok((series, wifi))
+}
+
+pub fn fresh_all() -> Result<(Vec<Series>, Vec<WifiBucket>, Option<TelemetryStatus>)> {
+    let snapshot = snapshot()?;
+    Ok((snapshot.series, snapshot.wifi, snapshot.telemetry))
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Staged {
+    series: Vec<Series>,
+    wifi: Vec<WifiBucket>,
+    telemetry: Option<TelemetryStatus>,
+}
+
+struct Snapshot {
+    series: Vec<Series>,
+    wifi: Vec<WifiBucket>,
+    telemetry: Option<TelemetryStatus>,
+    clock: Option<clock::Clock>,
+}
+
+fn restamp_all(staged: &mut Staged, offset_ms: i64) {
+    for series in &mut staged.series {
+        clock::restamp(&mut series.buckets, offset_ms);
+    }
+    clock::restamp(&mut staged.wifi, offset_ms);
+    if let Some(telemetry) = &mut staged.telemetry {
+        clock::restamp(&mut telemetry.system_buckets, offset_ms);
+        for link in &mut telemetry.link_buckets {
+            clock::restamp(&mut link.buckets, offset_ms);
+        }
+    }
+}
+
+fn snapshot() -> Result<Snapshot> {
     let cutoff = cutoff()?;
-    let (mut samples, wifi) = runtime::ring();
-    discard_before(&mut samples, cutoff);
-    let mut buckets = wifi.map(|wifi| wifi.buckets).unwrap_or_default();
-    buckets.retain(|bucket| bucket.at > cutoff);
-    Ok((samples, buckets))
+    let parts = runtime::ring();
+    let clock = if parts.boot_id.is_empty() {
+        None
+    } else {
+        Some(clock::observe(&clock::Observation {
+            boot: &parts.boot_id,
+            boot_ms: parts.boot_ms,
+            wall_ms: parts.wall_ms,
+            reachable: parts
+                .series
+                .iter()
+                .any(|series| series.state.live() && series.received > 0),
+        })?)
+    };
+    let mut staged = Staged {
+        series: parts.series,
+        wifi: parts.wifi.map(|wifi| wifi.buckets).unwrap_or_default(),
+        telemetry: parts.telemetry,
+    };
+    if let Some(clock) = clock.as_ref().filter(|clock| clock.synced) {
+        restamp_all(&mut staged, clock.offset_ms);
+    }
+    discard_before(&mut staged.series, cutoff);
+    staged.wifi.retain(|bucket| bucket.at > cutoff);
+    if let Some(telemetry) = &mut staged.telemetry {
+        telemetry.system_buckets.retain(|bucket| bucket.at > cutoff);
+        for link in &mut telemetry.link_buckets {
+            link.buckets.retain(|bucket| bucket.at > cutoff);
+        }
+    }
+    Ok(Snapshot {
+        series: staged.series,
+        wifi: staged.wifi,
+        telemetry: staged.telemetry,
+        clock,
+    })
+}
+
+const PENDING_LIMIT: u64 = 16 * 1024 * 1024;
+const PENDING_READ: usize = 32 * 1024 * 1024;
+
+#[derive(Default, Serialize, Deserialize)]
+struct Cursor {
+    boot: String,
+    uptime_ms: u64,
+}
+
+fn pending_dir(root: &Path) -> PathBuf {
+    root.join("pending")
+}
+
+pub fn pending(config: &Settings) -> bool {
+    fs::read_dir(pending_dir(&root(config)))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "ndjson")
+        })
+}
+
+fn stage(root: &Path, boot: &str, snapshot: &Snapshot) -> Result<()> {
+    use std::io::Write as _;
+    let cursor_path = pending_dir(root).join("cursor.json");
+    let cursor: Cursor = runtime::load(&cursor_path);
+    let after = if cursor.boot == boot {
+        cursor.uptime_ms
+    } else {
+        0
+    };
+    let newer = |uptime: u64| uptime > after;
+    fs::create_dir_all(pending_dir(root))?;
+    let staged = Staged {
+        series: snapshot
+            .series
+            .iter()
+            .map(|series| Series {
+                buckets: series
+                    .buckets
+                    .iter()
+                    .filter(|bucket| newer(bucket.uptime_ms))
+                    .copied()
+                    .collect(),
+                history: Vec::new(),
+                ..series.clone()
+            })
+            .filter(|series| !series.buckets.is_empty())
+            .collect(),
+        wifi: snapshot
+            .wifi
+            .iter()
+            .filter(|bucket| newer(bucket.uptime_ms))
+            .copied()
+            .collect(),
+        telemetry: snapshot
+            .telemetry
+            .as_ref()
+            .map(|telemetry| TelemetryStatus {
+                system_buckets: telemetry
+                    .system_buckets
+                    .iter()
+                    .filter(|bucket| newer(bucket.uptime_ms))
+                    .copied()
+                    .collect(),
+                link_buckets: telemetry
+                    .link_buckets
+                    .iter()
+                    .map(|link| wayline_protocol::LinkHistory {
+                        id: link.id.clone(),
+                        buckets: link
+                            .buckets
+                            .iter()
+                            .filter(|bucket| newer(bucket.uptime_ms))
+                            .copied()
+                            .collect(),
+                    })
+                    .collect(),
+                ..TelemetryStatus::default()
+            }),
+    };
+    let latest = staged
+        .series
+        .iter()
+        .flat_map(|series| series.buckets.iter().map(|bucket| bucket.uptime_ms))
+        .chain(staged.wifi.iter().map(|bucket| bucket.uptime_ms))
+        .chain(staged.telemetry.iter().flat_map(|telemetry| {
+            telemetry
+                .system_buckets
+                .iter()
+                .map(|bucket| bucket.uptime_ms)
+                .chain(
+                    telemetry
+                        .link_buckets
+                        .iter()
+                        .flat_map(|link| link.buckets.iter().map(|bucket| bucket.uptime_ms)),
+                )
+        }))
+        .max();
+    let Some(latest) = latest else {
+        return Ok(());
+    };
+    let directory = pending_dir(root);
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{boot}.ndjson"));
+    if fs::metadata(&path).is_ok_and(|meta| meta.len() > PENDING_LIMIT) {
+        return Ok(());
+    }
+    let mut line = serde_json::to_vec(&staged)?;
+    line.push(b'\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    file.write_all(&line)?;
+    file.sync_all()?;
+    runtime::store(
+        &cursor_path,
+        &Cursor {
+            boot: boot.to_owned(),
+            uptime_ms: latest,
+        },
+    )
+}
+
+fn flush_pending(root: &Path, days: u32, now: u64, clock: Option<&clock::Clock>) -> Result<()> {
+    let directory = pending_dir(root);
+    let files: Vec<PathBuf> = fs::read_dir(&directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "ndjson")
+        })
+        .collect();
+    for path in files {
+        let boot = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let text =
+            String::from_utf8_lossy(&wayline_support::read(&path, PENDING_READ)?).into_owned();
+        let mut staged = Staged::default();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let Ok(part) = serde_json::from_str::<Staged>(line) else {
+                continue;
+            };
+            staged.series.extend(part.series);
+            staged.wifi.extend(part.wifi);
+            if let Some(telemetry) = part.telemetry {
+                let target = staged
+                    .telemetry
+                    .get_or_insert_with(TelemetryStatus::default);
+                target.system_buckets.extend(telemetry.system_buckets);
+                for link in telemetry.link_buckets {
+                    match target
+                        .link_buckets
+                        .iter_mut()
+                        .find(|known| known.id == link.id)
+                    {
+                        Some(known) => known.buckets.extend(link.buckets),
+                        None => target.link_buckets.push(link),
+                    }
+                }
+            }
+        }
+        match clock.filter(|clock| clock.boot == boot) {
+            Some(clock) => restamp_all(&mut staged, clock.offset_ms),
+            None => changes::append(
+                root,
+                [Event {
+                    at: now * 1_000,
+                    seq: 0,
+                    subject: "history".into(),
+                    kind: "clock".into(),
+                    text: "History from a boot that never set its clock was saved with the router's unsynchronized time.".into(),
+                }],
+            )?,
+        }
+        let series = merge_series(staged.series);
+        persist(
+            root,
+            days,
+            now,
+            &series,
+            &staged.wifi,
+            staged.telemetry.as_ref(),
+        )?;
+        fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
+fn merge_series(items: Vec<Series>) -> Vec<Series> {
+    let mut merged: Vec<Series> = Vec::new();
+    for item in items {
+        match merged.iter_mut().find(|known| known.id == item.id) {
+            Some(known) => known.buckets.extend(item.buckets),
+            None => merged.push(item),
+        }
+    }
+    merged
 }
 
 fn discard_before(samples: &mut [Series], cutoff: u64) {
@@ -161,19 +651,35 @@ pub fn purge() -> Result<()> {
             runtime::now().to_string().as_bytes(),
         )?;
         for root in roots {
-            for name in [
-                "latency.sqlite",
-                "latency.sqlite-journal",
-                "latency.sqlite-wal",
-                "latency.sqlite-shm",
-                "latency.sqlite.broken",
+            for directory in columnar::kinds(&root) {
+                match fs::remove_dir_all(&directory) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error).with_context(|| {
+                            format!("Cannot remove history {}.", directory.display())
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            for name in LEGACY.iter().chain(&[
                 "events.json",
                 "facts.json",
-                "wifi.sqlite",
-                "wifi.sqlite-journal",
-                "wifi.sqlite.broken",
-            ] {
+                "incidents.json",
+                "index.json",
+                "dimensions.parquet",
+            ]) {
                 remove(&root.join(name))?;
+            }
+        }
+        for root in [
+            PathBuf::from("/etc/wayline/history"),
+            Path::new(RUNTIME).join("history"),
+        ] {
+            match fs::remove_dir_all(pending_dir(&root)) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error).context("Cannot remove staged history.");
+                }
+                _ => {}
             }
         }
         remove(&known_cache())?;
@@ -218,13 +724,6 @@ pub const fn retained(days: u32, step: u64) -> u64 {
     }
 }
 
-pub fn table(step: u64) -> &'static str {
-    LEVELS
-        .iter()
-        .find(|(width, _)| *width == step)
-        .map_or(LEVELS[0].1, |level| level.1)
-}
-
 pub fn resolution(days: u32, step: u64, start: u64, end: u64, now: u64) -> Result<u64> {
     let step = if matches!(step, 1 | 5) {
         step * 60
@@ -258,285 +757,78 @@ pub fn availability(config: &Settings) -> Availability {
     }
 }
 
-fn cap(path: &Path) -> u64 {
-    if path.starts_with(RUNTIME) {
-        MEMORY_PAGES
-    } else {
-        PAGES
-    }
-}
-
-fn levels(statement: impl Fn(&str) -> String) -> String {
-    LEVELS.iter().map(|(_, table)| statement(table)).collect()
-}
-
-fn schema() -> String {
-    let tiers = levels(|table| {
-        format!(
-            "CREATE TABLE {table}(period INTEGER NOT NULL,series INTEGER NOT NULL,min_us INTEGER,median_us INTEGER,max_us INTEGER,sent INTEGER NOT NULL,lost INTEGER NOT NULL,PRIMARY KEY(period,series)) WITHOUT ROWID;"
-        )
-    });
-    format!(
-        "CREATE TABLE series(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,seen INTEGER NOT NULL);{tiers}"
-    )
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Access {
-    ReadOnly,
-    ReadWrite,
-}
-
-fn open(path: &Path, access: Access) -> Result<Connection> {
-    open_capped(path, access, cap(path))
-}
-
-pub fn open_capped(path: &Path, access: Access, pages: u64) -> Result<Connection> {
-    let connection = if access == Access::ReadOnly {
-        Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?
-    } else {
-        Connection::open(path)?
-    };
-    connection.busy_timeout(Duration::from_secs(1))?;
-    connection.pragma_update(None, "cache_size", -128)?;
-    connection.pragma_update(None, "mmap_size", 0)?;
-    connection.pragma_update(None, "temp_store", "MEMORY")?;
-    if access == Access::ReadWrite {
-        connection.pragma_update(None, "page_size", PAGE_BYTES)?;
-        connection.pragma_update(None, "max_page_count", pages)?;
-        connection.pragma_update(None, "journal_mode", "TRUNCATE")?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
-    }
-    Ok(connection)
-}
-
-pub fn pragma<T: FromSql>(path: &Path, name: &str) -> Option<T> {
-    open(path, Access::ReadOnly)
-        .ok()?
-        .pragma_query_value(None, name, |row| row.get(0))
-        .ok()
-}
-
-pub fn healthy(path: &Path) -> bool {
-    pragma::<String>(path, "quick_check").is_some_and(|status| status == "ok")
-}
-
-fn pages(path: &Path) -> u64 {
-    pragma(path, "page_count").unwrap_or_default()
-}
-
-fn convert(path: &Path) -> Result<bool> {
-    let mut connection = open(path, Access::ReadWrite)?;
-    let current: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current >= VERSION {
-        return Ok(false);
-    }
-    ensure!(
-        runtime::now() >= MIN_CLOCK,
-        "The clock is not synchronized."
-    );
-    let upgrade = current == 3;
-    let tables: u32 =
-        connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
-    if !upgrade && tables > 0 {
-        drop(connection);
-        quarantine(path, DAMAGED)?;
-        connection = open(path, Access::ReadWrite)?;
-    }
-    connection.pragma_update(None, "max_page_count", 2 * cap(path))?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if upgrade {
-        transaction.execute_batch(&format!(
-            "ALTER TABLE series RENAME TO old_series;{}",
-            levels(|table| format!("ALTER TABLE {table} RENAME TO old_{table};"))
-        ))?;
-    }
-    transaction.execute_batch(&schema())?;
-    if upgrade {
-        transaction.execute(
-            "INSERT INTO series SELECT id,name,?1 FROM old_series",
-            [runtime::now() / HOUR],
-        )?;
-        transaction.execute_batch(&format!(
-            "DROP TABLE old_series;{}DROP TABLE meta;",
-            levels(|table| format!(
-                "INSERT INTO {table}(series,period,{COLUMNS}) SELECT * FROM old_{table}; DROP TABLE old_{table};"
-            ))
-        ))?;
-    }
-    transaction.pragma_update(None, "user_version", VERSION)?;
-    transaction.commit()?;
-    if upgrade {
-        let _ = connection.execute_batch("PRAGMA temp_store=DEFAULT; VACUUM;");
-    }
-    Ok(true)
-}
-
-fn span(live: &[&Series]) -> Option<(u64, u64)> {
-    let at = live
-        .iter()
-        .flat_map(|series| &series.buckets)
-        .map(|bucket| bucket.at / BUCKET_SECONDS);
-    Some((at.clone().min()?, at.max()?))
-}
-
 pub const fn aligned((low, high): (u64, u64), ratio: u64) -> (u64, u64) {
     (low / ratio * ratio, (high / ratio + 1) * ratio - 1)
 }
 
-fn fill(connection: &Connection, live: &[&Series]) -> Result<()> {
-    connection.execute_batch(
-        "CREATE TEMP TABLE live(period INTEGER NOT NULL,series TEXT NOT NULL,min_us INTEGER,median_us INTEGER,max_us INTEGER,sent INTEGER NOT NULL,lost INTEGER NOT NULL,PRIMARY KEY(period,series)) WITHOUT ROWID;",
-    )?;
-    let mut insert =
-        connection.prepare("INSERT OR REPLACE INTO live VALUES(?1,?2,?3,?4,?5,?6,?7)")?;
-    for series in live {
-        for bucket in &series.buckets {
-            insert.execute(params![
-                bucket.at / BUCKET_SECONDS,
-                series.id,
-                bucket.min_us,
-                bucket.median_us,
-                bucket.max_us,
-                bucket.sent,
-                bucket.lost
-            ])?;
-        }
-    }
-    Ok(())
-}
-
-fn rollup(source: &str) -> String {
-    format!(
-        "SELECT p,series,min(min_us),max(CASE WHEN n=(c+1)/2 THEN median_us END),max(max_us),sum(sent),sum(lost) FROM (SELECT period/?1 AS p,series,min_us,median_us,max_us,sent,lost,row_number() OVER (w ORDER BY median_us IS NULL,median_us) AS n,count(median_us) OVER w AS c FROM {source} WHERE period BETWEEN ?2 AND ?3 WINDOW w AS (PARTITION BY series,period/?1)) GROUP BY p,series"
-    )
-}
-
-const RETIRED: &str = "SELECT o.id FROM series o WHERE o.seen<?1 OR o.id NOT IN (SELECT id FROM series ORDER BY (name IN (SELECT series FROM live)) DESC,seen DESC,id DESC LIMIT ?2)";
-
-fn append(path: &Path, days: u32, now: u64, ring: &[Series]) -> Result<BTreeSet<String>> {
-    let live: Vec<&Series> = ring
-        .iter()
+fn latency_entries(ring: &[Series]) -> Vec<Entry> {
+    ring.iter()
         .take(MAX_SERIES)
-        .filter(|series| !series.buckets.is_empty())
-        .collect();
-    let mut connection = open(path, Access::ReadWrite)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    fill(&transaction, &live)?;
-    if let Some(mut range) = span(&live) {
-        transaction.execute(
-            "INSERT INTO series(name,seen) SELECT DISTINCT series,?1 FROM live WHERE true ON CONFLICT(name) DO UPDATE SET seen=excluded.seen WHERE seen<excluded.seen",
-            [now / HOUR],
-        )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO s15 SELECT period,s.id,min_us,median_us,max_us,sent,lost FROM live l JOIN series s ON s.name=l.series",
-            [],
-        )?;
-        for pair in LEVELS.windows(2) {
-            let [(child_step, child), (step, parent)] = pair else {
-                continue;
-            };
-            if retained(days, *step) == 0 {
-                break;
-            }
-            let ratio = step / child_step;
-            let (low, high) = aligned(range, ratio);
-            transaction.execute(
-                &format!("INSERT OR REPLACE INTO {parent} {}", rollup(child)),
-                [ratio, low, high],
-            )?;
-            range = (range.0 / ratio, range.1 / ratio);
-        }
-    }
-    for (step, table) in LEVELS {
-        let kept = retained(days, step);
-        transaction.execute(
-            &format!("DELETE FROM {table} WHERE period<?1"),
-            [now.saturating_sub(kept) / step + u64::from(kept == 0)],
-        )?;
-    }
-    let longest = LEVELS
+        .flat_map(|series| {
+            series.buckets.iter().map(|bucket| Entry {
+                link: series.id.clone(),
+                at: bucket.at,
+                row: vec![
+                    bucket.min_us.map(i64::from),
+                    bucket.median_us.map(i64::from),
+                    bucket.max_us.map(i64::from),
+                    Some(i64::from(bucket.sent)),
+                    Some(i64::from(bucket.lost)),
+                    Some(i64::try_from(bucket.jitter_sum_us).unwrap_or(i64::MAX)),
+                    Some(i64::from(bucket.jitter_n)),
+                ]
+                .into_iter()
+                .chain(bucket.rtt.iter().map(|count| Some(i64::from(*count))))
+                .collect(),
+            })
+        })
+        .collect()
+}
+
+fn longest(days: u32) -> u64 {
+    LEVELS
         .iter()
         .map(|(step, _)| retained(days, *step))
         .max()
-        .unwrap_or_default();
-    let retired = (now.saturating_sub(longest) / HOUR, MAX_SERIES);
-    for (_, table) in LEVELS {
-        transaction.execute(
-            &format!("DELETE FROM {table} WHERE series IN ({RETIRED})"),
-            retired,
-        )?;
-    }
-    transaction.execute(
-        &format!("DELETE FROM series WHERE id IN ({RETIRED})"),
-        retired,
-    )?;
-    transaction.commit()?;
-    Ok(connection
-        .prepare("SELECT DISTINCT substr(name,1,48) FROM series")?
-        .query_map([], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?)
+        .unwrap_or_default()
 }
 
-pub fn quarantine(path: &Path, text: &str) -> Result<()> {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("Invalid history file.")?;
-    fs::rename(path, path.with_file_name(format!("{name}.broken")))?;
-    let _ = fs::remove_file(path.with_file_name(format!("{name}-journal")));
-    changes::append(
-        path,
-        [Event {
-            at: runtime::now() * 1000,
-            subject: "history".into(),
-            kind: "history".into(),
-            text: text.into(),
-        }],
-    )
+fn index(root: &Path, days: u32, now: u64, ring: &[Series]) -> Result<BTreeSet<String>> {
+    let path = root.join("index.json");
+    let mut seen: BTreeMap<String, u64> = runtime::load(&path);
+    let before = seen.clone();
+    for series in ring.iter().filter(|series| !series.buckets.is_empty()) {
+        seen.insert(series.id.clone(), now / HOUR);
+    }
+    let cutoff = now.saturating_sub(longest(days)) / HOUR;
+    seen.retain(|_, hour| *hour >= cutoff);
+    if seen.len() > MAX_SERIES {
+        let mut order: Vec<(u64, String)> = seen
+            .iter()
+            .map(|(name, hour)| (*hour, name.clone()))
+            .collect();
+        order.sort();
+        for (_, name) in order.iter().take(seen.len() - MAX_SERIES) {
+            seen.remove(name);
+        }
+    }
+    if seen != before {
+        runtime::store(&path, &seen)?;
+    }
+    Ok(seen
+        .keys()
+        .map(|name| name.chars().take(48).collect())
+        .collect())
 }
 
-fn shrink(path: &Path) -> Result<()> {
-    let mut connection = open(path, Access::ReadWrite)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for (_, table) in LEVELS.iter().rev() {
-        transaction.execute(
-            &format!(
-                "DELETE FROM {table} WHERE period<=(SELECT period FROM {table} ORDER BY period LIMIT 1 OFFSET (SELECT count(*)/10 FROM {table}))"
-            ),
-            [],
-        )?;
-    }
-    Ok(transaction.commit()?)
-}
-
-fn recover(path: &Path, error: Error) -> Result<()> {
-    if path.exists() && !healthy(path) {
-        quarantine(path, DAMAGED)?;
-    }
-    if convert(path)? {
-        return Ok(());
-    }
-    if pages(path) < cap(path) {
-        return Err(error);
-    }
-    shrink(path)
-}
-
-fn store(path: &Path, days: u32, ring: &[Series]) -> Result<BTreeSet<String>> {
-    let now = runtime::now();
-    append(path, days, now, ring).or_else(|error| {
-        recover(path, error)?;
-        append(path, days, now, ring)
-    })
+fn store(root: &Path, days: u32, now: u64, ring: &[Series]) -> Result<BTreeSet<String>> {
+    columnar::store(root, days, &LATENCY, &latency_entries(ring), now)?;
+    index(root, days, now, ring)
 }
 
 #[cfg(test)]
-fn collect_at(path: &Path, days: u32, ring: &[Series]) -> Result<()> {
-    store(path, days, ring).map(drop)
+fn collect_at(root: &Path, days: u32, ring: &[Series]) -> Result<()> {
+    store(root, days, runtime::now(), ring).map(drop)
 }
 
 pub fn collect(config: &Settings) -> Result<()> {
@@ -544,153 +836,255 @@ pub fn collect(config: &Settings) -> Result<()> {
 }
 
 fn collect_inner(config: &Settings) -> Result<()> {
-    let path = database(config);
-    runtime::directory(path.parent().context("Invalid history directory.")?)?;
-    let cache = known_cache();
-    let (ring, buckets) = fresh()?;
-    if runtime::now() < MIN_CLOCK {
+    let root = root(config);
+    runtime::directory(&root)?;
+    let snapshot = snapshot()?;
+    let now = runtime::now();
+    if let Some(clock) = snapshot.clock.as_ref().filter(|clock| !clock.synced) {
+        return stage(&root, &clock.boot, &snapshot);
+    }
+    if now < MIN_CLOCK {
         return Ok(());
     }
-    let stored = if buckets.is_empty() {
-        Ok(())
-    } else {
-        wifi::store(&wifi::database(config), config.history_days, &buckets)
+    let days = config.history_days;
+    let flushed = flush_pending(&root, days, now, snapshot.clock.as_ref());
+    let prefixes = persist(
+        &root,
+        days,
+        now,
+        &snapshot.series,
+        &snapshot.wifi,
+        snapshot.telemetry.as_ref(),
+    )?;
+    publish(&known_cache(), &prefixes)?;
+    flushed
+}
+
+fn persist(
+    root: &Path,
+    days: u32,
+    now: u64,
+    ring: &[Series],
+    buckets: &[WifiBucket],
+    status: Option<&TelemetryStatus>,
+) -> Result<BTreeSet<String>> {
+    let wifi = columnar::store(root, days, &wifi::KIND, &wifi::entries(buckets), now);
+    let system = status.map_or(Ok(()), |status| {
+        columnar::store(
+            root,
+            days,
+            &telemetry::SYSTEM,
+            &telemetry::system_entries(status),
+            now,
+        )
+    });
+    let links = status.map_or(Ok(()), |status| {
+        columnar::store(
+            root,
+            days,
+            &telemetry::INTERFACE,
+            &telemetry::link_entries(status),
+            now,
+        )
+    });
+    let logged = record_incidents(root, ring, buckets);
+    let prefixes = store(root, days, now, ring)?;
+    wifi.and(system).and(links).and(logged)?;
+    Ok(prefixes)
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Logged {
+    pub series: String,
+    pub kind: String,
+    pub start: u64,
+    pub end: Option<u64>,
+}
+
+const MAX_INCIDENTS: usize = 200;
+
+pub fn ring_incidents(ring: &[Series], wifi: &[WifiBucket], now: u64) -> Vec<Logged> {
+    let mut found = Vec::new();
+    let mut runs = |series: &str, kind: &str, states: Vec<(u64, Option<bool>)>| {
+        let Some(&(first, _)) = states.first() else {
+            return;
+        };
+        let mut timeline: Vec<Option<bool>> = Vec::new();
+        let mut expected = first;
+        for (at, state) in states {
+            while expected < at {
+                timeline.push(None);
+                expected += BUCKET_SECONDS;
+            }
+            timeline.push(state);
+            expected = at + BUCKET_SECONDS;
+        }
+        found.extend(
+            outages(series, "", "", first * 1_000, BUCKET_SECONDS, timeline, now)
+                .into_iter()
+                .map(|incident| Logged {
+                    series: series.into(),
+                    kind: kind.into(),
+                    start: incident.start,
+                    end: incident.end,
+                }),
+        );
     };
-    let idle = ring.iter().all(|series| series.buckets.is_empty());
-    if !(idle && cache.exists()) {
-        publish(&cache, &store(&path, config.history_days, &ring)?)?;
+    for series in ring {
+        runs(
+            &series.id,
+            "loss",
+            series
+                .buckets
+                .iter()
+                .map(|bucket| {
+                    (
+                        bucket.at,
+                        (bucket.sent > 0).then_some(bucket.lost == bucket.sent),
+                    )
+                })
+                .collect(),
+        );
     }
+    runs("wifi", "wifi", wifi::down(wifi).collect());
+    found
+}
+
+pub fn merge_incidents(stored: &mut Vec<Logged>, fresh: Vec<Logged>) {
+    for incident in fresh {
+        let overlapping = stored.iter_mut().find(|known| {
+            known.series == incident.series
+                && known.kind == incident.kind
+                && known.start <= incident.start
+                && known.end.is_none_or(|end| end >= incident.start)
+        });
+        match overlapping {
+            Some(known) => {
+                known.end = match (known.end, incident.end) {
+                    (_, None) => None,
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (None, Some(right)) => Some(right),
+                };
+            }
+            None => stored.push(incident),
+        }
+    }
+    stored.sort_by_key(|incident| incident.start);
+    let excess = stored.len().saturating_sub(MAX_INCIDENTS);
+    stored.drain(..excess);
+}
+
+fn incidents_path(root: &Path) -> PathBuf {
+    root.join("incidents.json")
+}
+
+fn record_incidents(path: &Path, ring: &[Series], wifi: &[WifiBucket]) -> Result<()> {
+    let file = incidents_path(path);
+    let mut stored: Vec<Logged> = runtime::load(&file);
+    let before = stored.clone();
+    merge_incidents(
+        &mut stored,
+        ring_incidents(ring, wifi, runtime::now() * 1_000),
+    );
+    if stored != before {
+        runtime::store(&file, &stored)?;
+    }
+    Ok(())
+}
+
+pub fn logged_incidents(config: &Settings, ring: &[Series], wifi: &[WifiBucket]) -> Vec<Logged> {
+    let mut stored: Vec<Logged> = runtime::load(incidents_path(&root(config)));
+    merge_incidents(
+        &mut stored,
+        ring_incidents(ring, wifi, runtime::now() * 1_000),
+    );
     stored
 }
 
-pub fn report(config: &Settings) -> Result<Report> {
-    let path = database(config);
-    let bytes = fs::metadata(&path).map_or(0, |meta| meta.len());
-    let mut lines = Vec::new();
-    if path.exists() {
-        let connection = open(&path, Access::ReadOnly)?;
-        let show = |value: Option<u64>| value.map_or_else(String::new, |value| value.to_string());
-        for (_, table) in LEVELS {
-            let (rows, oldest, newest): (u64, Option<u64>, Option<u64>) = connection.query_row(
-                &format!("SELECT count(*),min(period),max(period) FROM {table}"),
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-            lines.push(format!(
-                "{table}: {rows} rows, oldest period {}, newest period {}",
-                show(oldest),
-                show(newest)
-            ));
-        }
+pub fn report(config: &Settings) -> Report {
+    let root = root(config);
+    Report {
+        bytes: columnar::bytes(&root),
+        cap: columnar::cap(&root),
+        lines: columnar::report(&root),
     }
-    Ok(Report {
-        bytes,
-        cap: cap(&path) * PAGE_BYTES,
-        lines,
-    })
-}
-
-fn reader(path: &Path) -> Result<Connection> {
-    if path.exists() {
-        let connection = open(path, Access::ReadOnly)?;
-        if connection.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))? >= 3 {
-            return Ok(connection);
-        }
-    }
-    let connection = Connection::open_in_memory()?;
-    connection.execute_batch(&schema())?;
-    Ok(connection)
 }
 
 fn lines(
-    path: &Path,
+    root: &Path,
     step: u64,
     query: &Query,
     ring: &[Series],
     subjects: Vec<Subject>,
-) -> Result<Vec<Line>> {
+) -> Result<Vec<Track>> {
     if subjects.is_empty() {
         return Ok(Vec::new());
     }
     let (first, last) = (query.start / 1_000 / step, query.end / 1_000 / step);
-    let live: Vec<&Series> = ring
+    let wanted: Vec<Series> = ring
         .iter()
-        .filter(|series| {
-            !series.buckets.is_empty()
-                && subjects.iter().any(|subject| subject.identity == series.id)
+        .filter(|series| subjects.iter().any(|subject| subject.identity == series.id))
+        .map(|series| Series {
+            buckets: series.buckets.clone(),
+            history: Vec::new(),
+            id: series.id.clone(),
+            name: String::new(),
+            interface: String::new(),
+            path_id: String::new(),
+            target: series.target,
+            state: series.state,
+            median_us: None,
+            sent: 0,
+            received: 0,
+            success_age_ms: None,
+            jitter_us: None,
         })
         .collect();
-    let ratio = step / BUCKET_SECONDS;
-    let blank: Vec<Point> = (first..=last)
-        .map(|period| Point {
-            at: period * step * 1_000,
-            ..Point::default()
-        })
-        .collect();
-    let (identities, mut lines): (Vec<String>, Vec<Line>) = subjects
+    let mut found = columnar::series(
+        root,
+        &LATENCY,
+        step,
+        (first, last),
+        &latency_entries(&wanted),
+    )?;
+    let blank = vec![Point::default(); usize::try_from(last - first + 1)?];
+    Ok(subjects
         .into_iter()
         .map(|subject| {
-            (
-                subject.identity,
-                Line {
-                    id: subject.id,
-                    name: subject.name,
-                    points: blank.clone(),
-                },
-            )
-        })
-        .unzip();
-    let names: Vec<&dyn ToSql> = identities.iter().map(|id| id as &dyn ToSql).collect();
-    let marks = vec!["?"; names.len()].join(",");
-    let stored = |table: &str| {
-        format!(
-            "SELECT t.period,s.name,t.min_us,t.median_us,t.max_us,t.sent,t.lost FROM {table} t JOIN series s ON s.id=t.series WHERE t.period BETWEEN ? AND ? AND s.name IN ({marks})"
-        )
-    };
-    let index: BTreeMap<&str, usize> = identities.iter().map(String::as_str).zip(0..).collect();
-    let mut connection = reader(path)?;
-    let transaction = connection.transaction()?;
-    let bounds = span(&live).map(|range| aligned(range, ratio));
-    if let Some((low, high)) = bounds {
-        fill(&transaction, &live)?;
-        let mut arguments: Vec<&dyn ToSql> = vec![&low, &high];
-        arguments.extend(names.iter().copied());
-        transaction.execute(
-            &format!("INSERT OR IGNORE INTO live {}", stored(LEVELS[0].1)),
-            arguments.as_slice(),
-        )?;
-    }
-    let mut load = |statement: &str, arguments: &[&dyn ToSql]| -> Result<()> {
-        let mut prepared = transaction.prepare(statement)?;
-        let mut rows = prepared.query(arguments)?;
-        while let Some(row) = rows.next()? {
-            let period: u64 = row.get(0)?;
-            let name: String = row.get(1)?;
-            if let Some(&line) = index.get(name.as_str())
-                && let Some(slot) = period
+            let mut points = blank.clone();
+            for (period, row) in found.remove(&subject.identity).unwrap_or_default() {
+                let cell = |index: usize| row.get(index).copied().flatten();
+                let small = |index: usize| cell(index).and_then(|value| u32::try_from(value).ok());
+                if let Some(slot) = period
                     .checked_sub(first)
                     .and_then(|offset| usize::try_from(offset).ok())
-                    .and_then(|offset| lines.get_mut(line)?.points.get_mut(offset))
-            {
-                *slot = Point {
-                    at: period * step * 1_000,
-                    min: row.get::<_, Option<u32>>(2)?.map(runtime::milliseconds),
-                    median: row.get::<_, Option<u32>>(3)?.map(runtime::milliseconds),
-                    max: row.get::<_, Option<u32>>(4)?.map(runtime::milliseconds),
-                    sent: row.get(5)?,
-                    lost: row.get(6)?,
-                };
+                    .and_then(|offset| points.get_mut(offset))
+                {
+                    *slot = Point {
+                        min: small(0),
+                        median: small(1),
+                        max: small(2),
+                        sent: small(3).unwrap_or(0),
+                        lost: small(4).unwrap_or(0),
+                        jitter_sum: cell(5)
+                            .and_then(|value| u64::try_from(value).ok())
+                            .unwrap_or(0),
+                        jitter_n: small(6).unwrap_or(0),
+                        rtt: std::array::from_fn(|bin| {
+                            cell(RTT_FIRST + bin)
+                                .and_then(|value| u64::try_from(value).ok())
+                                .unwrap_or(0)
+                        }),
+                    };
+                }
             }
-        }
-        Ok(())
-    };
-    let mut arguments: Vec<&dyn ToSql> = vec![&first, &last];
-    arguments.extend(names.iter().copied());
-    load(&stored(table(step)), &arguments)?;
-    if let Some((low, high)) = bounds {
-        load(&rollup("live"), &[&ratio, &low, &high])?;
-    }
-    Ok(lines)
+            Track {
+                id: subject.id,
+                name: subject.name,
+                points,
+            }
+        })
+        .collect())
 }
 
 pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {
@@ -755,26 +1149,53 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
             identity: router::series_id(wan.prefix(), target),
         });
     }
-    let series = lines(&database(config), step, query, &fresh_ring()?, subjects)?;
+    let tracks = lines(&root(config), step, query, &fresh_ring()?, subjects)?;
+    let start = query.start / 1_000 / step * step * 1_000;
+    let detail = format!("Every probe to {target} was lost");
+    let now = runtime::now() * 1_000;
+    let mut incidents: Vec<Incident> = tracks
+        .iter()
+        .filter(|track| !track.id.starts_with("endpoint:"))
+        .flat_map(|track| {
+            outages(
+                &track.id,
+                &track.name,
+                &detail,
+                start,
+                step,
+                track
+                    .points
+                    .iter()
+                    .map(|point| (point.sent > 0).then(|| point.down())),
+                now,
+            )
+        })
+        .collect();
+    incidents.sort_by_key(|incident| std::cmp::Reverse(incident.start));
+    let count = usize::try_from(query.end / 1_000 / step - query.start / 1_000 / step + 1)?;
     let events = changes::read(config)
         .into_iter()
         .filter(|event| (query.start..=query.end).contains(&event.at))
         .collect();
-    Ok(Response { series, events })
+    Ok(Response {
+        start,
+        step,
+        count,
+        series: tracks.into_iter().map(Line::from).collect(),
+        events,
+        incidents,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Access, DAY, HOUR, LEVELS, Query, Subject, append, collect_at, convert, lines, open,
-        resolution,
-    };
+    use super::{DAY, HOUR, LATENCY, Line, Query, Subject, collect_at, lines, outages, resolution};
+    use crate::columnar;
     use crate::runtime;
     use anyhow::{Result, ensure};
-    use std::fmt::Write;
-    use std::fs;
     use std::net::Ipv4Addr;
     use std::path::Path;
+    use wayline_protocol::schema::{RTT_BINS, rtt_bin};
     use wayline_protocol::{Bucket, Series, State};
 
     fn identity(index: u8) -> String {
@@ -793,6 +1214,7 @@ mod tests {
             sent: 6,
             received: 4,
             success_age_ms: Some(0),
+            jitter_us: None,
             history: Vec::new(),
             buckets,
         }
@@ -806,6 +1228,14 @@ mod tests {
             min_us: Some(value),
             median_us: Some(value),
             max_us: Some(value),
+            jitter_sum_us: u64::from(value / 10),
+            jitter_n: 2,
+            rtt: {
+                let mut rtt = [0; RTT_BINS];
+                rtt[rtt_bin(value)] = 4 - lost;
+                rtt
+            },
+            uptime_ms: 0,
         }
     }
 
@@ -818,8 +1248,6 @@ mod tests {
         super::discard_before(&mut live, 105);
         assert_eq!(live[0].buckets.len(), 1);
         assert_eq!(live[0].buckets[0].at, 120);
-        super::discard_before(&mut live, 105);
-        assert_eq!(live[0].buckets.len(), 1);
     }
 
     fn value(index: u64) -> u32 {
@@ -840,7 +1268,7 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn hour_row() -> (u32, usize, u32, u32, u32) {
+    fn expected_hour() -> Vec<Option<i64>> {
         let minutes: Vec<u32> = (0..60)
             .map(|minute| lower_median((4 * minute..4 * minute + 4).map(value).collect()))
             .collect();
@@ -849,28 +1277,35 @@ mod tests {
             .map(|chunk| lower_median(chunk.to_vec()))
             .collect();
         let values: Vec<u32> = (0..240).map(value).collect();
-        (
-            960,
-            (0..240).filter(|index| index % 3 == 0).count(),
-            values.iter().min().copied().unwrap_or_default(),
-            lower_median(fives),
-            values.iter().max().copied().unwrap_or_default(),
+        let lost = (0..240).filter(|index| index % 3 == 0).count();
+        vec![
+            values.iter().min().copied().map(i64::from),
+            Some(i64::from(lower_median(fives))),
+            values.iter().max().copied().map(i64::from),
+            Some(960),
+            i64::try_from(lost).ok(),
+            Some(values.iter().map(|value| i64::from(value / 10)).sum()),
+            Some(480),
+        ]
+        .into_iter()
+        .chain((0..RTT_BINS).map(|bin| {
+            Some(
+                (0..240_u64)
+                    .filter(|index| rtt_bin(value(*index)) == bin)
+                    .map(|index| 4 - i64::from(index % 3 == 0))
+                    .sum(),
+            )
+        }))
+        .collect()
+    }
+
+    fn stored(root: &Path, step: u64, period: u64) -> Result<Vec<Option<i64>>> {
+        Ok(
+            columnar::series(root, &LATENCY, step, (period, period), &[])?
+                .remove(&identity(1))
+                .and_then(|mut rows| rows.remove(&period))
+                .unwrap_or_default(),
         )
-    }
-
-    fn scalar(path: &Path, statement: &str) -> Result<i64> {
-        Ok(open(path, Access::ReadOnly)?.query_row(statement, [], |row| row.get(0))?)
-    }
-
-    fn edit(path: &Path, statement: &str) -> Result<()> {
-        Ok(open(path, Access::ReadWrite)?.execute_batch(statement)?)
-    }
-
-    fn counts(path: &Path) -> Result<Vec<i64>> {
-        LEVELS
-            .iter()
-            .map(|(_, table)| scalar(path, &format!("SELECT count(*) FROM {table}")))
-            .collect()
     }
 
     fn request(start: u64, end: u64, step: u64) -> Query {
@@ -895,275 +1330,47 @@ mod tests {
         }
     }
 
-    fn rendered(path: &Path, step: u64, start: u64, ring: &[Series]) -> Result<serde_json::Value> {
+    fn rendered(root: &Path, step: u64, start: u64, ring: &[Series]) -> Result<serde_json::Value> {
         let query = request(start, start + HOUR, step);
-        let mut value = serde_json::to_value(lines(path, step, &query, ring, vec![subject(1)])?)?;
-        if step > 60 {
-            for point in value[0]["points"].as_array_mut().into_iter().flatten() {
-                point["median"] = serde_json::Value::Null;
-            }
-        }
-        Ok(value)
+        let tracks: Vec<Line> = lines(root, step, &query, ring, vec![subject(1)])?
+            .into_iter()
+            .map(Line::from)
+            .collect();
+        Ok(serde_json::to_value(tracks)?)
     }
 
     #[test]
     fn buckets_roll_up_exactly() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
+        let root = directory.path();
         let start = runtime::now() / HOUR * HOUR - 2 * HOUR;
-        collect_at(&database, 30, &[series(&identity(1), hour(start))])?;
-        let row = open(&database, Access::ReadOnly)?.query_row(
-            "SELECT sent,lost,min_us,median_us,max_us FROM s1h WHERE period=?1",
-            [start / HOUR],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )?;
-        ensure!(row == hour_row(), "Unexpected hour: {row:?}");
-        let counts = counts(&database)?;
-        ensure!(counts == [240, 60, 12, 1], "Unexpected counts: {counts:?}");
+        collect_at(root, 30, &[series(&identity(1), hour(start))])?;
+        let row = stored(root, 3_600, start / HOUR)?;
+        ensure!(row == expected_hour(), "Unexpected hour: {row:?}");
         Ok(())
     }
 
     #[test]
     fn repeated_collection_never_double_counts() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
+        let root = directory.path();
         let start = runtime::now() / HOUR * HOUR - 2 * HOUR;
         let buckets = hour(start);
-        collect_at(
-            &database,
-            30,
-            &[series(&identity(1), buckets[..120].to_vec())],
-        )?;
-        collect_at(&database, 30, &[series(&identity(1), buckets.clone())])?;
-        collect_at(&database, 30, &[series(&identity(1), buckets)])?;
+        collect_at(root, 30, &[series(&identity(1), buckets[..120].to_vec())])?;
+        collect_at(root, 30, &[series(&identity(1), buckets.clone())])?;
+        collect_at(root, 30, &[series(&identity(1), buckets)])?;
         ensure!(
-            scalar(&database, "SELECT sum(sent) FROM s1h")? == 960,
+            stored(root, 3_600, start / HOUR)?[3] == Some(960),
             "Double count."
         );
         Ok(())
     }
 
     #[test]
-    fn tiers_prune_to_their_retention() -> Result<()> {
-        let now = runtime::now();
-        let minute = now / 60 * 60 - 120;
-        for (days, expected) in [(1_u32, [2, 1, 0, 0]), (7, [2, 2, 1, 0])] {
-            let directory = tempfile::tempdir()?;
-            let database = directory.path().join("latency.sqlite");
-            collect_at(
-                &database,
-                days,
-                &[series(&identity(1), vec![bucket(minute, 20_000, 0)])],
-            )?;
-            edit(
-                &database,
-                &format!(
-                    "INSERT INTO s15 SELECT {},id,1,1,1,1,0 FROM series; INSERT INTO s1m SELECT {},id,1,1,1,1,0 FROM series; INSERT INTO s5m SELECT {},id,1,1,1,1,0 FROM series;",
-                    (now - 7 * HOUR) / 15,
-                    (now - 2 * DAY) / 60,
-                    (now - 8 * DAY) / 300
-                ),
-            )?;
-            collect_at(
-                &database,
-                days,
-                &[series(&identity(1), vec![bucket(minute + 15, 20_000, 0)])],
-            )?;
-            let counts = counts(&database)?;
-            ensure!(counts == expected, "Days {days}: {counts:?}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn idle_series_expire_with_their_rows() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let minute = runtime::now() / 60 * 60 - 120;
-        collect_at(
-            &database,
-            1,
-            &[
-                series(&identity(1), vec![bucket(minute, 20_000, 0)]),
-                series(&identity(2), vec![bucket(minute, 20_000, 0)]),
-            ],
-        )?;
-        edit(
-            &database,
-            &format!(
-                "UPDATE series SET seen={} WHERE name='{}';",
-                runtime::now() / HOUR - 49,
-                identity(2)
-            ),
-        )?;
-        collect_at(
-            &database,
-            1,
-            &[series(&identity(1), vec![bucket(minute + 15, 20_000, 0)])],
-        )?;
-        for statement in [
-            "SELECT count(*) FROM series",
-            "SELECT count(DISTINCT series) FROM s15",
-            "SELECT count(DISTINCT series) FROM s1m",
-        ] {
-            ensure!(scalar(&database, statement)? == 1, "{statement}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn retiring_many_series_leaves_no_orphans() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let minute = runtime::now() / 60 * 60 - 120;
-        let all: Vec<Series> = (1..=80)
-            .map(|index| series(&identity(index), vec![bucket(minute, 20_000, 0)]))
-            .collect();
-        collect_at(&database, 30, &all)?;
-        edit(
-            &database,
-            &format!(
-                "UPDATE series SET seen={} WHERE id>1;",
-                runtime::now() / HOUR - 721
-            ),
-        )?;
-        collect_at(
-            &database,
-            30,
-            &[series(&identity(1), vec![bucket(minute + 15, 20_000, 0)])],
-        )?;
-        ensure!(scalar(&database, "SELECT count(*) FROM series")? == 1);
-        for (_, table) in LEVELS {
-            ensure!(
-                scalar(
-                    &database,
-                    &format!(
-                        "SELECT count(*) FROM {table} WHERE series NOT IN (SELECT id FROM series)"
-                    )
-                )? == 0,
-                "Orphans in {table}."
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn series_cap_keeps_live_series_over_newer_ids() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let minute = runtime::now() / 60 * 60 - 120;
-        let all: Vec<Series> = (1..=90)
-            .map(|index| series(&identity(index), vec![bucket(minute, 20_000, 0)]))
-            .collect();
-        collect_at(&database, 1, &all)?;
-        collect_at(
-            &database,
-            1,
-            &[
-                series(&identity(91), vec![bucket(minute + 15, 20_000, 0)]),
-                series(&identity(1), vec![bucket(minute + 15, 20_000, 0)]),
-            ],
-        )?;
-        ensure!(scalar(&database, "SELECT count(*) FROM series")? == 90);
-        ensure!(
-            scalar(
-                &database,
-                &format!(
-                    "SELECT count(*) FROM series WHERE name IN ('{}','{}')",
-                    identity(1),
-                    identity(91)
-                )
-            )? == 2
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn unknown_schema_is_reset() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        edit(
-            &database,
-            "CREATE TABLE samples(x INTEGER); PRAGMA user_version=2;",
-        )?;
-        ensure!(convert(&database)?, "Expected a conversion.");
-        ensure!(
-            directory.path().join("latency.sqlite.broken").exists(),
-            "The old database was not moved aside."
-        );
-        ensure!(scalar(&database, "PRAGMA user_version")? == 4);
-        ensure!(
-            scalar(
-                &database,
-                "SELECT count(*) FROM sqlite_master WHERE name='samples'"
-            )? == 0
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn schema_v3_keeps_every_tier_when_converted() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let mut tiers = String::new();
-        for (index, (_, table)) in LEVELS.iter().enumerate() {
-            write!(
-                tiers,
-                "CREATE TABLE {table}(series INTEGER NOT NULL, period INTEGER NOT NULL, min_us INTEGER, median_us INTEGER, max_us INTEGER, sent INTEGER NOT NULL, lost INTEGER NOT NULL, PRIMARY KEY(series, period)) WITHOUT ROWID; INSERT INTO {table} VALUES(1,{},1,2,3,4,{index});",
-                100 + index
-            )?;
-        }
-        let script = format!(
-            "CREATE TABLE series(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE); CREATE TABLE meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID; INSERT INTO series(name) VALUES('x'); INSERT INTO meta VALUES('cursor',5);{tiers}PRAGMA user_version=3;"
-        );
-        edit(&database, &script)?;
-        ensure!(
-            append(&database, 30, runtime::now(), &[]).is_err(),
-            "A stale schema must fail the write so that it is converted."
-        );
-        ensure!(convert(&database)?, "Expected a conversion.");
-        ensure!(scalar(&database, "PRAGMA user_version")? == 4);
-        ensure!(
-            scalar(
-                &database,
-                "SELECT lost FROM s15 WHERE period=100 AND series=1"
-            )? == 0
-        );
-        ensure!(
-            scalar(
-                &database,
-                "SELECT lost FROM s1h WHERE period=103 AND series=1"
-            )? == 3
-        );
-        ensure!(
-            scalar(
-                &database,
-                "SELECT count(*) FROM sqlite_master WHERE name IN ('meta','old_series','old_s15')"
-            )? == 0
-        );
-        ensure!(scalar(&database, "SELECT count(*) FROM series WHERE seen>0")? == 1);
-        append(&database, 30, runtime::now() + 60 * DAY, &[])?;
-        ensure!(
-            scalar(&database, "SELECT count(*) FROM s1m")? == 0,
-            "Rows outlived their series."
-        );
-        ensure!(!convert(&database)?, "A current schema must be left alone.");
-        Ok(())
-    }
-
-    #[test]
     fn live_buckets_merge_into_stored_periods() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let full = directory.path().join("full.sqlite");
-        let half = directory.path().join("half.sqlite");
+        let full = directory.path().join("full");
+        let half = directory.path().join("half");
         let start = runtime::now() / HOUR * HOUR - 2 * HOUR;
         let buckets = hour(start);
         let id = identity(1);
@@ -1176,7 +1383,7 @@ mod tests {
                 rendered(&half, step, start, &live)? == expected,
                 "Live merge differs at step {step}."
             );
-            let missing = directory.path().join("missing.sqlite");
+            let missing = directory.path().join("missing");
             ensure!(
                 rendered(&missing, step, start, &[series(&id, buckets.clone())])? == expected,
                 "Ring alone differs at step {step}."
@@ -1207,33 +1414,108 @@ mod tests {
     }
 
     #[test]
-    fn damaged_database_is_moved_aside_and_recorded() -> Result<()> {
+    fn unsynced_buckets_are_staged_then_restamped_on_sync() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        fs::write(&database, [0x5a_u8; 8192])?;
-        let fresh = runtime::now() / 15 * 15 - 60;
-        collect_at(
-            &database,
-            7,
-            &[series(&identity(1), vec![bucket(fresh, 20_000, 0)])],
-        )?;
+        let root = directory.path();
+        let actual = runtime::now() / HOUR * HOUR - HOUR;
+        let skewed = actual - 3 * 86_400;
+        let offset_ms = i64::try_from((actual - 600) * 1_000)?;
+        let staged_buckets = |from: u64| -> Vec<Bucket> {
+            (from..from + 8)
+                .map(|index| Bucket {
+                    uptime_ms: 600_000 + index * 15_000,
+                    ..bucket(skewed + index * 15, 20_000, 0)
+                })
+                .collect()
+        };
+        let snapshot = |buckets: Vec<Bucket>| super::Snapshot {
+            series: vec![series(&identity(1), buckets)],
+            wifi: Vec::new(),
+            telemetry: None,
+            clock: None,
+        };
+        super::stage(root, "boot1", &snapshot(staged_buckets(0)))?;
+        super::stage(root, "boot1", &snapshot(staged_buckets(4)))?;
+        let staged = std::fs::read_to_string(root.join("pending/boot1.ndjson"))?;
+        ensure!(staged.lines().count() == 2, "Expected two staged lines.");
+        let synced = crate::clock::Clock {
+            boot: "boot1".into(),
+            synced: true,
+            source: Some(crate::clock::Source::Ntp),
+            offset_ms,
+        };
+        super::flush_pending(root, 7, runtime::now(), Some(&synced))?;
         ensure!(
-            directory.path().join("latency.sqlite.broken").exists(),
-            "Damaged database was not moved aside."
+            !root.join("pending/boot1.ndjson").exists(),
+            "Staged file remains."
         );
-        ensure!(scalar(&database, "SELECT count(*) FROM s15")? == 1);
-        let events = fs::read_to_string(directory.path().join("events.json"))?;
+        let first = actual / 15;
+        let read = columnar::series(root, &LATENCY, 15, (first, first + 20), &[])?;
+        let periods: Vec<u64> = read
+            .get(&identity(1))
+            .map(|rows| rows.keys().copied().collect())
+            .unwrap_or_default();
         ensure!(
-            events.contains("The history database was damaged and was reset."),
-            "Missing recovery event."
+            periods.len() == 12,
+            "Stored {} restamped buckets.",
+            periods.len()
         );
+        ensure!(
+            periods[0] == first,
+            "First bucket at {} not {first}.",
+            periods[0]
+        );
+        let old = columnar::series(root, &LATENCY, 15, (skewed / 15, skewed / 15 + 20), &[])?;
+        ensure!(old.is_empty(), "Buckets were stored at the skewed time.");
         Ok(())
+    }
+
+    #[test]
+    fn percentiles_land_inside_their_bin() {
+        let mut rtt = [0; RTT_BINS];
+        rtt[rtt_bin(12_000)] = 90;
+        rtt[rtt_bin(120_000)] = 10;
+        let p50 = super::percentile(&rtt, 500, None, None).unwrap_or(0);
+        let p95 = super::percentile(&rtt, 950, None, None).unwrap_or(0);
+        let p99 = super::percentile(&rtt, 990, None, None).unwrap_or(0);
+        assert!((10_000..15_000).contains(&p50), "{p50}");
+        assert!((100_000..150_000).contains(&p95), "{p95}");
+        assert!(p99 >= p95, "{p99} < {p95}");
+        let tight = super::percentile(&rtt, 990, Some(11_000), Some(121_000)).unwrap_or(0);
+        assert!((100_000..=121_000).contains(&tight), "{tight}");
+        let mut slow = [0; RTT_BINS];
+        slow[RTT_BINS - 1] = 3;
+        assert_eq!(
+            super::percentile(&slow, 500, Some(600_000), Some(900_000)),
+            Some(750_000)
+        );
+        assert_eq!(super::percentile(&[0; RTT_BINS], 500, None, None), None);
+    }
+
+    #[test]
+    fn outages_cover_fully_lost_runs() {
+        let states = [
+            Some(false),
+            Some(true),
+            Some(true),
+            None,
+            Some(true),
+            Some(false),
+            Some(true),
+        ];
+        let found = outages("wan", "WAN", "lost", 0, 15, states, 1_000_000);
+        assert_eq!(found.len(), 3);
+        assert_eq!((found[0].start, found[0].end), (15_000, Some(45_000)));
+        assert_eq!((found[1].start, found[1].end), (60_000, Some(75_000)));
+        assert_eq!((found[2].start, found[2].end), (90_000, Some(105_000)));
+        let ongoing = outages("wan", "WAN", "lost", 0, 15, states, 110_000);
+        assert_eq!(ongoing[2].end, None);
     }
 
     #[test]
     fn eleven_series_for_a_week_stay_small() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
+        let root = directory.path();
         let start = runtime::now() / HOUR * HOUR - 168 * HOUR;
         let identities: Vec<String> = (1..=11).map(identity).collect();
         for hours in 0..168 {
@@ -1241,20 +1523,17 @@ mod tests {
                 .iter()
                 .map(|id| series(id, hour(start + hours * HOUR)))
                 .collect();
-            collect_at(&database, 7, &snapshot)?;
+            collect_at(root, 7, &snapshot)?;
         }
-        let size = fs::metadata(&database)?.len();
-        ensure!(size < 4 * 1024 * 1024, "Database is {size} bytes.");
+        let size = columnar::bytes(root);
+        ensure!(size < 2 * 1024 * 1024, "History is {size} bytes.");
         let query = request(runtime::now() - DAY, runtime::now(), 60);
-        let line = lines(&database, 60, &query, &[], vec![subject(1)])?.remove(0);
+        let line = lines(root, 60, &query, &[], vec![subject(1)])?.remove(0);
         ensure!(line.points.len() <= 1_441, "Too many points.");
         ensure!(
             line.points.iter().filter(|point| point.sent > 0).count() > 1_000,
             "Stored minutes are missing."
         );
-        let json = serde_json::to_vec(&line)?.len();
-        ensure!(json < 262_144, "Response is {json} bytes.");
-        ensure!(LEVELS.len() == 4, "Unexpected tiers.");
         Ok(())
     }
 }

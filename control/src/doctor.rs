@@ -84,24 +84,20 @@ fn history(warnings: &mut usize, settings: &Result<Settings>) {
         return;
     };
     println!("probe interval: {} s", config.interval);
-    match history::report(config) {
-        Ok(report) => {
-            println!(
-                "history database: {} bytes of {} bytes cap",
-                report.bytes, report.cap
-            );
-            for line in &report.lines {
-                println!("history {line}");
-            }
-            if report.bytes * 5 > report.cap * 4 {
-                warn(
-                    warnings,
-                    "history database",
-                    "Above 80% of its cap. The oldest rows of the coarsest tiers are removed when it fills.",
-                );
-            }
-        }
-        Err(error) => warn(warnings, "history database", &error.to_string()),
+    let report = history::report(config);
+    println!(
+        "history storage: {} bytes of {} bytes cap (Arrow IPC chunks, zstd)",
+        report.bytes, report.cap
+    );
+    for line in &report.lines {
+        println!("{line}");
+    }
+    if report.bytes * 5 > report.cap * 4 {
+        warn(
+            warnings,
+            "history storage",
+            "Above 80% of its cap. The oldest chunks are removed when it fills.",
+        );
     }
 }
 
@@ -153,8 +149,63 @@ fn wifi_status(
                 .map_or_else(|| "?".into(), |value| value.to_string()),
         );
     }
-    for line in wifi::report(config) {
-        println!("{line}");
+}
+
+fn monitor_details(warnings: &mut usize, settings: &Result<Settings>) {
+    let parts = runtime::current();
+    println!("measurement series: {}", parts.series.len());
+    wifi_status(warnings, settings, parts.wifi.as_ref());
+    telemetry_status(settings, parts.telemetry.as_ref());
+}
+
+fn telemetry_status(
+    settings: &Result<Settings>,
+    status: Option<&wayline_protocol::TelemetryStatus>,
+) {
+    if !settings.as_ref().is_ok_and(|config| config.telemetry) {
+        println!("router telemetry: off by setting");
+        return;
+    }
+    let Some(status) = status else {
+        println!("router telemetry: no status from the monitor");
+        return;
+    };
+    if let Some(system) = status.system {
+        println!(
+            "router telemetry: cpu {} permille, load {:?} centi, memory {} of {} bytes available, temperature {} millidegrees, conntrack {}/{}",
+            system
+                .cpu_permille
+                .map_or_else(|| "?".into(), |value| value.to_string()),
+            system.load_centi,
+            system.mem_available,
+            system.mem_total,
+            system
+                .temperature_milli
+                .map_or_else(|| "?".into(), |value| value.to_string()),
+            system
+                .conntrack
+                .map_or_else(|| "?".into(), |value| value.to_string()),
+            system
+                .conntrack_max
+                .map_or_else(|| "?".into(), |value| value.to_string()),
+        );
+    }
+    for link in &status.links {
+        println!(
+            "interface {} ({}, {}): present {}, rx {} bit/s, tx {} bit/s, errors {}, drops {}, handshake age {}",
+            link.id,
+            link.device,
+            link.kind,
+            link.present,
+            link.rx_bps
+                .map_or_else(|| "?".into(), |value| value.to_string()),
+            link.tx_bps
+                .map_or_else(|| "?".into(), |value| value.to_string()),
+            link.errors,
+            link.drops,
+            link.handshake_age
+                .map_or_else(|| "none".into(), |value| format!("{value} s")),
+        );
     }
 }
 
@@ -246,9 +297,7 @@ pub fn run() -> bool {
         size(MONITOR_CONFIG),
         size(STATUS_SOCKET)
     );
-    let (series, wifi) = runtime::current();
-    println!("measurement series: {}", series.len());
-    wifi_status(&mut warnings, &settings, wifi.as_ref());
+    monitor_details(&mut warnings, &settings);
     if let Some(status) = update::Status::read() {
         let value = serde_json::to_value(&status).unwrap_or_default();
         println!("last update check: {value}");
