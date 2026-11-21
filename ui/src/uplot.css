@@ -1,0 +1,59 @@
+.uplot,
+.uplot * {
+  box-sizing: border-box;
+}
+.uplot {
+  line-height: 1.5;
+  width: min-content;
+}
+.u-wrap {
+  position: relative;
+  user-select: none;
+}
+.u-over,
+.u-under,
+.u-axis,
+.u-select,
+.u-cursor-x,
+.u-cursor-y,
+.u-cursor-pt {
+  position: absolute;
+}
+.u-under {
+  overflow: hidden;
+}
+.uplot canvas {
+  display: block;
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+.u-select,
+.u-cursor-x,
+.u-cursor-y,
+.u-cursor-pt {
+  pointer-events: none;
+}
+.u-cursor-x,
+.u-cursor-y,
+.u-cursor-pt {
+  left: 0;
+  top: 0;
+  will-change: transform;
+}
+.u-hz .u-cursor-x {
+  height: 100%;
+  border-right: 1px dashed;
+}
+.u-hz .u-cursor-y {
+  width: 100%;
+  border-bottom: 1px dashed;
+}
+.u-cursor-pt {
+  border-radius: 50%;
+  border: 0 solid;
+  background-clip: padding-box !important;
+}
+.u-off {
+  display: none;
+}
