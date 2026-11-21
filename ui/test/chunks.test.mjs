@@ -46,8 +46,8 @@ test('chunk references use forms the loader rewrites', () => {
 });
 
 test('the first load stays within budget and excludes lazy views', () => {
-  assert.ok(report.firstLoad.zstd <= 125000, String(report.firstLoad.zstd));
-  assert.ok(report.total.minified <= 600000, String(report.total.minified));
+  assert.ok(report.firstLoad.zstd <= 120000, String(report.firstLoad.zstd));
+  assert.ok(report.total.minified <= 580000, String(report.total.minified));
   for (const name of ['paths', 'wifi', 'traffic', 'router', 'events', 'settings', 'agent'])
     assert.ok(!report.firstLoad.files.includes(report.entries[name]), name);
   assert.ok(!report.firstLoad.files.some((f) => f.startsWith('chart-')));

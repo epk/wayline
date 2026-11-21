@@ -382,13 +382,12 @@ fn licenses(version: &str) -> Result<()> {
     Ok(())
 }
 
-const UI_PACKAGES: [&str; 8] = [
+const UI_PACKAGES: [&str; 7] = [
     "react",
     "react-dom",
     "scheduler",
     "@ui-sdk/core",
     "@ui-sdk/react",
-    "@uwdata/flechette",
     "fzstd",
     "uplot",
 ];
