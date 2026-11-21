@@ -6,16 +6,21 @@
     <title>Wayline · UI preview</title>
     <meta name="description" content="Interactive Wayline dashboard with synthetic tunnel data." />
     <style>
+      @media (prefers-color-scheme: light) {
+        :root {
+          --background-color: #f4f6f8;
+          --card-background-color: #fff;
+          --text-color: #253644;
+          --label-color: #5a6d78;
+          --table-border: #e3e9ed;
+          --primary-color: #159b9b;
+        }
+      }
       :root {
-        --background-color: #f4f6f8;
-        --card-background-color: #fff;
-        --text-color: #253644;
-        --label-color: #5a6d78;
-        --table-border: #e3e9ed;
-        --primary-color: #159b9b;
+        color-scheme: light dark;
         --preview-header: #0b6b6b;
         --preview-header-text: #fff;
-        --preview-active: #edf8f8;
+        --preview-active: light-dark(#edf8f8, #16302f);
         --preview-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       }
       html,
@@ -24,8 +29,8 @@
       }
       body {
         margin: 0;
-        background: var(--background-color);
-        color: var(--text-color);
+        background: var(--background-color, light-dark(#f4f6f8, #11161b));
+        color: var(--text-color, light-dark(#253644, #dce4e9));
         font-family: var(--preview-font);
       }
       .router-header {
@@ -67,10 +72,10 @@
         min-height: calc(100vh - 58px);
       }
       aside {
-        background: var(--card-background-color);
-        border-right: 1px solid var(--table-border);
+        background: var(--card-background-color, light-dark(#fff, #192027));
+        border-right: 1px solid var(--table-border, light-dark(#e3e9ed, #2c3740));
         padding: 25px 14px;
-        color: var(--label-color);
+        color: var(--label-color, light-dark(#5a6d78, #9cadb8));
         font-size: 14px;
       }
       aside div {
@@ -115,6 +120,9 @@
         <a href="?compat=newer">Newer</a>
         <a href="?compat=unsupported">Unsupported</a>
         <a href="?fail=1">Read fails</a>
+        <a href="?telemetry=off&amp;wifi=off">Telemetry and Wi-Fi off</a>
+        <a href="?clock=unsynced">Clock unsynced</a>
+        <a href="?transport=rpc">RPC transport</a>
       </nav>
     </header>
     <div class="router-layout">
@@ -134,17 +142,20 @@
     <script src="../node_modules/vue/dist/vue.runtime.min.js"></script>
     <script>
       var module = { exports: {} };
+      var exports = module.exports;
       function require(name) {
-        if (name === 'vue') return Vue;
         throw Error('Unexpected dependency: ' + name);
       }
     </script>
     <script src="../dist/gl-sdk4-ui-wayline.common.js"></script>
-    <script src="demo.js"></script>
+    <script src="dist/demo.js"></script>
     <script>
       Vue.prototype.$rpcRequest = window.previewRpc;
       new Vue({
-        render: (h) => h(module.exports, { props: { preview: true } }),
+        render: (h) =>
+          h(module.exports.default || module.exports, {
+            props: { preview: true, source: window.previewSource },
+          }),
       }).$mount('#app');
     </script>
   </body>
