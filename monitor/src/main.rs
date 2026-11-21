@@ -6,6 +6,7 @@ compile_error!("waylined requires Linux. Cross-compile the ARM64 musl executable
 mod config;
 mod probe;
 mod route;
+mod telemetry;
 mod wifi;
 
 use probe::Probe;
@@ -113,6 +114,7 @@ struct Monitor<'config> {
     run_id: String,
     reply_hint: usize,
     wifi: Option<wifi::Wifi>,
+    telemetry: Option<telemetry::Telemetry>,
 }
 
 impl<'config> Monitor<'config> {
@@ -150,6 +152,11 @@ impl<'config> Monitor<'config> {
                 }),
             reply_hint: 0,
             wifi: config.wifi.as_ref().map(wifi::Wifi::start).transpose()?,
+            telemetry: config
+                .telemetry
+                .as_ref()
+                .map(telemetry::Telemetry::start)
+                .transpose()?,
         })
     }
 
@@ -167,6 +174,10 @@ impl<'config> Monitor<'config> {
                 .map(|probe| probe.series(now, since))
                 .collect(),
             wifi: self.wifi.as_ref().map(|wifi| wifi.status(now, since)),
+            telemetry: self
+                .telemetry
+                .as_ref()
+                .map(|telemetry| telemetry.status(now, since)),
         };
         let data = fit(&mut status, self.reply_hint)?;
         self.reply_hint = data.len();
@@ -193,6 +204,18 @@ fn fit(status: &mut Status, hint: usize) -> io::Result<Vec<u8>> {
                     .iter()
                     .flat_map(|wifi| wifi.buckets.iter().map(|bucket| bucket.at)),
             )
+            .chain(status.telemetry.iter().flat_map(|telemetry| {
+                telemetry
+                    .system_buckets
+                    .iter()
+                    .map(|bucket| bucket.at)
+                    .chain(
+                        telemetry
+                            .link_buckets
+                            .iter()
+                            .flat_map(|link| link.buckets.iter().map(|bucket| bucket.at)),
+                    )
+            }))
             .collect();
         times.sort_unstable();
         let excess = data.len() - MAX_STATUS;
@@ -209,6 +232,12 @@ fn fit(status: &mut Status, hint: usize) -> io::Result<Vec<u8>> {
         }
         if let Some(wifi) = &mut status.wifi {
             wifi.buckets.retain(|bucket| bucket.at > cut);
+        }
+        if let Some(telemetry) = &mut status.telemetry {
+            telemetry.system_buckets.retain(|bucket| bucket.at > cut);
+            for link in &mut telemetry.link_buckets {
+                link.buckets.retain(|bucket| bucket.at > cut);
+            }
         }
     }
 }
@@ -404,7 +433,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let command = args.next().unwrap_or_default();
     if command == "--help" || command == "-h" || command.is_empty() {
         println!(
-            "waylined monitor --config FILE --socket ABSOLUTE_PATH [--run-for SECONDS]\nwaylined status --socket ABSOLUTE_PATH [--since UNIX_SECONDS]\nIPv4 ICMP and upstream Wi-Fi monitor. The monitor does not change routes. Socket clients receive one JSON snapshot."
+            "waylined monitor --config FILE --socket ABSOLUTE_PATH [--run-for SECONDS]\nwaylined status --socket ABSOLUTE_PATH [--since UNIX_SECONDS]\nIPv4 ICMP, upstream Wi-Fi and router telemetry monitor. The monitor does not change routes. Socket clients receive one JSON snapshot."
         );
         return Ok(());
     }

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wayline_protocol::{BUCKET_SECONDS, Bucket, HISTORY, Sample, Series, State, Tunnel};
 
 const LATENCY_WINDOW: usize = 5;
+const JITTER_WINDOW: usize = 16;
 const PACKET_SIZE: usize = 32;
 const BUCKET_SAMPLES: usize = 64;
 const OPEN_BUCKETS: usize = 8;
@@ -33,6 +34,8 @@ struct OpenBucket {
     sent: u16,
     lost: u16,
     samples: Vec<u32>,
+    jitter_sum_us: u64,
+    jitter_n: u16,
 }
 
 impl OpenBucket {
@@ -48,6 +51,8 @@ impl OpenBucket {
                 .get(self.samples.len().saturating_sub(1) / 2)
                 .copied(),
             max_us: self.samples.last().copied(),
+            jitter_sum_us: self.jitter_sum_us,
+            jitter_n: self.jitter_n,
         }
     }
 }
@@ -106,6 +111,7 @@ pub struct Probe<'tunnel> {
     state: State,
     generation: u32,
     last_success: Option<Instant>,
+    previous_rtt: Option<u32>,
     sent: u64,
     received: u64,
     unmatched: u16,
@@ -136,6 +142,7 @@ impl<'tunnel> Probe<'tunnel> {
             state: State::Waiting,
             generation: 0,
             last_success: None,
+            previous_rtt: None,
             sent: 0,
             received: 0,
             unmatched: 0,
@@ -167,6 +174,14 @@ impl<'tunnel> Probe<'tunnel> {
             sent: self.sent,
             received: self.received,
             success_age_ms: self.last_success.map(|at| millis(now.duration_since(at))),
+            jitter_us: wayline_protocol::jitter(
+                &self
+                    .history
+                    .iter()
+                    .skip(self.history.len().saturating_sub(JITTER_WINDOW))
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ),
             history: self.history.iter().copied().collect(),
             buckets: self
                 .closed
@@ -224,6 +239,7 @@ impl<'tunnel> Probe<'tunnel> {
         self.closed.clear();
         self.unmatched = 0;
         self.last_success = None;
+        self.previous_rtt = None;
         self.sent = 0;
         self.received = 0;
     }
@@ -256,6 +272,8 @@ impl<'tunnel> Probe<'tunnel> {
                     sent: 0,
                     lost: 0,
                     samples: Vec::with_capacity(self.sample_hint),
+                    jitter_sum_us: 0,
+                    jitter_n: 0,
                 });
                 self.open.len() - 1
             });
@@ -279,6 +297,7 @@ impl<'tunnel> Probe<'tunnel> {
         bucket.sent = bucket.sent.saturating_add(1);
         bucket.lost = bucket.lost.saturating_add(1);
         self.push_history(None);
+        self.previous_rtt = None;
     }
 
     pub fn query_route(
@@ -429,10 +448,15 @@ impl<'tunnel> Probe<'tunnel> {
     fn finish(&mut self, index: usize, micros: Option<u32>, now: Instant) {
         let pending = self.pending.remove(index);
         self.push_history(micros);
+        let previous = std::mem::replace(&mut self.previous_rtt, micros);
         let bucket = self.open_bucket(pending.bucket);
         if let Some(us) = micros {
             if bucket.samples.len() < BUCKET_SAMPLES {
                 bucket.samples.push(us);
+            }
+            if let Some(before) = previous {
+                bucket.jitter_sum_us += u64::from(us.abs_diff(before));
+                bucket.jitter_n = bucket.jitter_n.saturating_add(1);
             }
             self.received = self.received.saturating_add(1);
             self.last_success = Some(now);

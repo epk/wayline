@@ -28,6 +28,17 @@ return {
             return type(value) == 'number' and value > 0 and value % 1 == 0
         end,
     },
+    get_telemetry_history = {
+        start = function(value)
+            return type(value) == 'number' and value >= 0 and value % 1 == 0
+        end,
+        ['end'] = function(value)
+            return type(value) == 'number' and value >= 0 and value % 1 == 0
+        end,
+        step = function(value)
+            return type(value) == 'number' and value > 0 and value % 1 == 0
+        end,
+    },
     get_history = {
         tunnel = '^[%w_-]+$',
         target = function(value)

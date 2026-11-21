@@ -189,7 +189,7 @@ fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
         ))
     }));
     if config.upstream_wifi
-        && let (_, Some(status)) = runtime::current()
+        && let Some(status) = runtime::current().wifi
         && let Some(link) = status.link
     {
         let network = if link.ssid.is_empty() {

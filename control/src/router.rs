@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
-use wayline_protocol::{Config, MAX_SERIES, Tunnel, WifiConfig};
+use wayline_protocol::{Config, MAX_SERIES, TelemetryConfig, Tunnel, WifiConfig};
 
 const VPN_PROTOCOLS: [&str; 4] = ["wgclient", "ovpnclient", "wireguard", "openvpn"];
 const NO_PEER: &str = "The tunnel has no active WireGuard peer endpoint yet.";
@@ -700,6 +700,10 @@ pub fn monitor<'a>(
         tunnels,
         wifi: settings.upstream_wifi.then_some(WifiConfig {
             interval_ms: WIFI_INTERVAL_MS,
+        }),
+        telemetry: settings.telemetry.then(|| TelemetryConfig {
+            interval_ms: crate::telemetry::INTERVAL_MS,
+            interfaces: crate::telemetry::counters(inventory),
         }),
     }
 }

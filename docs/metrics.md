@@ -29,8 +29,12 @@ combine without loss, and latency medians are medians of child medians.
   Buckets keep the sum and count, so rollups stay exact. This is the
   interarrival form of RFC 3550 without its 1/16 smoothing.
 - **Incident**: a run of consecutive 15-second buckets in which every probe was
-  lost. It ends with the first bucket that has a reply. Uptime for a range is
-  `1 − (fully lost buckets / buckets with probes)`.
+  lost. It ends with the first bucket that has a reply; a gap without probes
+  also ends it. The incident log (`incidents.json`, last 200) is written at
+  15-second resolution every 5 minutes, so it outlives the 15-second tier.
+  Upstream Wi-Fi incidents are runs of buckets in which the repeater was never
+  associated. History views derive incidents at the resolution they show.
+  Uptime for a range is `1 − (fully lost buckets / buckets with probes)`.
 
 ## Voice quality estimate (MOS)
 

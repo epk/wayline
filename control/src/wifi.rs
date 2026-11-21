@@ -1,33 +1,18 @@
 use crate::changes::{self, Event};
-use crate::history::{self, Access, HOUR, LEVELS, MIN_CLOCK};
+use crate::history;
 use crate::router::Inventory;
-use crate::runtime::{self, RUNTIME};
+use crate::runtime;
 use crate::settings::Settings;
-use anyhow::{Context, Error, Result, ensure};
-use rusqlite::types::Value as Sql;
-use rusqlite::{Connection, Row, TransactionBehavior, params_from_iter};
+use crate::store::{self, Entry, Fold, Kind, Row};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
-use std::fs;
-use std::path::{Path, PathBuf};
-use wayline_protocol::{BUCKET_SECONDS, WifiBucket, WifiLink, WifiSample, WifiState, WifiStatus};
+use wayline_protocol::{WifiBucket, WifiLink, WifiSample, WifiState, WifiStatus};
 
-const VERSION: u32 = 1;
 const UPSTREAM: &str = "upstream";
-const MEMORY_PAGES: u64 = 256;
-const PAGES: u64 = 2_048;
-const DAMAGED: &str = "The Wi-Fi history database was damaged and was reset.";
 pub const SUBJECT: &str = "wifi";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Fold {
-    Sum,
-    Min,
-    Max,
-}
-
-const FIELDS: [(&str, Fold); 26] = [
+static FIELDS: [(&str, Fold); 26] = [
     ("samples", Fold::Sum),
     ("connected", Fold::Sum),
     ("signal_n", Fold::Sum),
@@ -56,8 +41,12 @@ const FIELDS: [(&str, Fold); 26] = [
     ("roams", Fold::Sum),
 ];
 
+pub static KIND: Kind = Kind {
+    table: "wifi",
+    fields: &FIELDS,
+};
+
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Query {
     start: u64,
     end: u64,
@@ -67,7 +56,6 @@ pub struct Query {
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Point {
-    at: u64,
     samples: u32,
     uptime: Option<f64>,
     signal: Option<f64>,
@@ -92,11 +80,67 @@ pub struct Point {
     roams: u32,
 }
 
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Columns {
+    samples: Vec<u32>,
+    uptime: Vec<Option<f64>>,
+    signal: Vec<Option<f64>>,
+    signal_min: Vec<Option<i64>>,
+    signal_max: Vec<Option<i64>>,
+    noise: Vec<Option<f64>>,
+    snr: Vec<Option<f64>>,
+    tx_rate: Vec<Option<f64>>,
+    tx_rate_min: Vec<Option<f64>>,
+    rx_rate: Vec<Option<f64>>,
+    expected: Vec<Option<f64>>,
+    retries: Vec<Option<f64>>,
+    failures: Vec<Option<f64>>,
+    busy: Vec<Option<f64>>,
+    rx_air: Vec<Option<f64>>,
+    tx_air: Vec<Option<f64>>,
+    upload: Vec<Option<f64>>,
+    download: Vec<Option<f64>>,
+    tx_bytes: Vec<u64>,
+    rx_bytes: Vec<u64>,
+    disconnects: Vec<u32>,
+    roams: Vec<u32>,
+}
+
+impl Columns {
+    fn push(&mut self, point: &Point) {
+        self.samples.push(point.samples);
+        self.uptime.push(point.uptime);
+        self.signal.push(point.signal);
+        self.signal_min.push(point.signal_min);
+        self.signal_max.push(point.signal_max);
+        self.noise.push(point.noise);
+        self.snr.push(point.snr);
+        self.tx_rate.push(point.tx_rate);
+        self.tx_rate_min.push(point.tx_rate_min);
+        self.rx_rate.push(point.rx_rate);
+        self.expected.push(point.expected);
+        self.retries.push(point.retries);
+        self.failures.push(point.failures);
+        self.busy.push(point.busy);
+        self.rx_air.push(point.rx_air);
+        self.tx_air.push(point.tx_air);
+        self.upload.push(point.upload);
+        self.download.push(point.download);
+        self.tx_bytes.push(point.tx_bytes);
+        self.rx_bytes.push(point.rx_bytes);
+        self.disconnects.push(point.disconnects);
+        self.roams.push(point.roams);
+    }
+}
+
 #[derive(Serialize)]
 pub struct Response {
+    start: u64,
     step: u64,
+    count: usize,
     summary: Point,
-    points: Vec<Point>,
+    columns: Columns,
     events: Vec<Event>,
 }
 
@@ -116,315 +160,89 @@ pub struct View {
     history_available: bool,
 }
 
-pub fn database(config: &Settings) -> PathBuf {
-    history::database(config).with_file_name("wifi.sqlite")
+fn value(value: impl TryInto<i64>) -> Option<i64> {
+    value.try_into().ok().or(Some(i64::MAX))
 }
 
-fn cap(path: &Path) -> u64 {
-    if path.starts_with(RUNTIME) {
-        MEMORY_PAGES
-    } else {
-        PAGES
-    }
-}
-
-fn open(path: &Path, access: Access) -> Result<Connection> {
-    history::open_capped(path, access, cap(path))
-}
-
-fn columns() -> String {
-    FIELDS
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn folds() -> String {
-    FIELDS
-        .iter()
-        .map(|(name, fold)| match fold {
-            Fold::Sum => format!("sum({name})"),
-            Fold::Min => format!("min({name})"),
-            Fold::Max => format!("max({name})"),
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn schema() -> String {
-    let fields = FIELDS.iter().fold(String::new(), |mut out, (name, _)| {
-        let _ = write!(out, "{name} INTEGER,");
-        out
-    });
-    let tiers = LEVELS.iter().fold(String::new(), |mut out, (_, table)| {
-        let _ = write!(
-            out,
-            "CREATE TABLE {table}(period INTEGER NOT NULL,link INTEGER NOT NULL,{fields}PRIMARY KEY(period,link)) WITHOUT ROWID;"
-        );
-        out
-    });
-    format!(
-        "CREATE TABLE link(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,seen INTEGER NOT NULL);{tiers}"
-    )
-}
-
-fn number(value: impl TryInto<i64>) -> Sql {
-    Sql::Integer(value.try_into().unwrap_or(i64::MAX))
-}
-
-fn optional(value: Option<impl Into<i64>>) -> Sql {
-    value.map_or(Sql::Null, |value| Sql::Integer(value.into()))
-}
-
-fn values(bucket: &WifiBucket) -> Vec<Sql> {
+pub fn row(bucket: &WifiBucket) -> Row {
     vec![
-        number(bucket.samples),
-        number(bucket.connected),
-        number(bucket.signal_n),
-        number(bucket.signal_sum),
-        optional(bucket.signal_min),
-        optional(bucket.signal_max),
-        number(bucket.noise_n),
-        number(bucket.noise_sum),
-        number(bucket.tx_rate_n),
-        number(bucket.tx_rate_sum),
-        optional(bucket.tx_rate_min),
-        number(bucket.rx_rate_n),
-        number(bucket.rx_rate_sum),
-        number(bucket.expected_n),
-        number(bucket.expected_sum),
-        number(bucket.frames),
-        number(bucket.retries),
-        number(bucket.failed),
-        number(bucket.tx_bytes),
-        number(bucket.rx_bytes),
-        number(bucket.active_ms),
-        number(bucket.busy_ms),
-        number(bucket.rx_ms),
-        number(bucket.tx_ms),
-        number(bucket.disconnects),
-        number(bucket.roams),
+        value(bucket.samples),
+        value(bucket.connected),
+        value(bucket.signal_n),
+        value(bucket.signal_sum),
+        bucket.signal_min.map(i64::from),
+        bucket.signal_max.map(i64::from),
+        value(bucket.noise_n),
+        value(bucket.noise_sum),
+        value(bucket.tx_rate_n),
+        value(bucket.tx_rate_sum),
+        bucket.tx_rate_min.map(i64::from),
+        value(bucket.rx_rate_n),
+        value(bucket.rx_rate_sum),
+        value(bucket.expected_n),
+        value(bucket.expected_sum),
+        value(bucket.frames),
+        value(bucket.retries),
+        value(bucket.failed),
+        value(bucket.tx_bytes),
+        value(bucket.rx_bytes),
+        value(bucket.active_ms),
+        value(bucket.busy_ms),
+        value(bucket.rx_ms),
+        value(bucket.tx_ms),
+        value(bucket.disconnects),
+        value(bucket.roams),
     ]
 }
 
-struct Cursor<'row, 'statement> {
-    row: &'row Row<'statement>,
-    index: usize,
-}
-
-impl Cursor<'_, '_> {
-    fn raw(&mut self) -> rusqlite::Result<Option<i64>> {
-        self.index += 1;
-        self.row.get(self.index)
-    }
-
-    fn big(&mut self) -> rusqlite::Result<u64> {
-        Ok(self
-            .raw()?
+fn bucket(at: u64, row: &[Option<i64>]) -> WifiBucket {
+    let cell = |index: usize| row.get(index).copied().flatten();
+    let big = |index: usize| {
+        cell(index)
             .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or(0))
-    }
-
-    fn small(&mut self) -> rusqlite::Result<u32> {
-        Ok(u32::try_from(self.big()?).unwrap_or(u32::MAX))
-    }
-
-    fn signed(&mut self) -> rusqlite::Result<i64> {
-        Ok(self.raw()?.unwrap_or(0))
-    }
-
-    fn level(&mut self) -> rusqlite::Result<Option<i16>> {
-        Ok(self.raw()?.and_then(|value| i16::try_from(value).ok()))
-    }
-
-    fn rate(&mut self) -> rusqlite::Result<Option<u32>> {
-        Ok(self.raw()?.and_then(|value| u32::try_from(value).ok()))
+            .unwrap_or(0)
+    };
+    let small = |index: usize| u32::try_from(big(index)).unwrap_or(u32::MAX);
+    WifiBucket {
+        samples: small(0),
+        connected: small(1),
+        signal_n: small(2),
+        signal_sum: cell(3).unwrap_or(0),
+        signal_min: cell(4).and_then(|value| i16::try_from(value).ok()),
+        signal_max: cell(5).and_then(|value| i16::try_from(value).ok()),
+        noise_n: small(6),
+        noise_sum: cell(7).unwrap_or(0),
+        tx_rate_n: small(8),
+        tx_rate_sum: big(9),
+        tx_rate_min: cell(10).and_then(|value| u32::try_from(value).ok()),
+        rx_rate_n: small(11),
+        rx_rate_sum: big(12),
+        expected_n: small(13),
+        expected_sum: big(14),
+        frames: big(15),
+        retries: big(16),
+        failed: big(17),
+        tx_bytes: big(18),
+        rx_bytes: big(19),
+        active_ms: big(20),
+        busy_ms: big(21),
+        rx_ms: big(22),
+        tx_ms: big(23),
+        disconnects: small(24),
+        roams: small(25),
+        ..WifiBucket::empty(at)
     }
 }
 
-fn bucket(row: &Row, at: u64) -> rusqlite::Result<WifiBucket> {
-    let mut cursor = Cursor { row, index: 0 };
-    Ok(WifiBucket {
-        at,
-        samples: cursor.small()?,
-        connected: cursor.small()?,
-        signal_n: cursor.small()?,
-        signal_sum: cursor.signed()?,
-        signal_min: cursor.level()?,
-        signal_max: cursor.level()?,
-        noise_n: cursor.small()?,
-        noise_sum: cursor.signed()?,
-        tx_rate_n: cursor.small()?,
-        tx_rate_sum: cursor.big()?,
-        tx_rate_min: cursor.rate()?,
-        rx_rate_n: cursor.small()?,
-        rx_rate_sum: cursor.big()?,
-        expected_n: cursor.small()?,
-        expected_sum: cursor.big()?,
-        frames: cursor.big()?,
-        retries: cursor.big()?,
-        failed: cursor.big()?,
-        tx_bytes: cursor.big()?,
-        rx_bytes: cursor.big()?,
-        active_ms: cursor.big()?,
-        busy_ms: cursor.big()?,
-        rx_ms: cursor.big()?,
-        tx_ms: cursor.big()?,
-        disconnects: cursor.small()?,
-        roams: cursor.small()?,
-    })
-}
-
-fn convert(path: &Path) -> Result<bool> {
-    let mut connection = open(path, Access::ReadWrite)?;
-    let current: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current >= VERSION {
-        return Ok(false);
-    }
-    ensure!(
-        runtime::now() >= MIN_CLOCK,
-        "The clock is not synchronized."
-    );
-    let tables: u32 =
-        connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
-    if tables > 0 {
-        drop(connection);
-        history::quarantine(path, DAMAGED)?;
-        connection = open(path, Access::ReadWrite)?;
-    }
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(&schema())?;
-    transaction.pragma_update(None, "user_version", VERSION)?;
-    transaction.commit()?;
-    Ok(true)
-}
-
-fn span(buckets: &[WifiBucket]) -> Option<(u64, u64)> {
-    let periods = buckets.iter().map(|bucket| bucket.at / BUCKET_SECONDS);
-    Some((periods.clone().min()?, periods.max()?))
-}
-
-fn append(path: &Path, days: u32, now: u64, buckets: &[WifiBucket]) -> Result<()> {
-    let mut connection = open(path, Access::ReadWrite)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute(
-        "INSERT INTO link(name,seen) VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET seen=excluded.seen WHERE seen<excluded.seen",
-        (UPSTREAM, now / HOUR),
-    )?;
-    let link: i64 =
-        transaction.query_row("SELECT id FROM link WHERE name=?1", [UPSTREAM], |row| {
-            row.get(0)
-        })?;
-    let marks = vec!["?"; FIELDS.len()].join(",");
-    {
-        let mut insert = transaction.prepare(&format!(
-            "INSERT OR IGNORE INTO {}(period,link,{}) VALUES(?,?,{marks})",
-            LEVELS[0].1,
-            columns()
-        ))?;
-        for item in buckets {
-            let mut arguments = vec![number(item.at / BUCKET_SECONDS), Sql::Integer(link)];
-            arguments.extend(values(item));
-            insert.execute(params_from_iter(arguments))?;
-        }
-    }
-    if let Some(mut range) = span(buckets) {
-        for pair in LEVELS.windows(2) {
-            let [(child_step, child), (step, parent)] = pair else {
-                continue;
-            };
-            if history::retained(days, *step) == 0 {
-                break;
-            }
-            let ratio = step / child_step;
-            let (low, high) = history::aligned(range, ratio);
-            transaction.execute(
-                &format!(
-                    "INSERT OR REPLACE INTO {parent}(period,link,{}) SELECT period/?1,link,{} FROM {child} WHERE period BETWEEN ?2 AND ?3 GROUP BY period/?1,link",
-                    columns(),
-                    folds()
-                ),
-                [ratio, low, high],
-            )?;
-            range = (range.0 / ratio, range.1 / ratio);
-        }
-    }
-    for (step, table) in LEVELS {
-        let kept = history::retained(days, step);
-        transaction.execute(
-            &format!("DELETE FROM {table} WHERE period<?1"),
-            [now.saturating_sub(kept) / step + u64::from(kept == 0)],
-        )?;
-    }
-    transaction.commit()?;
-    Ok(())
-}
-
-fn shrink(path: &Path) -> Result<()> {
-    let mut connection = open(path, Access::ReadWrite)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for (_, table) in LEVELS.iter().rev() {
-        transaction.execute(
-            &format!(
-                "DELETE FROM {table} WHERE period<=(SELECT period FROM {table} ORDER BY period LIMIT 1 OFFSET (SELECT count(*)/10 FROM {table}))"
-            ),
-            [],
-        )?;
-    }
-    Ok(transaction.commit()?)
-}
-
-fn recover(path: &Path, error: Error) -> Result<()> {
-    if path.exists() && !history::healthy(path) {
-        history::quarantine(path, DAMAGED)?;
-    }
-    if convert(path)? {
-        return Ok(());
-    }
-    if history::pragma::<u64>(path, "page_count").unwrap_or_default() < cap(path) {
-        return Err(error);
-    }
-    shrink(path)
-}
-
-pub fn store(path: &Path, days: u32, buckets: &[WifiBucket]) -> Result<()> {
-    let now = runtime::now();
-    append(path, days, now, buckets).or_else(|error| {
-        recover(path, error)?;
-        append(path, days, now, buckets)
-    })
-}
-
-fn stored(
-    path: &Path,
-    table: &str,
-    first: u64,
-    last: u64,
-    into: &mut BTreeMap<u64, WifiBucket>,
-) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let connection = open(path, Access::ReadOnly)?;
-    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version < VERSION {
-        return Ok(());
-    }
-    let mut statement = connection.prepare(&format!(
-        "SELECT t.period,{} FROM {table} t JOIN link l ON l.id=t.link WHERE l.name=?1 AND t.period BETWEEN ?2 AND ?3",
-        columns()
-            .split(',')
-            .map(|name| format!("t.{name}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    ))?;
-    let mut rows = statement.query((UPSTREAM, first, last))?;
-    while let Some(row) = rows.next()? {
-        let period: u64 = row.get(0)?;
-        into.insert(period, bucket(row, period)?);
-    }
-    Ok(())
+pub fn entries(buckets: &[WifiBucket]) -> Vec<Entry> {
+    buckets
+        .iter()
+        .map(|item| Entry {
+            link: UPSTREAM.into(),
+            at: item.at,
+            row: row(item),
+        })
+        .collect()
 }
 
 #[expect(
@@ -460,12 +278,9 @@ fn megabits(kbps: f64) -> f64 {
     rounded(kbps / 1_000.0, 1)
 }
 
-fn point(at: u64, item: Option<&WifiBucket>, seconds: u64) -> Point {
+fn point(item: Option<&WifiBucket>, seconds: u64) -> Point {
     let Some(item) = item.filter(|item| item.samples > 0) else {
-        return Point {
-            at,
-            ..Point::default()
-        };
+        return Point::default();
     };
     let signal = average(signed(item.signal_sum), item.signal_n);
     let noise = average(signed(item.noise_sum), item.noise_n);
@@ -474,7 +289,6 @@ fn point(at: u64, item: Option<&WifiBucket>, seconds: u64) -> Point {
             .then(|| rounded(float(bytes) * 8.0 / float(seconds) / 1_000_000.0, 3))
     };
     Point {
-        at,
         samples: item.samples,
         uptime: share(u64::from(item.connected), u64::from(item.samples)),
         signal: signal.map(|value| rounded(value, 1)),
@@ -502,38 +316,26 @@ fn point(at: u64, item: Option<&WifiBucket>, seconds: u64) -> Point {
     }
 }
 
-fn series(
-    path: &Path,
+fn periods(
+    config: &Settings,
     step: u64,
     first: u64,
     last: u64,
     live: &[WifiBucket],
 ) -> Result<BTreeMap<u64, WifiBucket>> {
-    let mut periods = BTreeMap::new();
-    stored(path, history::table(step), first, last, &mut periods)?;
-    if let Some(range) = span(live) {
-        let ratio = step / BUCKET_SECONDS;
-        let (low, high) = history::aligned(range, ratio);
-        let mut fine = BTreeMap::new();
-        stored(path, LEVELS[0].1, low, high, &mut fine)?;
-        for item in live {
-            fine.insert(item.at / BUCKET_SECONDS, *item);
-        }
-        let mut coarse: BTreeMap<u64, WifiBucket> = BTreeMap::new();
-        for (period, item) in fine {
-            let parent = period / ratio;
-            coarse
-                .entry(parent)
-                .or_insert_with(|| WifiBucket::empty(parent))
-                .merge(&item);
-        }
-        periods.extend(
-            coarse
-                .into_iter()
-                .filter(|(period, _)| (first..=last).contains(period)),
-        );
-    }
-    Ok(periods)
+    let mut found = store::series(
+        &store::database(config),
+        &KIND,
+        step,
+        (first, last),
+        &entries(live),
+    )?;
+    Ok(found
+        .remove(UPSTREAM)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(period, row)| (period, bucket(period, &row)))
+        .collect())
 }
 
 pub fn query(config: &Settings, query: &Query) -> Result<Response> {
@@ -550,24 +352,33 @@ fn query_inner(config: &Settings, query: &Query) -> Result<Response> {
     )?;
     let (first, last) = (query.start / 1_000 / step, query.end / 1_000 / step);
     let (_, live) = history::fresh()?;
-    let periods = series(&database(config), step, first, last, &live)?;
+    let periods = periods(config, step, first, last, &live)?;
     let mut total = WifiBucket::empty(first);
     for item in periods.values() {
         total.merge(item);
     }
-    let points = (first..=last)
-        .map(|period| point(period * step * 1_000, periods.get(&period), step))
-        .collect();
+    let mut columns = Columns::default();
+    for period in first..=last {
+        columns.push(&point(periods.get(&period), step));
+    }
     let events = changes::read(config)
         .into_iter()
         .filter(|event| event.subject == SUBJECT && (query.start..=query.end).contains(&event.at))
         .collect();
     Ok(Response {
+        start: first * step * 1_000,
         step,
-        summary: point(query.start, Some(&total), (last - first + 1) * step),
-        points,
+        count: columns.samples.len(),
+        summary: point(Some(&total), (last - first + 1) * step),
+        columns,
         events,
     })
+}
+
+pub fn down(buckets: &[WifiBucket]) -> impl Iterator<Item = (u64, Option<bool>)> + '_ {
+    buckets
+        .iter()
+        .map(|item| (item.at, (item.samples > 0).then_some(item.connected == 0)))
 }
 
 const fn band(frequency: u32) -> &'static str {
@@ -628,7 +439,7 @@ pub fn view(config: &Settings, inventory: Option<&Inventory>, status: Option<Wif
             .find(|uplink| Some(&uplink.interface) == interface.as_ref())
             .map(|uplink| uplink.id.clone())
     });
-    let history_available = database(config).exists()
+    let history_available = store::database(config).exists()
         || status
             .as_ref()
             .is_some_and(|status| !status.buckets.is_empty());
@@ -666,44 +477,14 @@ pub const fn disabled() -> View {
     }
 }
 
-pub fn report(config: &Settings) -> Vec<String> {
-    let path = database(config);
-    let mut lines = vec![format!(
-        "Wi-Fi history database: {} bytes of {} bytes cap",
-        fs::metadata(&path).map_or(0, |meta| meta.len()),
-        cap(&path) * history::PAGE_BYTES
-    )];
-    if let Ok(connection) = open(&path, Access::ReadOnly).context("unreadable") {
-        for (_, table) in LEVELS {
-            if let Ok((rows, oldest, newest)) = connection.query_row(
-                &format!("SELECT count(*),min(period),max(period) FROM {table}"),
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, u64>(0)?,
-                        row.get::<_, Option<u64>>(1)?,
-                        row.get::<_, Option<u64>>(2)?,
-                    ))
-                },
-            ) {
-                lines.push(format!(
-                    "Wi-Fi {table}: {rows} rows, oldest period {}, newest period {}",
-                    oldest.map_or_else(String::new, |value| value.to_string()),
-                    newest.map_or_else(String::new, |value| value.to_string())
-                ));
-            }
-        }
-    }
-    lines
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{BUCKET_SECONDS, HOUR, LEVELS, append, open, point, series, store};
-    use crate::history::Access;
+    use super::{KIND, entries, point};
+    use crate::history::{HOUR, LEVELS};
     use crate::runtime;
+    use crate::store;
     use anyhow::{Result, ensure};
-    use wayline_protocol::WifiBucket;
+    use wayline_protocol::{BUCKET_SECONDS, WifiBucket};
 
     fn sample(at: u64, index: u64) -> WifiBucket {
         let signal = -50 - i16::try_from(index % 20).unwrap_or(0);
@@ -743,30 +524,42 @@ mod tests {
     }
 
     #[test]
+    fn rows_round_trip() {
+        let item = sample(1_800_000_000, 7);
+        let row = super::row(&item);
+        assert_eq!(row.len(), KIND.fields.len());
+        assert_eq!(super::bucket(item.at, &row), item);
+    }
+
+    #[test]
     fn buckets_store_and_roll_up_exactly() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("wifi.sqlite");
+        let database = directory.path().join("telemetry.sqlite");
         let start = runtime::now() / HOUR * HOUR - 2 * HOUR;
         let buckets = hour(start);
-        store(&database, 30, &buckets)?;
-        store(&database, 30, &buckets)?;
-        let connection = open(&database, Access::ReadOnly)?;
+        store::store(&database, 30, &KIND, &entries(&buckets))?;
+        store::store(&database, 30, &KIND, &entries(&buckets))?;
+        let connection = store::open_for_test(&database)?;
         for ((_, table), expected) in LEVELS.iter().zip([240, 60, 12, 1]) {
             let rows: i64 =
-                connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                connection.query_row(&format!("SELECT count(*) FROM wifi_{table}"), [], |row| {
                     row.get(0)
                 })?;
             ensure!(rows == expected, "{table} has {rows} rows.");
         }
-        let periods = series(&database, 3_600, start / HOUR, start / HOUR, &[])?;
-        let total = periods.get(&(start / HOUR)).copied().unwrap_or_default();
+        let found = store::series(&database, &KIND, 3_600, (start / HOUR, start / HOUR), &[])?;
+        let row = found
+            .get("upstream")
+            .and_then(|rows| rows.get(&(start / HOUR)))
+            .cloned()
+            .unwrap_or_default();
+        let total = super::bucket(start / HOUR, &row);
         let mut expected = WifiBucket::empty(start / HOUR);
         for item in &buckets {
             expected.merge(item);
         }
-        expected.at = total.at;
         ensure!(total == expected, "Rolled-up hour differs: {total:?}");
-        let shown = point(start * 1_000, Some(&total), 3_600);
+        let shown = point(Some(&total), 3_600);
         ensure!(shown.disconnects == 1 && shown.roams == 1);
         ensure!(shown.signal_min == Some(-71) && shown.signal_max == Some(-48));
         ensure!(shown.snr.is_some_and(|snr| snr > 30.0));
@@ -778,30 +571,29 @@ mod tests {
     #[test]
     fn live_buckets_fill_recent_periods() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("wifi.sqlite");
+        let database = directory.path().join("telemetry.sqlite");
         let start = runtime::now() / HOUR * HOUR - HOUR;
         let buckets = hour(start);
         let (old, live) = buckets.split_at(200);
-        store(&database, 7, old)?;
-        let periods = series(&database, 60, start / 60, start / 60 + 59, live)?;
-        ensure!(periods.len() == 60, "Missing minutes: {}", periods.len());
-        let samples: u32 = periods.values().map(|item| item.samples).sum();
+        store::store(&database, 7, &KIND, &entries(old))?;
+        let found = store::series(
+            &database,
+            &KIND,
+            60,
+            (start / 60, start / 60 + 59),
+            &entries(live),
+        )?;
+        let minutes = found
+            .get("upstream")
+            .map_or(0, std::collections::BTreeMap::len);
+        ensure!(minutes == 60, "Missing minutes: {minutes}");
+        let samples: i64 = found
+            .get("upstream")
+            .into_iter()
+            .flat_map(|rows| rows.values())
+            .filter_map(|row| row[0])
+            .sum();
         ensure!(samples == 720, "Unexpected samples {samples}.");
-        Ok(())
-    }
-
-    #[test]
-    fn expired_rows_are_pruned() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("wifi.sqlite");
-        let now = runtime::now();
-        let old = now - 40 * 86_400;
-        store(&database, 30, &[sample(old, 0)])?;
-        append(&database, 30, now, &[sample(now / 15 * 15 - 60, 1)])?;
-        let connection = open(&database, Access::ReadOnly)?;
-        let oldest: i64 =
-            connection.query_row("SELECT min(period) FROM s1h", [], |row| row.get(0))?;
-        ensure!(u64::try_from(oldest)? * 3_600 >= now - 31 * 86_400);
         Ok(())
     }
 }

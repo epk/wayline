@@ -4,7 +4,7 @@ use crate::router::Inventory;
 use crate::runtime;
 use crate::runtime::RUNTIME;
 use crate::settings::{Settings, Target};
-use crate::wifi;
+use crate::{store, wifi};
 use anyhow::{Context, Error, Result, ensure};
 use rusqlite::types::{FromSql, ToSql};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use wayline_protocol::{BUCKET_SECONDS, MAX_SERIES, Series, WifiBucket};
+use wayline_protocol::{BUCKET_SECONDS, MAX_SERIES, Series, TelemetryStatus, WifiBucket};
 
 pub const HOUR: u64 = 3_600;
 const DAY: u64 = 86_400;
@@ -23,9 +23,11 @@ const MAX_POINTS: u64 = 2_500;
 const MEMORY_PAGES: u64 = 1_024;
 const PAGES: u64 = 8_192;
 pub const PAGE_BYTES: u64 = 4_096;
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const COLUMNS: &str = "min_us,median_us,max_us,sent,lost";
 const DAMAGED: &str = "The history database was damaged and was reset.";
+const JITTER_COLUMNS: &str =
+    "jitter_sum INTEGER NOT NULL DEFAULT 0,jitter_n INTEGER NOT NULL DEFAULT 0";
 pub const LEVELS: [(u64, &str); 4] = [
     (BUCKET_SECONDS, "s15"),
     (60, "s1m"),
@@ -57,25 +59,123 @@ pub struct Query {
 
 #[derive(Serialize)]
 pub struct Response {
+    start: u64,
+    step: u64,
+    count: usize,
     series: Vec<Line>,
     events: Vec<Event>,
+    incidents: Vec<Incident>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Incident {
+    pub subject: String,
+    pub name: String,
+    pub kind: String,
+    pub start: u64,
+    pub end: Option<u64>,
+    pub detail: String,
 }
 
 #[derive(Serialize)]
 struct Line {
     id: String,
     name: String,
+    median: Vec<Option<u32>>,
+    min: Vec<Option<u32>>,
+    max: Vec<Option<u32>>,
+    jitter: Vec<Option<u32>>,
+    sent: Vec<u32>,
+    lost: Vec<u32>,
+}
+
+struct Track {
+    id: String,
+    name: String,
     points: Vec<Point>,
 }
 
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Copy, Default)]
 struct Point {
-    at: u64,
-    median: Option<f64>,
-    min: Option<f64>,
-    max: Option<f64>,
+    median: Option<u32>,
+    min: Option<u32>,
+    max: Option<u32>,
     sent: u32,
     lost: u32,
+    jitter_sum: u64,
+    jitter_n: u32,
+}
+
+impl Point {
+    fn jitter(&self) -> Option<u32> {
+        (self.jitter_n > 0)
+            .then(|| u32::try_from(self.jitter_sum / u64::from(self.jitter_n)).unwrap_or(u32::MAX))
+    }
+
+    const fn down(&self) -> bool {
+        self.sent > 0 && self.lost == self.sent
+    }
+}
+
+impl From<Track> for Line {
+    fn from(track: Track) -> Self {
+        let column = |read: fn(&Point) -> Option<u32>| track.points.iter().map(read).collect();
+        Self {
+            median: column(|point| point.median),
+            min: column(|point| point.min),
+            max: column(|point| point.max),
+            jitter: column(Point::jitter),
+            sent: track.points.iter().map(|point| point.sent).collect(),
+            lost: track.points.iter().map(|point| point.lost).collect(),
+            id: track.id,
+            name: track.name,
+        }
+    }
+}
+
+pub fn outages(
+    subject: &str,
+    name: &str,
+    detail: &str,
+    start: u64,
+    step: u64,
+    down: impl IntoIterator<Item = Option<bool>>,
+    now: u64,
+) -> Vec<Incident> {
+    let mut found: Vec<Incident> = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut last_end = start;
+    for (index, state) in down.into_iter().enumerate() {
+        let at = start + u64::try_from(index).unwrap_or(u64::MAX) * step * 1_000;
+        let end = at + step * 1_000;
+        match state {
+            Some(true) => {
+                if open.is_none() {
+                    found.push(Incident {
+                        subject: subject.into(),
+                        name: name.into(),
+                        kind: "loss".into(),
+                        start: at,
+                        end: None,
+                        detail: detail.into(),
+                    });
+                    open = Some(found.len() - 1);
+                }
+                last_end = end;
+            }
+            Some(false) | None => {
+                if let Some(index) = open.take() {
+                    found[index].end = Some(last_end);
+                }
+            }
+        }
+    }
+    if let Some(index) = open
+        && last_end + 2 * step * 1_000 < now
+    {
+        found[index].end = Some(last_end);
+    }
+    found
 }
 
 #[derive(Serialize)]
@@ -131,12 +231,25 @@ fn fresh_ring() -> Result<Vec<Series>> {
 }
 
 pub fn fresh() -> Result<(Vec<Series>, Vec<WifiBucket>)> {
+    let (series, wifi, _) = fresh_all()?;
+    Ok((series, wifi))
+}
+
+pub fn fresh_all() -> Result<(Vec<Series>, Vec<WifiBucket>, Option<TelemetryStatus>)> {
     let cutoff = cutoff()?;
-    let (mut samples, wifi) = runtime::ring();
+    let parts = runtime::ring();
+    let mut samples = parts.series;
     discard_before(&mut samples, cutoff);
-    let mut buckets = wifi.map(|wifi| wifi.buckets).unwrap_or_default();
+    let mut buckets = parts.wifi.map(|wifi| wifi.buckets).unwrap_or_default();
     buckets.retain(|bucket| bucket.at > cutoff);
-    Ok((samples, buckets))
+    let telemetry = parts.telemetry.map(|mut telemetry| {
+        telemetry.system_buckets.retain(|bucket| bucket.at > cutoff);
+        for link in &mut telemetry.link_buckets {
+            link.buckets.retain(|bucket| bucket.at > cutoff);
+        }
+        telemetry
+    });
+    Ok((samples, buckets, telemetry))
 }
 
 fn discard_before(samples: &mut [Series], cutoff: u64) {
@@ -169,9 +282,10 @@ pub fn purge() -> Result<()> {
                 "latency.sqlite.broken",
                 "events.json",
                 "facts.json",
-                "wifi.sqlite",
-                "wifi.sqlite-journal",
-                "wifi.sqlite.broken",
+                "incidents.json",
+                "telemetry.sqlite",
+                "telemetry.sqlite-journal",
+                "telemetry.sqlite.broken",
             ] {
                 remove(&root.join(name))?;
             }
@@ -273,7 +387,7 @@ fn levels(statement: impl Fn(&str) -> String) -> String {
 fn schema() -> String {
     let tiers = levels(|table| {
         format!(
-            "CREATE TABLE {table}(period INTEGER NOT NULL,series INTEGER NOT NULL,min_us INTEGER,median_us INTEGER,max_us INTEGER,sent INTEGER NOT NULL,lost INTEGER NOT NULL,PRIMARY KEY(period,series)) WITHOUT ROWID;"
+            "CREATE TABLE {table}(period INTEGER NOT NULL,series INTEGER NOT NULL,min_us INTEGER,median_us INTEGER,max_us INTEGER,sent INTEGER NOT NULL,lost INTEGER NOT NULL,{JITTER_COLUMNS},PRIMARY KEY(period,series)) WITHOUT ROWID;"
         )
     });
     format!(
@@ -334,6 +448,17 @@ fn convert(path: &Path) -> Result<bool> {
     if current >= VERSION {
         return Ok(false);
     }
+    if current == 4 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(&levels(|table| {
+            format!(
+                "ALTER TABLE {table} ADD COLUMN jitter_sum INTEGER NOT NULL DEFAULT 0;ALTER TABLE {table} ADD COLUMN jitter_n INTEGER NOT NULL DEFAULT 0;"
+            )
+        }))?;
+        transaction.pragma_update(None, "user_version", VERSION)?;
+        transaction.commit()?;
+        return Ok(true);
+    }
     ensure!(
         runtime::now() >= MIN_CLOCK,
         "The clock is not synchronized."
@@ -389,10 +514,10 @@ pub const fn aligned((low, high): (u64, u64), ratio: u64) -> (u64, u64) {
 
 fn fill(connection: &Connection, live: &[&Series]) -> Result<()> {
     connection.execute_batch(
-        "CREATE TEMP TABLE live(period INTEGER NOT NULL,series TEXT NOT NULL,min_us INTEGER,median_us INTEGER,max_us INTEGER,sent INTEGER NOT NULL,lost INTEGER NOT NULL,PRIMARY KEY(period,series)) WITHOUT ROWID;",
+        "CREATE TEMP TABLE live(period INTEGER NOT NULL,series TEXT NOT NULL,min_us INTEGER,median_us INTEGER,max_us INTEGER,sent INTEGER NOT NULL,lost INTEGER NOT NULL,jitter_sum INTEGER NOT NULL,jitter_n INTEGER NOT NULL,PRIMARY KEY(period,series)) WITHOUT ROWID;",
     )?;
     let mut insert =
-        connection.prepare("INSERT OR REPLACE INTO live VALUES(?1,?2,?3,?4,?5,?6,?7)")?;
+        connection.prepare("INSERT OR REPLACE INTO live VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")?;
     for series in live {
         for bucket in &series.buckets {
             insert.execute(params![
@@ -402,7 +527,9 @@ fn fill(connection: &Connection, live: &[&Series]) -> Result<()> {
                 bucket.median_us,
                 bucket.max_us,
                 bucket.sent,
-                bucket.lost
+                bucket.lost,
+                bucket.jitter_sum_us,
+                bucket.jitter_n
             ])?;
         }
     }
@@ -411,7 +538,7 @@ fn fill(connection: &Connection, live: &[&Series]) -> Result<()> {
 
 fn rollup(source: &str) -> String {
     format!(
-        "SELECT p,series,min(min_us),max(CASE WHEN n=(c+1)/2 THEN median_us END),max(max_us),sum(sent),sum(lost) FROM (SELECT period/?1 AS p,series,min_us,median_us,max_us,sent,lost,row_number() OVER (w ORDER BY median_us IS NULL,median_us) AS n,count(median_us) OVER w AS c FROM {source} WHERE period BETWEEN ?2 AND ?3 WINDOW w AS (PARTITION BY series,period/?1)) GROUP BY p,series"
+        "SELECT p,series,min(min_us),max(CASE WHEN n=(c+1)/2 THEN median_us END),max(max_us),sum(sent),sum(lost),sum(jitter_sum),sum(jitter_n) FROM (SELECT period/?1 AS p,series,min_us,median_us,max_us,sent,lost,jitter_sum,jitter_n,row_number() OVER (w ORDER BY median_us IS NULL,median_us) AS n,count(median_us) OVER w AS c FROM {source} WHERE period BETWEEN ?2 AND ?3 WINDOW w AS (PARTITION BY series,period/?1)) GROUP BY p,series"
     )
 }
 
@@ -432,7 +559,7 @@ fn append(path: &Path, days: u32, now: u64, ring: &[Series]) -> Result<BTreeSet<
             [now / HOUR],
         )?;
         transaction.execute(
-            "INSERT OR IGNORE INTO s15 SELECT period,s.id,min_us,median_us,max_us,sent,lost FROM live l JOIN series s ON s.name=l.series",
+            "INSERT OR IGNORE INTO s15 SELECT period,s.id,min_us,median_us,max_us,sent,lost,jitter_sum,jitter_n FROM live l JOIN series s ON s.name=l.series",
             [],
         )?;
         for pair in LEVELS.windows(2) {
@@ -547,19 +674,141 @@ fn collect_inner(config: &Settings) -> Result<()> {
     let path = database(config);
     runtime::directory(path.parent().context("Invalid history directory.")?)?;
     let cache = known_cache();
-    let (ring, buckets) = fresh()?;
+    let (ring, buckets, telemetry) = fresh_all()?;
     if runtime::now() < MIN_CLOCK {
         return Ok(());
     }
-    let stored = if buckets.is_empty() {
-        Ok(())
-    } else {
-        wifi::store(&wifi::database(config), config.history_days, &buckets)
-    };
+    let telemetry_path = store::database(config);
+    let days = config.history_days;
+    let mut stored = store::store(&telemetry_path, days, &wifi::KIND, &wifi::entries(&buckets));
+    if let Some(status) = &telemetry {
+        let system = store::store(
+            &telemetry_path,
+            days,
+            &crate::telemetry::SYSTEM,
+            &crate::telemetry::system_entries(status, 0),
+        );
+        let links = store::store(
+            &telemetry_path,
+            days,
+            &crate::telemetry::INTERFACE,
+            &crate::telemetry::link_entries(status, 0),
+        );
+        stored = stored.and(system).and(links);
+    }
+    let logged = record_incidents(&path, &ring, &buckets);
     let idle = ring.iter().all(|series| series.buckets.is_empty());
     if !(idle && cache.exists()) {
         publish(&cache, &store(&path, config.history_days, &ring)?)?;
     }
+    stored.and(logged)
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Logged {
+    pub series: String,
+    pub kind: String,
+    pub start: u64,
+    pub end: Option<u64>,
+}
+
+const MAX_INCIDENTS: usize = 200;
+
+pub fn ring_incidents(ring: &[Series], wifi: &[WifiBucket], now: u64) -> Vec<Logged> {
+    let mut found = Vec::new();
+    let mut runs = |series: &str, kind: &str, states: Vec<(u64, Option<bool>)>| {
+        let Some(&(first, _)) = states.first() else {
+            return;
+        };
+        let mut timeline: Vec<Option<bool>> = Vec::new();
+        let mut expected = first;
+        for (at, state) in states {
+            while expected < at {
+                timeline.push(None);
+                expected += BUCKET_SECONDS;
+            }
+            timeline.push(state);
+            expected = at + BUCKET_SECONDS;
+        }
+        found.extend(
+            outages(series, "", "", first * 1_000, BUCKET_SECONDS, timeline, now)
+                .into_iter()
+                .map(|incident| Logged {
+                    series: series.into(),
+                    kind: kind.into(),
+                    start: incident.start,
+                    end: incident.end,
+                }),
+        );
+    };
+    for series in ring {
+        runs(
+            &series.id,
+            "loss",
+            series
+                .buckets
+                .iter()
+                .map(|bucket| {
+                    (
+                        bucket.at,
+                        (bucket.sent > 0).then_some(bucket.lost == bucket.sent),
+                    )
+                })
+                .collect(),
+        );
+    }
+    runs("wifi", "wifi", wifi::down(wifi).collect());
+    found
+}
+
+pub fn merge_incidents(stored: &mut Vec<Logged>, fresh: Vec<Logged>) {
+    for incident in fresh {
+        let overlapping = stored.iter_mut().find(|known| {
+            known.series == incident.series
+                && known.kind == incident.kind
+                && known.start <= incident.start
+                && known.end.is_none_or(|end| end >= incident.start)
+        });
+        match overlapping {
+            Some(known) => {
+                known.end = match (known.end, incident.end) {
+                    (_, None) => None,
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (None, Some(right)) => Some(right),
+                };
+            }
+            None => stored.push(incident),
+        }
+    }
+    stored.sort_by_key(|incident| incident.start);
+    let excess = stored.len().saturating_sub(MAX_INCIDENTS);
+    stored.drain(..excess);
+}
+
+fn incidents_path(path: &Path) -> PathBuf {
+    path.with_file_name("incidents.json")
+}
+
+fn record_incidents(path: &Path, ring: &[Series], wifi: &[WifiBucket]) -> Result<()> {
+    let file = incidents_path(path);
+    let mut stored: Vec<Logged> = runtime::load(&file);
+    let before = stored.clone();
+    merge_incidents(
+        &mut stored,
+        ring_incidents(ring, wifi, runtime::now() * 1_000),
+    );
+    if stored != before {
+        runtime::store(&file, &stored)?;
+    }
+    Ok(())
+}
+
+pub fn logged_incidents(config: &Settings, ring: &[Series], wifi: &[WifiBucket]) -> Vec<Logged> {
+    let mut stored: Vec<Logged> = runtime::load(incidents_path(&database(config)));
+    merge_incidents(
+        &mut stored,
+        ring_incidents(ring, wifi, runtime::now() * 1_000),
+    );
     stored
 }
 
@@ -590,16 +839,18 @@ pub fn report(config: &Settings) -> Result<Report> {
     })
 }
 
-fn reader(path: &Path) -> Result<Connection> {
+fn reader(path: &Path) -> Result<(Connection, bool)> {
     if path.exists() {
         let connection = open(path, Access::ReadOnly)?;
-        if connection.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))? >= 3 {
-            return Ok(connection);
+        let version =
+            connection.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?;
+        if version >= 3 {
+            return Ok((connection, version >= 5));
         }
     }
     let connection = Connection::open_in_memory()?;
     connection.execute_batch(&schema())?;
-    Ok(connection)
+    Ok((connection, true))
 }
 
 fn lines(
@@ -608,7 +859,7 @@ fn lines(
     query: &Query,
     ring: &[Series],
     subjects: Vec<Subject>,
-) -> Result<Vec<Line>> {
+) -> Result<Vec<Track>> {
     if subjects.is_empty() {
         return Ok(Vec::new());
     }
@@ -621,18 +872,13 @@ fn lines(
         })
         .collect();
     let ratio = step / BUCKET_SECONDS;
-    let blank: Vec<Point> = (first..=last)
-        .map(|period| Point {
-            at: period * step * 1_000,
-            ..Point::default()
-        })
-        .collect();
-    let (identities, mut lines): (Vec<String>, Vec<Line>) = subjects
+    let blank = vec![Point::default(); usize::try_from(last - first + 1)?];
+    let (identities, mut lines): (Vec<String>, Vec<Track>) = subjects
         .into_iter()
         .map(|subject| {
             (
                 subject.identity,
-                Line {
+                Track {
                     id: subject.id,
                     name: subject.name,
                     points: blank.clone(),
@@ -642,13 +888,18 @@ fn lines(
         .unzip();
     let names: Vec<&dyn ToSql> = identities.iter().map(|id| id as &dyn ToSql).collect();
     let marks = vec!["?"; names.len()].join(",");
+    let (mut connection, jitter) = reader(path)?;
+    let jitter_columns = if jitter {
+        "t.jitter_sum,t.jitter_n"
+    } else {
+        "0,0"
+    };
     let stored = |table: &str| {
         format!(
-            "SELECT t.period,s.name,t.min_us,t.median_us,t.max_us,t.sent,t.lost FROM {table} t JOIN series s ON s.id=t.series WHERE t.period BETWEEN ? AND ? AND s.name IN ({marks})"
+            "SELECT t.period,s.name,t.min_us,t.median_us,t.max_us,t.sent,t.lost,{jitter_columns} FROM {table} t JOIN series s ON s.id=t.series WHERE t.period BETWEEN ? AND ? AND s.name IN ({marks})"
         )
     };
     let index: BTreeMap<&str, usize> = identities.iter().map(String::as_str).zip(0..).collect();
-    let mut connection = reader(path)?;
     let transaction = connection.transaction()?;
     let bounds = span(&live).map(|range| aligned(range, ratio));
     if let Some((low, high)) = bounds {
@@ -673,12 +924,13 @@ fn lines(
                     .and_then(|offset| lines.get_mut(line)?.points.get_mut(offset))
             {
                 *slot = Point {
-                    at: period * step * 1_000,
-                    min: row.get::<_, Option<u32>>(2)?.map(runtime::milliseconds),
-                    median: row.get::<_, Option<u32>>(3)?.map(runtime::milliseconds),
-                    max: row.get::<_, Option<u32>>(4)?.map(runtime::milliseconds),
+                    min: row.get(2)?,
+                    median: row.get(3)?,
+                    max: row.get(4)?,
                     sent: row.get(5)?,
                     lost: row.get(6)?,
+                    jitter_sum: row.get(7)?,
+                    jitter_n: row.get(8)?,
                 };
             }
         }
@@ -755,19 +1007,49 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
             identity: router::series_id(wan.prefix(), target),
         });
     }
-    let series = lines(&database(config), step, query, &fresh_ring()?, subjects)?;
+    let tracks = lines(&database(config), step, query, &fresh_ring()?, subjects)?;
+    let start = query.start / 1_000 / step * step * 1_000;
+    let detail = format!("Every probe to {target} was lost");
+    let now = runtime::now() * 1_000;
+    let mut incidents: Vec<Incident> = tracks
+        .iter()
+        .filter(|track| !track.id.starts_with("endpoint:"))
+        .flat_map(|track| {
+            outages(
+                &track.id,
+                &track.name,
+                &detail,
+                start,
+                step,
+                track
+                    .points
+                    .iter()
+                    .map(|point| (point.sent > 0).then(|| point.down())),
+                now,
+            )
+        })
+        .collect();
+    incidents.sort_by_key(|incident| std::cmp::Reverse(incident.start));
+    let count = usize::try_from(query.end / 1_000 / step - query.start / 1_000 / step + 1)?;
     let events = changes::read(config)
         .into_iter()
         .filter(|event| (query.start..=query.end).contains(&event.at))
         .collect();
-    Ok(Response { series, events })
+    Ok(Response {
+        start,
+        step,
+        count,
+        series: tracks.into_iter().map(Line::from).collect(),
+        events,
+        incidents,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Access, DAY, HOUR, LEVELS, Query, Subject, append, collect_at, convert, lines, open,
-        resolution,
+        Access, DAY, HOUR, LEVELS, Line, Query, Subject, append, collect_at, convert, lines, open,
+        outages, resolution,
     };
     use crate::runtime;
     use anyhow::{Result, ensure};
@@ -793,6 +1075,7 @@ mod tests {
             sent: 6,
             received: 4,
             success_age_ms: Some(0),
+            jitter_us: None,
             history: Vec::new(),
             buckets,
         }
@@ -806,6 +1089,8 @@ mod tests {
             min_us: Some(value),
             median_us: Some(value),
             max_us: Some(value),
+            jitter_sum_us: u64::from(value / 10),
+            jitter_n: 2,
         }
     }
 
@@ -897,11 +1182,13 @@ mod tests {
 
     fn rendered(path: &Path, step: u64, start: u64, ring: &[Series]) -> Result<serde_json::Value> {
         let query = request(start, start + HOUR, step);
-        let mut value = serde_json::to_value(lines(path, step, &query, ring, vec![subject(1)])?)?;
+        let tracks: Vec<Line> = lines(path, step, &query, ring, vec![subject(1)])?
+            .into_iter()
+            .map(Line::from)
+            .collect();
+        let mut value = serde_json::to_value(tracks)?;
         if step > 60 {
-            for point in value[0]["points"].as_array_mut().into_iter().flatten() {
-                point["median"] = serde_json::Value::Null;
-            }
+            value[0]["median"] = serde_json::Value::Null;
         }
         Ok(value)
     }
@@ -966,7 +1253,7 @@ mod tests {
             edit(
                 &database,
                 &format!(
-                    "INSERT INTO s15 SELECT {},id,1,1,1,1,0 FROM series; INSERT INTO s1m SELECT {},id,1,1,1,1,0 FROM series; INSERT INTO s5m SELECT {},id,1,1,1,1,0 FROM series;",
+                    "INSERT INTO s15 SELECT {},id,1,1,1,1,0,0,0 FROM series; INSERT INTO s1m SELECT {},id,1,1,1,1,0,0,0 FROM series; INSERT INTO s5m SELECT {},id,1,1,1,1,0,0,0 FROM series;",
                     (now - 7 * HOUR) / 15,
                     (now - 2 * DAY) / 60,
                     (now - 8 * DAY) / 300
@@ -1099,7 +1386,7 @@ mod tests {
             directory.path().join("latency.sqlite.broken").exists(),
             "The old database was not moved aside."
         );
-        ensure!(scalar(&database, "PRAGMA user_version")? == 4);
+        ensure!(scalar(&database, "PRAGMA user_version")? == 5);
         ensure!(
             scalar(
                 &database,
@@ -1130,7 +1417,7 @@ mod tests {
             "A stale schema must fail the write so that it is converted."
         );
         ensure!(convert(&database)?, "Expected a conversion.");
-        ensure!(scalar(&database, "PRAGMA user_version")? == 4);
+        ensure!(scalar(&database, "PRAGMA user_version")? == 5);
         ensure!(
             scalar(
                 &database,
@@ -1231,6 +1518,55 @@ mod tests {
     }
 
     #[test]
+    fn version_four_databases_gain_jitter_in_place() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("latency.sqlite");
+        let start = runtime::now() / HOUR * HOUR - HOUR;
+        collect_at(&database, 7, &[series(&identity(1), hour(start))])?;
+        edit(
+            &database,
+            &LEVELS.iter().fold(String::new(), |mut sql, (_, table)| {
+                let _ = write!(
+                    sql,
+                    "ALTER TABLE {table} DROP COLUMN jitter_sum;ALTER TABLE {table} DROP COLUMN jitter_n;"
+                );
+                sql
+            }),
+        )?;
+        edit(&database, "PRAGMA user_version=4;")?;
+        let before = scalar(&database, "SELECT count(*) FROM s15")?;
+        let query = request(start, start + HOUR, 60);
+        let read = lines(&database, 60, &query, &[], vec![subject(1)])?;
+        ensure!(read[0].points.iter().all(|point| point.jitter_n == 0));
+        ensure!(convert(&database)?, "The upgrade did not run.");
+        ensure!(scalar(&database, "PRAGMA user_version")? == 5);
+        ensure!(scalar(&database, "SELECT count(*) FROM s15")? == before);
+        collect_at(&database, 7, &[series(&identity(1), hour(start + HOUR))])?;
+        ensure!(scalar(&database, "SELECT sum(jitter_n) FROM s1m")? > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn outages_cover_fully_lost_runs() {
+        let states = [
+            Some(false),
+            Some(true),
+            Some(true),
+            None,
+            Some(true),
+            Some(false),
+            Some(true),
+        ];
+        let found = outages("wan", "WAN", "lost", 0, 15, states, 1_000_000);
+        assert_eq!(found.len(), 3);
+        assert_eq!((found[0].start, found[0].end), (15_000, Some(45_000)));
+        assert_eq!((found[1].start, found[1].end), (60_000, Some(75_000)));
+        assert_eq!((found[2].start, found[2].end), (90_000, Some(105_000)));
+        let ongoing = outages("wan", "WAN", "lost", 0, 15, states, 110_000);
+        assert_eq!(ongoing[2].end, None);
+    }
+
+    #[test]
     fn eleven_series_for_a_week_stay_small() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("latency.sqlite");
@@ -1252,8 +1588,8 @@ mod tests {
             line.points.iter().filter(|point| point.sent > 0).count() > 1_000,
             "Stored minutes are missing."
         );
-        let json = serde_json::to_vec(&line)?.len();
-        ensure!(json < 262_144, "Response is {json} bytes.");
+        let json = serde_json::to_vec(&Line::from(line))?.len();
+        ensure!(json < 65_536, "Response is {json} bytes.");
         ensure!(LEVELS.len() == 4, "Unexpected tiers.");
         Ok(())
     }

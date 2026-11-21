@@ -59,7 +59,7 @@ Unchanged v1 fields, plus:
   },
   "interfaces": [
     {
-      "id": "uplink:wan", "name": "wan", "device": "eth1", "kind": "uplink",
+      "id": "uplink:wan", "name": "wan", "device": "eth1", "kind": "uplink", "present": true,
       "rxBps": 1520000, "txBps": 220000, "rxBytes": 1234567890, "txBytes": 34567890,
       "errors": 0, "drops": 3, "handshakeAge": null, "endpoint": null
     }
@@ -67,7 +67,8 @@ Unchanged v1 fields, plus:
 }
 ```
 
-`kind` is `uplink`, `tunnel`, or `wifi`. `handshakeAge` (seconds) and
+`kind` is `uplink`, `tunnel`, or `wifi`. `present` is false when the network
+device does not exist right now (rates are then `null`). `handshakeAge` (seconds) and
 `endpoint` are set for WireGuard tunnels. `system` is `null` until the first
 sample. Rates are bits per second over the last sampling interval.
 

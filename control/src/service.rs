@@ -76,7 +76,9 @@ pub fn restart() -> Result<()> {
 fn apply(config: &Settings, inventory: Option<&Inventory>) -> Result<()> {
     let desired = inventory
         .map(|inventory| router::monitor(config, inventory, &Resolved::read()))
-        .filter(|desired| !desired.tunnels.is_empty() || desired.wifi.is_some());
+        .filter(|desired| {
+            !desired.tunnels.is_empty() || desired.wifi.is_some() || desired.telemetry.is_some()
+        });
     let Some(desired) = desired else {
         halt();
         return Ok(());

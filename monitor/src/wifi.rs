@@ -382,6 +382,7 @@ pub struct Sampler<S: Source> {
     source: S,
     candidates: Vec<String>,
     discovered: Option<Instant>,
+    failed: bool,
     connected: bool,
 }
 
@@ -391,6 +392,7 @@ impl<S: Source> Sampler<S> {
             source,
             candidates: Vec::new(),
             discovered: None,
+            failed: false,
             connected: false,
         }
     }
@@ -431,9 +433,16 @@ impl<S: Source> Sampler<S> {
     }
 
     pub fn observe(&mut self, now: Instant) -> Observation {
-        if self.stale(now) && !self.discover(now) {
+        if self.stale(now) {
+            self.failed = !self.discover(now);
+        }
+        if self.failed || self.candidates.is_empty() {
             self.connected = false;
-            return Observation::QueryFailed;
+            return if self.failed {
+                Observation::QueryFailed
+            } else {
+                Observation::NoClientInterface
+            };
         }
         let mut first = None;
         let mut answered = false;
@@ -945,6 +954,29 @@ mod tests {
             Observation::QueryFailed
         ));
         Ok(())
+    }
+
+    #[test]
+    fn failed_discovery_stays_failed_until_the_next_attempt() {
+        let start = Instant::now();
+        let mut failed = fake();
+        failed.devices = None;
+        let mut sampler = Sampler::new(failed);
+        for offset in [0, 5, 10, 25] {
+            assert!(matches!(
+                sampler.observe(start + Duration::from_secs(offset)),
+                Observation::QueryFailed
+            ));
+        }
+        sampler.source.devices = Some(vec!["ra0".into()]);
+        assert!(matches!(
+            sampler.observe(start + Duration::from_secs(29)),
+            Observation::QueryFailed
+        ));
+        assert!(matches!(
+            sampler.observe(start + Duration::from_secs(31)),
+            Observation::NoClientInterface
+        ));
     }
 
     #[test]
