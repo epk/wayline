@@ -2,14 +2,17 @@ use crate::changes::{self, Event};
 use crate::history::{self, LEVELS};
 use crate::runtime::{self, RUNTIME};
 use anyhow::{Context, Result, ensure};
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
-use arrow_ipc::CompressionType;
-use arrow_ipc::reader::FileReader;
-use arrow_ipc::writer::{FileWriter, IpcWriteOptions};
-use arrow_schema::{DataType, Field, Schema};
+use bytes::Bytes;
+use parquet::basic::{Compression, Encoding, ZstdLevel};
+use parquet::column::reader::ColumnReader;
+use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::parser::parse_message_type;
+use parquet::schema::types::{ColumnPath, Type};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wayline_protocol::BUCKET_SECONDS;
@@ -18,7 +21,8 @@ const SPANS: [u64; 4] = [240, 360, 288, 168];
 const MEMORY_CAP: u64 = 8 * 1024 * 1024;
 const FLASH_CAP: u64 = 96 * 1024 * 1024;
 const CHUNK_LIMIT: usize = 16 * 1024 * 1024;
-const EXTENSION: &str = "arrow";
+const EXTENSION: &str = "parquet";
+const ZSTD_LEVEL: i32 = 3;
 const DAMAGED: &str = "A history chunk was damaged and was reset.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -54,76 +58,153 @@ fn chunk_path(dir: &Path, start: u64) -> PathBuf {
     dir.join(format!("{start}.{EXTENSION}"))
 }
 
-fn schema(kind: &Kind) -> Arc<Schema> {
-    let mut fields = vec![
-        Field::new("series", DataType::Utf8, false),
-        Field::new("period", DataType::Int64, false),
-    ];
-    fields.extend(
-        kind.fields
-            .iter()
-            .map(|(name, _)| Field::new(*name, DataType::Int64, true)),
-    );
-    Arc::new(Schema::new(fields))
+fn schema(kind: &Kind) -> Result<Arc<Type>> {
+    let fields = kind
+        .fields
+        .iter()
+        .map(|(name, _)| format!("optional int64 {name};"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(Arc::new(parse_message_type(&format!(
+        "message {} {{ required binary series (UTF8); required int64 period; {fields} }}",
+        kind.name
+    ))?))
 }
 
-pub fn options() -> Result<IpcWriteOptions> {
-    Ok(IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD))?)
+fn properties(kind: &Kind) -> Result<Arc<WriterProperties>> {
+    let mut builder = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))
+        .set_created_by("wayline".into());
+    for name in std::iter::once("period").chain(kind.fields.iter().map(|(name, _)| *name)) {
+        builder = builder
+            .set_column_dictionary_enabled(ColumnPath::from(name), false)
+            .set_column_encoding(ColumnPath::from(name), Encoding::DELTA_BINARY_PACKED);
+    }
+    Ok(Arc::new(builder.build()))
 }
 
 fn encode(kind: &Kind, chunk: &Chunk) -> Result<Vec<u8>> {
-    let schema = schema(kind);
-    let mut columns: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from_iter_values(
-            chunk.keys().map(|(series, _)| series.as_str()),
-        )),
-        Arc::new(Int64Array::from_iter_values(
-            chunk
-                .keys()
-                .map(|(_, period)| i64::try_from(*period).unwrap_or(i64::MAX)),
-        )),
-    ];
+    let mut out = Vec::new();
+    let mut writer = SerializedFileWriter::new(&mut out, schema(kind)?, properties(kind)?)?;
+    let mut group = writer.next_row_group()?;
+    let names: Vec<ByteArray> = chunk
+        .keys()
+        .map(|(series, _)| ByteArray::from(series.as_str()))
+        .collect();
+    let periods = chunk
+        .keys()
+        .map(|(_, period)| i64::try_from(*period))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut column = group
+        .next_column()?
+        .context("The chunk schema has no series.")?;
+    column
+        .typed::<ByteArrayType>()
+        .write_batch(&names, None, None)?;
+    column.close()?;
+    let mut column = group
+        .next_column()?
+        .context("The chunk schema has no period.")?;
+    column
+        .typed::<Int64Type>()
+        .write_batch(&periods, None, None)?;
+    column.close()?;
     for index in 0..kind.fields.len() {
-        columns.push(Arc::new(Int64Array::from_iter(
-            chunk.values().map(|row| row.get(index).copied().flatten()),
-        )));
+        let cells = chunk.values().map(|row| row.get(index).copied().flatten());
+        let values: Vec<i64> = cells.clone().flatten().collect();
+        let levels: Vec<i16> = cells.map(|cell| i16::from(cell.is_some())).collect();
+        let mut column = group
+            .next_column()?
+            .context("The chunk schema is missing a column.")?;
+        column
+            .typed::<Int64Type>()
+            .write_batch(&values, Some(&levels), None)?;
+        column.close()?;
     }
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
-    let mut writer = FileWriter::try_new_with_options(Vec::new(), &schema, options()?)?;
-    writer.write(&batch)?;
-    writer.finish()?;
-    Ok(writer.into_inner()?)
+    group.close()?;
+    writer.close()?;
+    Ok(out)
 }
 
-fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T> {
-    batch
-        .column_by_name(name)
-        .and_then(|column| column.as_any().downcast_ref::<T>())
-        .with_context(|| format!("The history chunk has no valid {name} column."))
+fn integers(reader: ColumnReader, rows: usize, optional: bool) -> Result<Vec<Option<i64>>> {
+    let ColumnReader::Int64ColumnReader(mut reader) = reader else {
+        anyhow::bail!("The history chunk has a column of the wrong type.");
+    };
+    let (mut values, mut levels) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
+    let mut read = 0;
+    while read < rows {
+        let (records, _, _) = reader.read_records(
+            rows - read,
+            optional.then_some(&mut levels),
+            None,
+            &mut values,
+        )?;
+        ensure!(records > 0, "The history chunk ended early.");
+        read += records;
+    }
+    if !optional {
+        return Ok(values.into_iter().map(Some).collect());
+    }
+    ensure!(
+        levels.len() == rows,
+        "The history chunk has missing levels."
+    );
+    let mut present = values.into_iter();
+    Ok(levels
+        .into_iter()
+        .map(|level| if level > 0 { present.next() } else { None })
+        .collect())
+}
+
+fn names(reader: ColumnReader, rows: usize) -> Result<Vec<String>> {
+    let ColumnReader::ByteArrayColumnReader(mut reader) = reader else {
+        anyhow::bail!("The history chunk has no series names.");
+    };
+    let mut values = Vec::with_capacity(rows);
+    let mut read = 0;
+    while read < rows {
+        let (records, _, _) = reader.read_records(rows - read, None, None, &mut values)?;
+        ensure!(records > 0, "The history chunk ended early.");
+        read += records;
+    }
+    values
+        .iter()
+        .map(|value: &ByteArray| Ok(value.as_utf8()?.to_owned()))
+        .collect()
 }
 
 fn decode(kind: &Kind, bytes: Vec<u8>) -> Result<Chunk> {
+    let reader = SerializedFileReader::new(Bytes::from(bytes))?;
+    let expected: Vec<&str> = ["series", "period"]
+        .into_iter()
+        .chain(kind.fields.iter().map(|(name, _)| *name))
+        .collect();
+    let found: Vec<String> = reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .map(|column| column.name().to_owned())
+        .collect();
+    ensure!(
+        found == expected,
+        "The history chunk has an unexpected schema."
+    );
     let mut chunk = Chunk::new();
-    for batch in FileReader::try_new(Cursor::new(bytes), None)? {
-        let batch = batch?;
-        let series: &StringArray = column(&batch, "series")?;
-        let periods: &Int64Array = column(&batch, "period")?;
-        let values = kind
-            .fields
-            .iter()
-            .map(|(name, _)| column::<Int64Array>(&batch, name))
+    for index in 0..reader.num_row_groups() {
+        let group = reader.get_row_group(index)?;
+        let rows = usize::try_from(group.metadata().num_rows())?;
+        let series = names(group.get_column_reader(0)?, rows)?;
+        let periods = integers(group.get_column_reader(1)?, rows, false)?;
+        let columns = (0..kind.fields.len())
+            .map(|field| integers(group.get_column_reader(field + 2)?, rows, true))
             .collect::<Result<Vec<_>>>()?;
-        for row in 0..batch.num_rows() {
-            ensure!(
-                series.is_valid(row) && periods.is_valid(row),
-                "The history chunk has a row without a key."
-            );
-            let period = u64::try_from(periods.value(row))?;
-            let cells = values
-                .iter()
-                .map(|array| array.is_valid(row).then(|| array.value(row)))
-                .collect();
-            chunk.insert((series.value(row).to_owned(), period), cells);
+        for (row, (name, period)) in series.into_iter().zip(periods).enumerate() {
+            let period =
+                u64::try_from(period.context("The history chunk has a row without a key.")?)?;
+            let cells = columns.iter().map(|column| column[row]).collect();
+            chunk.insert((name, period), cells);
         }
     }
     Ok(chunk)
@@ -595,12 +676,12 @@ mod tests {
         let at = now / 15 * 15 - 600;
         store(root, 7, &TEST, &[entry("a", at, 3)], now)?;
         let dir = root.join("test").join(LEVELS[0].1);
-        let chunk = dir.join(format!("{}.arrow", at / 15 / 240 * 240));
+        let chunk = dir.join(format!("{}.parquet", at / 15 / 240 * 240));
         fs::write(&chunk, b"not arrow")?;
         let read = series(root, &TEST, 15, (at / 15, at / 15), &[])?;
         ensure!(read.is_empty(), "A damaged chunk was read.");
         ensure!(
-            dir.join(format!("{}.arrow.broken", at / 15 / 240 * 240))
+            dir.join(format!("{}.parquet.broken", at / 15 / 240 * 240))
                 .exists()
         );
         let events = fs::read_to_string(root.join("events.json"))?;

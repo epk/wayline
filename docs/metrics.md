@@ -19,11 +19,18 @@ combine without loss, and latency medians are lower medians of child medians.
 Live data not yet saved is rolled up through the same tiers at query time, so a
 period reads the same before and after it is saved.
 
-## Storage
+## Storage and transport
 
-History is columnar on disk, in the same Arrow format the page receives.
-Each kind (`latency`, `wifi`, `system`, `interface`) has a directory per tier,
-holding Arrow IPC files with ZSTD-compressed buffers, one file per time chunk:
+Columnar end to end, with each format used for what it was designed for:
+Parquet at rest, Arrow in motion.
+
+- **Disk: Parquet.** Each kind (`latency`, `wifi`, `system`, `interface`) has
+  a directory per tier with one Parquet file per time chunk. Series names use
+  dictionary encoding; integer columns use delta binary packing; every page is
+  zstd-compressed and carries min/max statistics.
+- **Wire and page: Arrow IPC.** History replies are one Arrow IPC stream with
+  zstd buffers, decoded in the page straight into typed arrays for the charts.
+- **Control plane: JSON.** `get_state` and commands are small nested objects.
 
 | Tier | Chunk |
 | --- | --- |
@@ -32,21 +39,36 @@ holding Arrow IPC files with ZSTD-compressed buffers, one file per time chunk:
 | 5 min | 1 day |
 | 1 hour | 7 days |
 
-Each file has the columns `series` (UTF-8), `period` (bucket start / step) and
-the kind's measurement columns (Int64, nullable). Every 5 minutes wayline-ctl
-merges new 15-second rows into the open chunk, recomputes the affected coarser
-periods, and rewrites each changed file atomically (write, fsync, rename).
-Retention deletes whole files, so it can keep up to one chunk longer than the
-nominal period. A file that cannot be read is renamed to `.broken`, logged in
-Recent changes, and only that chunk is lost. Storage is capped at 96 MB on
-flash and 8 MB in memory; the oldest chunks go first.
+Every 5 minutes wayline-ctl merges new 15-second rows into the open chunk,
+recomputes the affected coarser periods, and rewrites each changed file
+atomically (write, fsync, rename). Retention deletes whole files, so data can
+outlive the nominal period by up to one chunk. A file that cannot be read is
+renamed to `.broken` and logged in Recent changes; only that chunk is lost.
+Storage is capped at 96 MB on flash and 8 MB in memory, oldest chunks first.
 
-A week of eleven latency series takes about 360 KB; the SQLite store it
-replaced took 2.9 MB for the same data. Read the files with any Arrow tool,
-for example `pyarrow.ipc.open_file("…/latency/s1m/1795291800.arrow")`.
+Measured for one week of eleven latency series, all tiers:
 
-`latency.sqlite` from earlier versions is left in place and no longer read.
-Purge history deletes it.
+| Store | Size |
+| --- | --- |
+| SQLite (earlier versions) | 2.9 MB |
+| Arrow IPC, zstd buffers | 360 KB |
+| Parquet, delta + dictionary, zstd | 91 KB |
+
+Parquet adds about 57 KB to wayline-ctl on top of the Arrow writer the wire
+needs, and writes and reads a week of chunks faster than Arrow IPC files.
+
+Query the files directly with DuckDB, Polars or pyarrow, on the router's copy
+or one taken off it:
+
+```sql
+SELECT series, avg(median_us) / 1000 AS avg_ms, sum(lost) * 100.0 / sum(sent) AS loss_pct,
+       sum(jitter_sum) / sum(jitter_n) / 1000 AS jitter_ms
+FROM '/etc/wayline/history/latency/s5m/*.parquet' GROUP BY series;
+```
+
+Series names are path digests; `wayline-ctl doctor` and the page map them to
+tunnel and uplink names. `latency.sqlite` from earlier versions is left in
+place and no longer read. Purge history deletes it.
 
 ## Latency, loss, jitter
 

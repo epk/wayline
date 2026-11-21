@@ -1,7 +1,7 @@
-use crate::columnar;
 use anyhow::{Result, bail};
 use arrow_array::{ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, UInt32Array};
-use arrow_ipc::writer::StreamWriter;
+use arrow_ipc::CompressionType;
+use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -72,7 +72,11 @@ pub fn ipc(columns: Vec<(String, Column)>) -> Result<Vec<u8>> {
     }
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
-    let mut writer = StreamWriter::try_new_with_options(Vec::new(), &schema, columnar::options()?)?;
+    let mut writer = StreamWriter::try_new_with_options(
+        Vec::new(),
+        &schema,
+        IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD))?,
+    )?;
     writer.write(&batch)?;
     writer.finish()?;
     Ok(writer.into_inner()?)

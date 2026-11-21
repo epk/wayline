@@ -22,7 +22,8 @@ Measurement data is columnar from disk to chart. History reads accept
 ```
 
 `data` is base64 of an Arrow IPC stream (one record batch) whose buffers use
-Arrow body compression ZSTD. Any Arrow implementation reads it: arrow-rs,
+Arrow body compression ZSTD. History is stored as Parquet on the router and
+converted to Arrow per request. Any Arrow implementation reads it: arrow-rs,
 pyarrow, Polars, or flechette in the page. The table has exactly `count` rows,
 and row `i` covers `[start + i * step * 1000, start + (i + 1) * step * 1000)`.
 A null cell means no data.
