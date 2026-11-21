@@ -10,6 +10,7 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use wayline_protocol::schema::{RTT_BINS, rtt_bin};
 use wayline_protocol::{BUCKET_SECONDS, Bucket, HISTORY, Sample, Series, State, Tunnel};
 
 const LATENCY_WINDOW: usize = 5;
@@ -36,6 +37,8 @@ struct OpenBucket {
     samples: Vec<u32>,
     jitter_sum_us: u64,
     jitter_n: u16,
+    rtt: [u16; RTT_BINS],
+    uptime_ms: u64,
 }
 
 impl OpenBucket {
@@ -53,12 +56,32 @@ impl OpenBucket {
             max_us: self.samples.last().copied(),
             jitter_sum_us: self.jitter_sum_us,
             jitter_n: self.jitter_n,
+            rtt: self.rtt,
+            uptime_ms: self.uptime_ms,
         }
     }
 }
 
 pub fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn read_uptime() -> u64 {
+    let text = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+    let first = text.split_whitespace().next().unwrap_or("0");
+    let (seconds, fraction) = first.split_once('.').unwrap_or((first, "0"));
+    let centis: String = fraction.chars().chain("00".chars()).take(2).collect();
+    seconds.parse::<u64>().unwrap_or(0) * 1_000 + centis.parse::<u64>().unwrap_or(0) * 10
+}
+
+pub fn boot_millis() -> u64 {
+    static ORIGIN: std::sync::OnceLock<(Instant, u64)> = std::sync::OnceLock::new();
+    let (start, uptime) = *ORIGIN.get_or_init(|| (Instant::now(), read_uptime()));
+    uptime + millis(start.elapsed())
+}
+
+pub fn boot_start(wall_ms: u64, at: u64) -> u64 {
+    boot_millis().saturating_sub(wall_ms.saturating_sub(at * 1_000))
 }
 
 pub fn unix_millis() -> u64 {
@@ -274,6 +297,8 @@ impl<'tunnel> Probe<'tunnel> {
                     samples: Vec::with_capacity(self.sample_hint),
                     jitter_sum_us: 0,
                     jitter_n: 0,
+                    rtt: [0; RTT_BINS],
+                    uptime_ms: boot_start(unix_millis(), at),
                 });
                 self.open.len() - 1
             });
@@ -454,6 +479,8 @@ impl<'tunnel> Probe<'tunnel> {
             if bucket.samples.len() < BUCKET_SAMPLES {
                 bucket.samples.push(us);
             }
+            let bin = &mut bucket.rtt[rtt_bin(us)];
+            *bin = bin.saturating_add(1);
             if let Some(before) = previous {
                 bucket.jitter_sum_us += u64::from(us.abs_diff(before));
                 bucket.jitter_n = bucket.jitter_n.saturating_add(1);

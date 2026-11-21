@@ -105,6 +105,25 @@ fn apply(config: &Settings, inventory: Option<&Inventory>) -> Result<()> {
     Ok(())
 }
 
+fn troubled(config: &Settings) -> bool {
+    let parts = runtime::current();
+    let lossy = parts.series.iter().any(|series| {
+        series
+            .buckets
+            .last()
+            .is_some_and(|bucket| bucket.sent > 0 && bucket.lost == bucket.sent)
+    });
+    let disconnected = config.upstream_wifi
+        && parts.wifi.as_ref().is_some_and(|wifi| {
+            matches!(
+                wifi.state,
+                wayline_protocol::WifiState::Disconnected
+                    | wayline_protocol::WifiState::NoClientInterface
+            )
+        });
+    lossy || disconnected
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Lifecycle {
     Enable,
@@ -193,7 +212,12 @@ fn routine() -> Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let now = runtime::now();
-    if config.monitoring() && (now.saturating_sub(last) >= 300 || now < last) {
+    let interval = if config.monitoring() && troubled(&config) {
+        60
+    } else {
+        300
+    };
+    if config.monitoring() && (now.saturating_sub(last) >= interval || now < last) {
         let result = history::collect(&config);
         wayline_support::atomic(Path::new(&collected), now.to_string().as_bytes())?;
         result?;

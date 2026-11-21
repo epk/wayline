@@ -4,7 +4,7 @@ use crate::runtime;
 use crate::runtime::SETTINGS;
 use crate::service;
 use crate::settings::{self, Settings, Target};
-use crate::{auto, changes, egress, history, native, telemetry, update, wifi};
+use crate::{auto, changes, clock, egress, history, native, telemetry, update, wifi};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -44,6 +44,16 @@ pub struct State {
     telemetry: telemetry::View,
     probe: Probe,
     incidents: Vec<history::Incident>,
+    clock: ClockView,
+    device: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClockView {
+    synced: bool,
+    source: Option<clock::Source>,
+    pending: bool,
 }
 
 #[derive(Serialize)]
@@ -78,6 +88,8 @@ struct UplinkView {
     state: Option<Measurement>,
     median: Option<f64>,
     jitter: Option<f64>,
+    samples: usize,
+    lost: usize,
 }
 
 #[derive(Serialize)]
@@ -161,6 +173,7 @@ struct Discovery {
     snapshot: Vec<Series>,
     wifi: Option<WifiStatus>,
     telemetry: Option<TelemetryStatus>,
+    clock: Option<clock::Clock>,
     native: Result<native::List>,
     compat: native::Compat,
 }
@@ -180,7 +193,24 @@ impl Discovery {
             series: snapshot,
             wifi,
             telemetry,
+            boot_id,
+            boot_ms,
+            wall_ms,
         } = runtime::current();
+        let reachable = snapshot
+            .iter()
+            .any(|series| series.state.live() && series.received > 0);
+        let clock = (!boot_id.is_empty())
+            .then(|| {
+                clock::observe(&clock::Observation {
+                    boot: &boot_id,
+                    boot_ms,
+                    wall_ms,
+                    reachable,
+                })
+                .ok()
+            })
+            .flatten();
         let native = native::List::read();
         if compat.level == native::Level::Full && native.is_err() {
             compat.monitoring_only();
@@ -192,6 +222,7 @@ impl Discovery {
             snapshot,
             wifi,
             telemetry,
+            clock,
             native,
             compat,
         })
@@ -427,6 +458,8 @@ fn uplink_views(config: &Settings, inventory: &Inventory, snapshot: &[Series]) -
                 jitter: item
                     .and_then(|item| item.jitter_us)
                     .map(runtime::milliseconds),
+                samples: item.map_or(0, |item| item.history.len()),
+                lost: item.map_or(0, Series::lost),
             }
         })
         .collect()
@@ -532,6 +565,12 @@ fn unsupported(compat: native::Compat) -> State {
             timeout: 0,
         },
         incidents: Vec::new(),
+        clock: ClockView {
+            synced: true,
+            source: None,
+            pending: false,
+        },
+        device: crate::identity::device(),
     }
 }
 
@@ -550,6 +589,7 @@ pub fn state() -> Result<State> {
         snapshot,
         wifi,
         telemetry,
+        clock,
         compat,
         ..
     } = discovery;
@@ -603,6 +643,12 @@ pub fn state() -> Result<State> {
         incidents: incidents(&config, &inventory, &snapshot, wifi.as_ref()),
         wifi: wifi::view(&config, Some(&inventory), wifi),
         telemetry: telemetry::view(&config, telemetry),
+        clock: ClockView {
+            synced: clock.as_ref().is_none_or(|clock| clock.synced),
+            source: clock.as_ref().and_then(|clock| clock.source),
+            pending: history::pending(&config),
+        },
+        device: crate::identity::device(),
         probe: Probe {
             interval: config.interval,
             timeout: 2_000,

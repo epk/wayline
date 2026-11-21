@@ -1,16 +1,17 @@
 use crate::changes::{self, Event};
-use crate::columnar::{self, Entry, Fold, Kind, measure};
+use crate::columnar::{self, Entry};
 use crate::router;
 use crate::router::Inventory;
 use crate::runtime;
 use crate::runtime::RUNTIME;
 use crate::settings::{Settings, Target};
-use crate::{encoding, telemetry, wifi};
+use crate::{clock, encoding, telemetry, wifi};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use wayline_protocol::schema::{RTT_BINS, RTT_EDGES_US, RTT_FIRST};
 use wayline_protocol::{BUCKET_SECONDS, MAX_SERIES, Series, TelemetryStatus, WifiBucket};
 
 pub const HOUR: u64 = 3_600;
@@ -36,18 +37,7 @@ const LEGACY: [&str; 9] = [
     "series.json",
 ];
 
-pub static LATENCY: Kind = Kind {
-    name: "latency",
-    fields: &[
-        measure("min_us", Fold::Min, "us"),
-        measure("median_us", Fold::Median, "us"),
-        measure("max_us", Fold::Max, "us"),
-        measure("sent", Fold::Sum, "probes"),
-        measure("lost", Fold::Sum, "probes"),
-        measure("jitter_sum", Fold::Sum, "us (sum of |RTT difference|)"),
-        measure("jitter_n", Fold::Sum, "RTT pairs"),
-    ],
-};
+pub use wayline_protocol::schema::LATENCY;
 
 #[derive(Deserialize)]
 #[expect(
@@ -99,6 +89,9 @@ struct Line {
     min: Vec<Option<u32>>,
     max: Vec<Option<u32>>,
     jitter: Vec<Option<u32>>,
+    p50: Vec<Option<u32>>,
+    p95: Vec<Option<u32>>,
+    p99: Vec<Option<u32>>,
     sent: Vec<u32>,
     lost: Vec<u32>,
 }
@@ -118,9 +111,47 @@ struct Point {
     lost: u32,
     jitter_sum: u64,
     jitter_n: u32,
+    rtt: [u64; RTT_BINS],
+}
+
+pub fn percentile(
+    rtt: &[u64; RTT_BINS],
+    permille: u64,
+    min: Option<u32>,
+    max: Option<u32>,
+) -> Option<u32> {
+    let total: u64 = rtt.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let rank = (total * permille).div_ceil(1_000).max(1);
+    let mut before = 0;
+    for (bin, count) in rtt.iter().enumerate() {
+        if *count == 0 || before + count < rank {
+            before += count;
+            continue;
+        }
+        let low = bin
+            .checked_sub(1)
+            .map_or(0, |edge| u64::from(RTT_EDGES_US[edge]));
+        let high = RTT_EDGES_US
+            .get(bin)
+            .map(|edge| u64::from(*edge))
+            .or_else(|| max.map(u64::from))
+            .unwrap_or(low);
+        let low = min.map_or(low, |min| low.max(u64::from(min)).min(high));
+        let high = max.map_or(high, |max| high.min(u64::from(max)).max(low));
+        let value = low + (high - low) * (2 * (rank - before) - 1) / (2 * count);
+        return u32::try_from(value).ok();
+    }
+    None
 }
 
 impl Point {
+    fn percentile(&self, permille: u64) -> Option<u32> {
+        percentile(&self.rtt, permille, self.min, self.max)
+    }
+
     fn jitter(&self) -> Option<u32> {
         (self.jitter_n > 0)
             .then(|| u32::try_from(self.jitter_sum / u64::from(self.jitter_n)).unwrap_or(u32::MAX))
@@ -139,6 +170,21 @@ impl From<Track> for Line {
             min: column(|point| point.min),
             max: column(|point| point.max),
             jitter: column(Point::jitter),
+            p50: track
+                .points
+                .iter()
+                .map(|point| point.percentile(500))
+                .collect(),
+            p95: track
+                .points
+                .iter()
+                .map(|point| point.percentile(950))
+                .collect(),
+            p99: track
+                .points
+                .iter()
+                .map(|point| point.percentile(990))
+                .collect(),
             sent: track.points.iter().map(|point| point.sent).collect(),
             lost: track.points.iter().map(|point| point.lost).collect(),
             id: track.id,
@@ -180,6 +226,9 @@ impl encoding::Document for Response {
                     (format!("{index}.min"), micros(&line.min)),
                     (format!("{index}.max"), micros(&line.max)),
                     (format!("{index}.jitter"), micros(&line.jitter)),
+                    (format!("{index}.p50"), micros(&line.p50)),
+                    (format!("{index}.p95"), micros(&line.p95)),
+                    (format!("{index}.p99"), micros(&line.p99)),
                     (
                         format!("{index}.sent"),
                         encoding::Column::U32(line.sent.clone()),
@@ -298,20 +347,286 @@ pub fn fresh() -> Result<(Vec<Series>, Vec<WifiBucket>)> {
 }
 
 pub fn fresh_all() -> Result<(Vec<Series>, Vec<WifiBucket>, Option<TelemetryStatus>)> {
+    let snapshot = snapshot()?;
+    Ok((snapshot.series, snapshot.wifi, snapshot.telemetry))
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Staged {
+    series: Vec<Series>,
+    wifi: Vec<WifiBucket>,
+    telemetry: Option<TelemetryStatus>,
+}
+
+struct Snapshot {
+    series: Vec<Series>,
+    wifi: Vec<WifiBucket>,
+    telemetry: Option<TelemetryStatus>,
+    clock: Option<clock::Clock>,
+}
+
+fn restamp_all(staged: &mut Staged, offset_ms: i64) {
+    for series in &mut staged.series {
+        clock::restamp(&mut series.buckets, offset_ms);
+    }
+    clock::restamp(&mut staged.wifi, offset_ms);
+    if let Some(telemetry) = &mut staged.telemetry {
+        clock::restamp(&mut telemetry.system_buckets, offset_ms);
+        for link in &mut telemetry.link_buckets {
+            clock::restamp(&mut link.buckets, offset_ms);
+        }
+    }
+}
+
+fn snapshot() -> Result<Snapshot> {
     let cutoff = cutoff()?;
     let parts = runtime::ring();
-    let mut samples = parts.series;
-    discard_before(&mut samples, cutoff);
-    let mut buckets = parts.wifi.map(|wifi| wifi.buckets).unwrap_or_default();
-    buckets.retain(|bucket| bucket.at > cutoff);
-    let telemetry = parts.telemetry.map(|mut telemetry| {
+    let clock = if parts.boot_id.is_empty() {
+        None
+    } else {
+        Some(clock::observe(&clock::Observation {
+            boot: &parts.boot_id,
+            boot_ms: parts.boot_ms,
+            wall_ms: parts.wall_ms,
+            reachable: parts
+                .series
+                .iter()
+                .any(|series| series.state.live() && series.received > 0),
+        })?)
+    };
+    let mut staged = Staged {
+        series: parts.series,
+        wifi: parts.wifi.map(|wifi| wifi.buckets).unwrap_or_default(),
+        telemetry: parts.telemetry,
+    };
+    if let Some(clock) = clock.as_ref().filter(|clock| clock.synced) {
+        restamp_all(&mut staged, clock.offset_ms);
+    }
+    discard_before(&mut staged.series, cutoff);
+    staged.wifi.retain(|bucket| bucket.at > cutoff);
+    if let Some(telemetry) = &mut staged.telemetry {
         telemetry.system_buckets.retain(|bucket| bucket.at > cutoff);
         for link in &mut telemetry.link_buckets {
             link.buckets.retain(|bucket| bucket.at > cutoff);
         }
-        telemetry
-    });
-    Ok((samples, buckets, telemetry))
+    }
+    Ok(Snapshot {
+        series: staged.series,
+        wifi: staged.wifi,
+        telemetry: staged.telemetry,
+        clock,
+    })
+}
+
+const PENDING_LIMIT: u64 = 16 * 1024 * 1024;
+const PENDING_READ: usize = 32 * 1024 * 1024;
+
+#[derive(Default, Serialize, Deserialize)]
+struct Cursor {
+    boot: String,
+    uptime_ms: u64,
+}
+
+fn pending_dir(root: &Path) -> PathBuf {
+    root.join("pending")
+}
+
+pub fn pending(config: &Settings) -> bool {
+    fs::read_dir(pending_dir(&root(config)))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "ndjson")
+        })
+}
+
+fn stage(root: &Path, boot: &str, snapshot: &Snapshot) -> Result<()> {
+    use std::io::Write as _;
+    let cursor_path = pending_dir(root).join("cursor.json");
+    let cursor: Cursor = runtime::load(&cursor_path);
+    let after = if cursor.boot == boot {
+        cursor.uptime_ms
+    } else {
+        0
+    };
+    let newer = |uptime: u64| uptime > after;
+    fs::create_dir_all(pending_dir(root))?;
+    let staged = Staged {
+        series: snapshot
+            .series
+            .iter()
+            .map(|series| Series {
+                buckets: series
+                    .buckets
+                    .iter()
+                    .filter(|bucket| newer(bucket.uptime_ms))
+                    .copied()
+                    .collect(),
+                history: Vec::new(),
+                ..series.clone()
+            })
+            .filter(|series| !series.buckets.is_empty())
+            .collect(),
+        wifi: snapshot
+            .wifi
+            .iter()
+            .filter(|bucket| newer(bucket.uptime_ms))
+            .copied()
+            .collect(),
+        telemetry: snapshot
+            .telemetry
+            .as_ref()
+            .map(|telemetry| TelemetryStatus {
+                system_buckets: telemetry
+                    .system_buckets
+                    .iter()
+                    .filter(|bucket| newer(bucket.uptime_ms))
+                    .copied()
+                    .collect(),
+                link_buckets: telemetry
+                    .link_buckets
+                    .iter()
+                    .map(|link| wayline_protocol::LinkHistory {
+                        id: link.id.clone(),
+                        buckets: link
+                            .buckets
+                            .iter()
+                            .filter(|bucket| newer(bucket.uptime_ms))
+                            .copied()
+                            .collect(),
+                    })
+                    .collect(),
+                ..TelemetryStatus::default()
+            }),
+    };
+    let latest = staged
+        .series
+        .iter()
+        .flat_map(|series| series.buckets.iter().map(|bucket| bucket.uptime_ms))
+        .chain(staged.wifi.iter().map(|bucket| bucket.uptime_ms))
+        .chain(staged.telemetry.iter().flat_map(|telemetry| {
+            telemetry
+                .system_buckets
+                .iter()
+                .map(|bucket| bucket.uptime_ms)
+                .chain(
+                    telemetry
+                        .link_buckets
+                        .iter()
+                        .flat_map(|link| link.buckets.iter().map(|bucket| bucket.uptime_ms)),
+                )
+        }))
+        .max();
+    let Some(latest) = latest else {
+        return Ok(());
+    };
+    let directory = pending_dir(root);
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{boot}.ndjson"));
+    if fs::metadata(&path).is_ok_and(|meta| meta.len() > PENDING_LIMIT) {
+        return Ok(());
+    }
+    let mut line = serde_json::to_vec(&staged)?;
+    line.push(b'\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    file.write_all(&line)?;
+    file.sync_all()?;
+    runtime::store(
+        &cursor_path,
+        &Cursor {
+            boot: boot.to_owned(),
+            uptime_ms: latest,
+        },
+    )
+}
+
+fn flush_pending(root: &Path, days: u32, now: u64, clock: Option<&clock::Clock>) -> Result<()> {
+    let directory = pending_dir(root);
+    let files: Vec<PathBuf> = fs::read_dir(&directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "ndjson")
+        })
+        .collect();
+    for path in files {
+        let boot = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let text =
+            String::from_utf8_lossy(&wayline_support::read(&path, PENDING_READ)?).into_owned();
+        let mut staged = Staged::default();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let Ok(part) = serde_json::from_str::<Staged>(line) else {
+                continue;
+            };
+            staged.series.extend(part.series);
+            staged.wifi.extend(part.wifi);
+            if let Some(telemetry) = part.telemetry {
+                let target = staged
+                    .telemetry
+                    .get_or_insert_with(TelemetryStatus::default);
+                target.system_buckets.extend(telemetry.system_buckets);
+                for link in telemetry.link_buckets {
+                    match target
+                        .link_buckets
+                        .iter_mut()
+                        .find(|known| known.id == link.id)
+                    {
+                        Some(known) => known.buckets.extend(link.buckets),
+                        None => target.link_buckets.push(link),
+                    }
+                }
+            }
+        }
+        match clock.filter(|clock| clock.boot == boot) {
+            Some(clock) => restamp_all(&mut staged, clock.offset_ms),
+            None => changes::append(
+                root,
+                [Event {
+                    at: now * 1_000,
+                    seq: 0,
+                    subject: "history".into(),
+                    kind: "clock".into(),
+                    text: "History from a boot that never set its clock was saved with the router's unsynchronized time.".into(),
+                }],
+            )?,
+        }
+        let series = merge_series(staged.series);
+        persist(
+            root,
+            days,
+            now,
+            &series,
+            &staged.wifi,
+            staged.telemetry.as_ref(),
+        )?;
+        fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
+fn merge_series(items: Vec<Series>) -> Vec<Series> {
+    let mut merged: Vec<Series> = Vec::new();
+    for item in items {
+        match merged.iter_mut().find(|known| known.id == item.id) {
+            Some(known) => known.buckets.extend(item.buckets),
+            None => merged.push(item),
+        }
+    }
+    merged
 }
 
 fn discard_before(samples: &mut [Series], cutoff: u64) {
@@ -354,6 +669,17 @@ pub fn purge() -> Result<()> {
                 "dimensions.parquet",
             ]) {
                 remove(&root.join(name))?;
+            }
+        }
+        for root in [
+            PathBuf::from("/etc/wayline/history"),
+            Path::new(RUNTIME).join("history"),
+        ] {
+            match fs::remove_dir_all(pending_dir(&root)) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error).context("Cannot remove staged history.");
+                }
+                _ => {}
             }
         }
         remove(&known_cache())?;
@@ -450,7 +776,10 @@ fn latency_entries(ring: &[Series]) -> Vec<Entry> {
                     Some(i64::from(bucket.lost)),
                     Some(i64::try_from(bucket.jitter_sum_us).unwrap_or(i64::MAX)),
                     Some(i64::from(bucket.jitter_n)),
-                ],
+                ]
+                .into_iter()
+                .chain(bucket.rtt.iter().map(|count| Some(i64::from(*count))))
+                .collect(),
             })
         })
         .collect()
@@ -509,38 +838,59 @@ pub fn collect(config: &Settings) -> Result<()> {
 fn collect_inner(config: &Settings) -> Result<()> {
     let root = root(config);
     runtime::directory(&root)?;
-    let cache = known_cache();
-    let (ring, buckets, status) = fresh_all()?;
+    let snapshot = snapshot()?;
     let now = runtime::now();
+    if let Some(clock) = snapshot.clock.as_ref().filter(|clock| !clock.synced) {
+        return stage(&root, &clock.boot, &snapshot);
+    }
     if now < MIN_CLOCK {
         return Ok(());
     }
     let days = config.history_days;
-    let wifi = columnar::store(&root, days, &wifi::KIND, &wifi::entries(&buckets), now);
-    let system = status.as_ref().map_or(Ok(()), |status| {
+    let flushed = flush_pending(&root, days, now, snapshot.clock.as_ref());
+    let prefixes = persist(
+        &root,
+        days,
+        now,
+        &snapshot.series,
+        &snapshot.wifi,
+        snapshot.telemetry.as_ref(),
+    )?;
+    publish(&known_cache(), &prefixes)?;
+    flushed
+}
+
+fn persist(
+    root: &Path,
+    days: u32,
+    now: u64,
+    ring: &[Series],
+    buckets: &[WifiBucket],
+    status: Option<&TelemetryStatus>,
+) -> Result<BTreeSet<String>> {
+    let wifi = columnar::store(root, days, &wifi::KIND, &wifi::entries(buckets), now);
+    let system = status.map_or(Ok(()), |status| {
         columnar::store(
-            &root,
+            root,
             days,
             &telemetry::SYSTEM,
             &telemetry::system_entries(status),
             now,
         )
     });
-    let links = status.as_ref().map_or(Ok(()), |status| {
+    let links = status.map_or(Ok(()), |status| {
         columnar::store(
-            &root,
+            root,
             days,
             &telemetry::INTERFACE,
             &telemetry::link_entries(status),
             now,
         )
     });
-    let logged = record_incidents(&root, &ring, &buckets);
-    let idle = ring.iter().all(|series| series.buckets.is_empty());
-    if !(idle && cache.exists()) {
-        publish(&cache, &store(&root, days, now, &ring)?)?;
-    }
-    wifi.and(system).and(links).and(logged)
+    let logged = record_incidents(root, ring, buckets);
+    let prefixes = store(root, days, now, ring)?;
+    wifi.and(system).and(links).and(logged)?;
+    Ok(prefixes)
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -720,6 +1070,11 @@ fn lines(
                             .and_then(|value| u64::try_from(value).ok())
                             .unwrap_or(0),
                         jitter_n: small(6).unwrap_or(0),
+                        rtt: std::array::from_fn(|bin| {
+                            cell(RTT_FIRST + bin)
+                                .and_then(|value| u64::try_from(value).ok())
+                                .unwrap_or(0)
+                        }),
                     };
                 }
             }
@@ -840,6 +1195,7 @@ mod tests {
     use anyhow::{Result, ensure};
     use std::net::Ipv4Addr;
     use std::path::Path;
+    use wayline_protocol::schema::{RTT_BINS, rtt_bin};
     use wayline_protocol::{Bucket, Series, State};
 
     fn identity(index: u8) -> String {
@@ -874,6 +1230,12 @@ mod tests {
             max_us: Some(value),
             jitter_sum_us: u64::from(value / 10),
             jitter_n: 2,
+            rtt: {
+                let mut rtt = [0; RTT_BINS];
+                rtt[rtt_bin(value)] = 4 - lost;
+                rtt
+            },
+            uptime_ms: 0,
         }
     }
 
@@ -925,6 +1287,16 @@ mod tests {
             Some(values.iter().map(|value| i64::from(value / 10)).sum()),
             Some(480),
         ]
+        .into_iter()
+        .chain((0..RTT_BINS).map(|bin| {
+            Some(
+                (0..240_u64)
+                    .filter(|index| rtt_bin(value(*index)) == bin)
+                    .map(|index| 4 - i64::from(index % 3 == 0))
+                    .sum(),
+            )
+        }))
+        .collect()
     }
 
     fn stored(root: &Path, step: u64, period: u64) -> Result<Vec<Option<i64>>> {
@@ -1039,6 +1411,85 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn unsynced_buckets_are_staged_then_restamped_on_sync() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let actual = runtime::now() / HOUR * HOUR - HOUR;
+        let skewed = actual - 3 * 86_400;
+        let offset_ms = i64::try_from((actual - 600) * 1_000)?;
+        let staged_buckets = |from: u64| -> Vec<Bucket> {
+            (from..from + 8)
+                .map(|index| Bucket {
+                    uptime_ms: 600_000 + index * 15_000,
+                    ..bucket(skewed + index * 15, 20_000, 0)
+                })
+                .collect()
+        };
+        let snapshot = |buckets: Vec<Bucket>| super::Snapshot {
+            series: vec![series(&identity(1), buckets)],
+            wifi: Vec::new(),
+            telemetry: None,
+            clock: None,
+        };
+        super::stage(root, "boot1", &snapshot(staged_buckets(0)))?;
+        super::stage(root, "boot1", &snapshot(staged_buckets(4)))?;
+        let staged = std::fs::read_to_string(root.join("pending/boot1.ndjson"))?;
+        ensure!(staged.lines().count() == 2, "Expected two staged lines.");
+        let synced = crate::clock::Clock {
+            boot: "boot1".into(),
+            synced: true,
+            source: Some(crate::clock::Source::Ntp),
+            offset_ms,
+        };
+        super::flush_pending(root, 7, runtime::now(), Some(&synced))?;
+        ensure!(
+            !root.join("pending/boot1.ndjson").exists(),
+            "Staged file remains."
+        );
+        let first = actual / 15;
+        let read = columnar::series(root, &LATENCY, 15, (first, first + 20), &[])?;
+        let periods: Vec<u64> = read
+            .get(&identity(1))
+            .map(|rows| rows.keys().copied().collect())
+            .unwrap_or_default();
+        ensure!(
+            periods.len() == 12,
+            "Stored {} restamped buckets.",
+            periods.len()
+        );
+        ensure!(
+            periods[0] == first,
+            "First bucket at {} not {first}.",
+            periods[0]
+        );
+        let old = columnar::series(root, &LATENCY, 15, (skewed / 15, skewed / 15 + 20), &[])?;
+        ensure!(old.is_empty(), "Buckets were stored at the skewed time.");
+        Ok(())
+    }
+
+    #[test]
+    fn percentiles_land_inside_their_bin() {
+        let mut rtt = [0; RTT_BINS];
+        rtt[rtt_bin(12_000)] = 90;
+        rtt[rtt_bin(120_000)] = 10;
+        let p50 = super::percentile(&rtt, 500, None, None).unwrap_or(0);
+        let p95 = super::percentile(&rtt, 950, None, None).unwrap_or(0);
+        let p99 = super::percentile(&rtt, 990, None, None).unwrap_or(0);
+        assert!((10_000..15_000).contains(&p50), "{p50}");
+        assert!((100_000..150_000).contains(&p95), "{p95}");
+        assert!(p99 >= p95, "{p99} < {p95}");
+        let tight = super::percentile(&rtt, 990, Some(11_000), Some(121_000)).unwrap_or(0);
+        assert!((100_000..=121_000).contains(&tight), "{tight}");
+        let mut slow = [0; RTT_BINS];
+        slow[RTT_BINS - 1] = 3;
+        assert_eq!(
+            super::percentile(&slow, 500, Some(600_000), Some(900_000)),
+            Some(750_000)
+        );
+        assert_eq!(super::percentile(&[0; RTT_BINS], 500, None, None), None);
     }
 
     #[test]

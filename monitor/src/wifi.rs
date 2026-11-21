@@ -1,4 +1,4 @@
-use crate::probe::{bucket_start, millis, unix_millis};
+use crate::probe::{boot_start, bucket_start, millis, unix_millis};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fs;
@@ -654,8 +654,13 @@ impl Record {
 
     fn bucket(&mut self, wall_ms: u64) -> &mut WifiBucket {
         self.close(wall_ms);
-        self.open
-            .get_or_insert_with(|| WifiBucket::empty(bucket_start(wall_ms)))
+        self.open.get_or_insert_with(|| {
+            let at = bucket_start(wall_ms);
+            WifiBucket {
+                uptime_ms: boot_start(wall_ms, at),
+                ..WifiBucket::empty(at)
+            }
+        })
     }
 
     fn remember(&mut self, sample: WifiSample) {

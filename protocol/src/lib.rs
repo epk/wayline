@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
+pub mod schema;
+
 pub const HISTORY: usize = 64;
 pub const MAX_SERIES: usize = 90;
 pub const BUCKET_SECONDS: u64 = 15;
@@ -111,13 +113,19 @@ pub struct Status {
     pub uptime_ms: u64,
     pub interval_ms: u64,
     pub tunnels: Vec<Series>,
+    #[serde(default)]
+    pub boot_id: String,
+    #[serde(default)]
+    pub boot_ms: u64,
+    #[serde(default)]
+    pub wall_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wifi: Option<WifiStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetryStatus>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Series {
     pub id: String,
     pub name: String,
@@ -148,6 +156,10 @@ pub struct Bucket {
     pub jitter_sum_us: u64,
     #[serde(default)]
     pub jitter_n: u16,
+    #[serde(default)]
+    pub rtt: [u16; schema::RTT_BINS],
+    #[serde(default)]
+    pub uptime_ms: u64,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -270,6 +282,8 @@ pub struct WifiBucket {
     pub tx_ms: u64,
     pub disconnects: u32,
     pub roams: u32,
+    #[serde(default)]
+    pub uptime_ms: u64,
 }
 
 fn lower<T: Ord>(left: Option<T>, right: Option<T>) -> Option<T> {
@@ -317,6 +331,7 @@ impl WifiBucket {
             tx_ms: 0,
             disconnects: 0,
             roams: 0,
+            uptime_ms: 0,
         }
     }
 
@@ -395,6 +410,8 @@ pub struct SystemBucket {
     pub temp_max: Option<i32>,
     pub conntrack_max: Option<u32>,
     pub conntrack_limit: Option<u32>,
+    #[serde(default)]
+    pub uptime_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,6 +428,8 @@ pub struct LinkBucket {
     pub rx_peak_bps: Option<u64>,
     pub tx_peak_bps: Option<u64>,
     pub handshake_age_max: Option<u64>,
+    #[serde(default)]
+    pub uptime_ms: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

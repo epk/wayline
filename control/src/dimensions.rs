@@ -8,18 +8,18 @@ use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::column::reader::ColumnReader;
-use parquet::data_type::{BoolType, ByteArray, ByteArrayType};
+use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const FILE: &str = "dimensions.parquet";
 const LIMIT: usize = 4 * 1024 * 1024;
-const SCHEMA: &str = "message dimensions { required binary table (UTF8); required binary series (UTF8); required binary kind (UTF8); required binary subject (UTF8); required binary name (UTF8); optional binary target (UTF8); optional binary device (UTF8); required boolean current; }";
+const SCHEMA: &str = "message dimensions { required binary table (UTF8); required binary series (UTF8); required binary kind (UTF8); required binary subject (UTF8); required binary name (UTF8); optional binary target (UTF8); optional binary device (UTF8); required int64 valid_from (TIMESTAMP(MILLIS,true)); optional int64 valid_to (TIMESTAMP(MILLIS,true)); }";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dimension {
@@ -30,7 +30,30 @@ pub struct Dimension {
     pub name: String,
     pub target: Option<String>,
     pub device: Option<String>,
-    pub current: bool,
+    pub valid_from: u64,
+    pub valid_to: Option<u64>,
+}
+
+impl Dimension {
+    fn same_labels(&self, other: &Self) -> bool {
+        (
+            &self.kind,
+            &self.subject,
+            &self.name,
+            &self.target,
+            &self.device,
+        ) == (
+            &other.kind,
+            &other.subject,
+            &other.name,
+            &other.target,
+            &other.device,
+        )
+    }
+
+    fn key(&self) -> (String, String) {
+        (self.table.clone(), self.series.clone())
+    }
 }
 
 fn row(
@@ -51,7 +74,8 @@ fn row(
         device: device
             .filter(|device| !device.is_empty())
             .map(str::to_owned),
-        current: true,
+        valid_from: 0,
+        valid_to: None,
     }
 }
 
@@ -115,8 +139,8 @@ pub fn current(config: &Settings, inventory: &Inventory) -> Vec<Dimension> {
             Some(&counter.device),
         ));
     }
-    let mut seen = std::collections::BTreeSet::new();
-    found.retain(|item| seen.insert((item.table.clone(), item.series.clone())));
+    let mut seen = BTreeSet::new();
+    found.retain(|item| seen.insert(item.key()));
     found
 }
 
@@ -146,23 +170,10 @@ fn optional_strings(reader: ColumnReader, rows: usize) -> Result<Vec<Option<Stri
         .collect()
 }
 
-fn flags(reader: ColumnReader, rows: usize) -> Result<Vec<bool>> {
-    let ColumnReader::BoolColumnReader(mut reader) = reader else {
-        anyhow::bail!("The dimension table has no current flags.");
-    };
-    let mut values = Vec::with_capacity(rows);
-    let mut read = 0;
-    while read < rows {
-        let (records, _, _) = reader.read_records(rows - read, None, None, &mut values)?;
-        ensure!(records > 0, "The dimension table ended early.");
-        read += records;
-    }
-    Ok(values)
-}
-
 pub fn read(path: &Path) -> Result<Vec<Dimension>> {
     let reader = SerializedFileReader::new(Bytes::from(wayline_support::read(path, LIMIT)?))?;
     let mut found = Vec::new();
+    let millis = |value: Option<i64>| value.and_then(|value| u64::try_from(value).ok());
     for index in 0..reader.num_row_groups() {
         let group = reader.get_row_group(index)?;
         let rows = usize::try_from(group.metadata().num_rows())?;
@@ -171,7 +182,8 @@ pub fn read(path: &Path) -> Result<Vec<Dimension>> {
             (text(0)?, text(1)?, text(2)?, text(3)?, text(4)?);
         let targets = optional_strings(group.get_column_reader(5)?, rows)?;
         let devices = optional_strings(group.get_column_reader(6)?, rows)?;
-        let current = flags(group.get_column_reader(7)?, rows)?;
+        let from = columnar::integers(group.get_column_reader(7)?, rows, false)?;
+        let to = columnar::integers(group.get_column_reader(8)?, rows, true)?;
         for index in 0..rows {
             found.push(Dimension {
                 table: tables[index].clone(),
@@ -181,7 +193,8 @@ pub fn read(path: &Path) -> Result<Vec<Dimension>> {
                 name: names[index].clone(),
                 target: targets[index].clone(),
                 device: devices[index].clone(),
-                current: current[index],
+                valid_from: millis(from[index]).unwrap_or(0),
+                valid_to: millis(to[index]),
             });
         }
     }
@@ -190,19 +203,20 @@ pub fn read(path: &Path) -> Result<Vec<Dimension>> {
 
 fn encode(rows: &[Dimension]) -> Result<Vec<u8>> {
     let columns = serde_json::json!([
-        {"name": "table", "unit": "kind directory the series belongs to"},
-        {"name": "series", "unit": "series key in that kind's files"},
-        {"name": "kind", "unit": "tunnel, wan, uplink, endpoint, wifi or system"},
-        {"name": "subject", "unit": "identifier used by the page and API"},
-        {"name": "name", "unit": "display name"},
-        {"name": "target", "unit": "probe destination"},
-        {"name": "device", "unit": "network device"},
-        {"name": "current", "unit": "still configured on the router"}
+        {"name": "table", "unit": "text", "description": "Kind directory the series belongs to"},
+        {"name": "series", "unit": "text", "description": "Series key in that kind's files"},
+        {"name": "kind", "unit": "text", "description": "tunnel, wan, uplink, endpoint, wifi or system"},
+        {"name": "subject", "unit": "text", "description": "Identifier used by the page and API"},
+        {"name": "name", "unit": "text", "description": "Display name"},
+        {"name": "target", "unit": "text", "description": "Probe destination"},
+        {"name": "device", "unit": "text", "description": "Network device"},
+        {"name": "valid_from", "unit": "timestamp", "description": "UTC time this version took effect"},
+        {"name": "valid_to", "unit": "timestamp", "description": "UTC time this version ended; null while current"}
     ]);
     let properties = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
         .set_created_by("wayline".into())
-        .set_key_value_metadata(Some(columnar::metadata("dimensions", None, &columns)))
+        .set_key_value_metadata(Some(columnar::metadata("dimensions", &columns, Vec::new())))
         .build();
     let mut out = Vec::new();
     let mut writer = SerializedFileWriter::new(
@@ -247,29 +261,66 @@ fn encode(rows: &[Dimension]) -> Result<Vec<u8>> {
             .write_batch(&values, Some(&levels), None)?;
         column.close()?;
     }
-    let current: Vec<bool> = rows.iter().map(|item| item.current).collect();
-    let mut column = group.next_column()?.context("Missing current column.")?;
+    let from = rows
+        .iter()
+        .map(|item| i64::try_from(item.valid_from))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut column = group.next_column()?.context("Missing valid_from column.")?;
+    column.typed::<Int64Type>().write_batch(&from, None, None)?;
+    column.close()?;
+    let to = rows
+        .iter()
+        .filter_map(|item| item.valid_to)
+        .map(i64::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let levels: Vec<i16> = rows
+        .iter()
+        .map(|item| i16::from(item.valid_to.is_some()))
+        .collect();
+    let mut column = group.next_column()?.context("Missing valid_to column.")?;
     column
-        .typed::<BoolType>()
-        .write_batch(&current, None, None)?;
+        .typed::<Int64Type>()
+        .write_batch(&to, Some(&levels), None)?;
     column.close()?;
     group.close()?;
     writer.close()?;
     Ok(out)
 }
 
-pub fn merge(previous: Vec<Dimension>, current: Vec<Dimension>) -> Vec<Dimension> {
-    let mut rows: BTreeMap<(String, String), Dimension> = previous
-        .into_iter()
-        .map(|mut item| {
-            item.current = false;
-            ((item.table.clone(), item.series.clone()), item)
-        })
-        .collect();
-    for item in current {
-        rows.insert((item.table.clone(), item.series.clone()), item);
+pub fn merge(previous: Vec<Dimension>, current: Vec<Dimension>, now: u64) -> Vec<Dimension> {
+    let mut rows = previous;
+    let mut seen = BTreeSet::new();
+    for mut item in current {
+        seen.insert(item.key());
+        let open = rows
+            .iter_mut()
+            .find(|row| row.valid_to.is_none() && row.key() == item.key());
+        match open {
+            Some(row) if row.same_labels(&item) => {}
+            Some(row) => {
+                row.valid_to = Some(now);
+                item.valid_from = now;
+                rows.push(item);
+            }
+            None => {
+                item.valid_from = now;
+                rows.push(item);
+            }
+        }
     }
-    rows.into_values().collect()
+    for row in &mut rows {
+        if row.valid_to.is_none() && !seen.contains(&row.key()) {
+            row.valid_to = Some(now);
+        }
+    }
+    rows.sort_by(|left, right| {
+        (&left.table, &left.series, left.valid_from).cmp(&(
+            &right.table,
+            &right.series,
+            right.valid_from,
+        ))
+    });
+    rows
 }
 
 pub fn path(config: &Settings) -> PathBuf {
@@ -284,7 +335,11 @@ pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
         } else {
             Vec::new()
         };
-        let rows = merge(previous.clone(), current(config, inventory));
+        let rows = merge(
+            previous.clone(),
+            current(config, inventory),
+            runtime::now() * 1_000,
+        );
         if rows == previous {
             return Ok(());
         }
@@ -307,24 +362,45 @@ mod tests {
             name: name.into(),
             target: target.map(str::to_owned),
             device: None,
-            current: true,
+            valid_from: 0,
+            valid_to: None,
         }
     }
 
     #[test]
-    fn dimensions_round_trip_and_keep_retired_rows() -> Result<()> {
-        let rows = merge(
+    fn renames_close_old_versions_and_removals_end_them() -> Result<()> {
+        let initial = || {
             vec![
                 item("old", "Old tunnel", None),
                 item("a", "Before", Some("1.1.1.1")),
-            ],
-            vec![item("a", "After", Some("1.1.1.1")), item("b", "New", None)],
+            ]
+        };
+        let first = merge(Vec::new(), initial(), 1_000);
+        ensure!(
+            first
+                .iter()
+                .all(|row| row.valid_from == 1_000 && row.valid_to.is_none())
         );
-        ensure!(rows.len() == 3);
-        ensure!(rows.iter().any(|row| row.series == "old" && !row.current));
+        ensure!(
+            merge(first.clone(), initial(), 2_000) == first,
+            "Unchanged labels created a new version."
+        );
+        let rows = merge(
+            first,
+            vec![item("a", "After", Some("1.1.1.1")), item("b", "New", None)],
+            3_000,
+        );
+        ensure!(rows.len() == 4, "Unexpected rows: {}", rows.len());
+        let versions: Vec<&Dimension> = rows.iter().filter(|row| row.series == "a").collect();
+        ensure!(versions[0].name == "Before" && versions[0].valid_to == Some(3_000));
+        ensure!(
+            versions[1].name == "After"
+                && versions[1].valid_from == 3_000
+                && versions[1].valid_to.is_none()
+        );
         ensure!(
             rows.iter()
-                .any(|row| row.series == "a" && row.name == "After" && row.current)
+                .any(|row| row.series == "old" && row.valid_to == Some(3_000))
         );
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("dimensions.parquet");

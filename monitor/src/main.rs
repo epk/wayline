@@ -112,6 +112,7 @@ struct Monitor<'config> {
     started: Instant,
     nonce: [u8; 16],
     run_id: String,
+    boot_id: String,
     reply_hint: usize,
     wifi: Option<wifi::Wifi>,
     telemetry: Option<telemetry::Telemetry>,
@@ -150,6 +151,9 @@ impl<'config> Monitor<'config> {
                     let _ = write!(out, "{byte:02x}");
                     out
                 }),
+            boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .map(|id| id.trim().chars().filter(char::is_ascii_hexdigit).collect())
+                .unwrap_or_default(),
             reply_hint: 0,
             wifi: config.wifi.as_ref().map(wifi::Wifi::start).transpose()?,
             telemetry: config
@@ -168,6 +172,9 @@ impl<'config> Monitor<'config> {
             target: self.config.target,
             uptime_ms: probe::millis(now.duration_since(self.started)),
             interval_ms: self.config.interval_ms,
+            boot_id: self.boot_id.clone(),
+            boot_ms: probe::boot_millis(),
+            wall_ms: probe::unix_millis(),
             tunnels: self
                 .probes
                 .iter()

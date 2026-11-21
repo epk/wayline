@@ -1,5 +1,5 @@
 use crate::changes::{self, Event};
-use crate::columnar::{self, Entry, Fold, Kind, Measure, Row, measure};
+use crate::columnar::{self, Entry, Row};
 use crate::history;
 use crate::router::Inventory;
 use crate::runtime;
@@ -12,39 +12,7 @@ use wayline_protocol::{WifiBucket, WifiLink, WifiSample, WifiState, WifiStatus};
 pub const UPSTREAM: &str = "upstream";
 pub const SUBJECT: &str = "wifi";
 
-static FIELDS: [Measure; 26] = [
-    measure("samples", Fold::Sum, "samples"),
-    measure("connected", Fold::Sum, "samples"),
-    measure("signal_n", Fold::Sum, "samples"),
-    measure("signal_sum", Fold::Sum, "dBm (sum)"),
-    measure("signal_min", Fold::Min, "dBm"),
-    measure("signal_max", Fold::Max, "dBm"),
-    measure("noise_n", Fold::Sum, "samples"),
-    measure("noise_sum", Fold::Sum, "dBm (sum)"),
-    measure("tx_rate_n", Fold::Sum, "samples"),
-    measure("tx_rate_sum", Fold::Sum, "kbit/s (sum)"),
-    measure("tx_rate_min", Fold::Min, "kbit/s"),
-    measure("rx_rate_n", Fold::Sum, "samples"),
-    measure("rx_rate_sum", Fold::Sum, "kbit/s (sum)"),
-    measure("expected_n", Fold::Sum, "samples"),
-    measure("expected_sum", Fold::Sum, "kbit/s (sum)"),
-    measure("frames", Fold::Sum, "frames"),
-    measure("retries", Fold::Sum, "frames"),
-    measure("failed", Fold::Sum, "frames"),
-    measure("tx_bytes", Fold::Sum, "bytes"),
-    measure("rx_bytes", Fold::Sum, "bytes"),
-    measure("active_ms", Fold::Sum, "ms"),
-    measure("busy_ms", Fold::Sum, "ms"),
-    measure("rx_ms", Fold::Sum, "ms"),
-    measure("tx_ms", Fold::Sum, "ms"),
-    measure("disconnects", Fold::Sum, "events"),
-    measure("roams", Fold::Sum, "events"),
-];
-
-pub static KIND: Kind = Kind {
-    name: "wifi",
-    fields: &FIELDS,
-};
+pub use wayline_protocol::schema::WIFI as KIND;
 
 #[derive(Deserialize)]
 pub struct Query {

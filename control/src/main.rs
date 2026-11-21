@@ -3,12 +3,14 @@
 mod api;
 mod auto;
 mod changes;
+mod clock;
 mod columnar;
 mod dimensions;
 mod doctor;
 mod egress;
 mod encoding;
 mod history;
+mod identity;
 mod native;
 mod resolve;
 mod router;

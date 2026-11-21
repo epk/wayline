@@ -1,5 +1,6 @@
 use crate::changes::{self, Event};
 use crate::history::{self, LEVELS};
+use crate::identity;
 use crate::runtime::{self, RUNTIME};
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
@@ -24,42 +25,9 @@ const FLASH_CAP: u64 = 96 * 1024 * 1024;
 const CHUNK_LIMIT: usize = 16 * 1024 * 1024;
 const EXTENSION: &str = "parquet";
 const ZSTD_LEVEL: i32 = 3;
-pub const SCHEMA: &str = "1";
 const DAMAGED: &str = "A history chunk was damaged and was reset.";
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Fold {
-    Sum,
-    Min,
-    Max,
-    Median,
-}
-
-impl Fold {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Sum => "sum",
-            Self::Min => "min",
-            Self::Max => "max",
-            Self::Median => "median",
-        }
-    }
-}
-
-pub struct Measure {
-    pub name: &'static str,
-    pub fold: Fold,
-    pub unit: &'static str,
-}
-
-pub const fn measure(name: &'static str, fold: Fold, unit: &'static str) -> Measure {
-    Measure { name, fold, unit }
-}
-
-pub struct Kind {
-    pub name: &'static str,
-    pub fields: &'static [Measure],
-}
+pub use wayline_protocol::schema::{Fold, Kind};
 
 pub type Row = Vec<Option<i64>>;
 
@@ -170,33 +138,37 @@ fn schema(kind: &Kind) -> Result<Arc<Type>> {
     ))?))
 }
 
-pub fn metadata(kind: &str, step: Option<u64>, columns: &serde_json::Value) -> Vec<KeyValue> {
-    let mut pairs = vec![
-        ("wayline.schema", SCHEMA.to_owned()),
+pub fn metadata(
+    kind: &str,
+    columns: &serde_json::Value,
+    extra: Vec<(&'static str, String)>,
+) -> Vec<KeyValue> {
+    [
+        (
+            "wayline.schema",
+            wayline_protocol::schema::VERSION.to_owned(),
+        ),
         ("wayline.kind", kind.to_owned()),
+        ("wayline.device", identity::device()),
         ("wayline.columns", columns.to_string()),
-    ];
-    if let Some(step) = step {
-        pairs.push(("wayline.step_seconds", step.to_string()));
-    }
-    pairs
-        .into_iter()
-        .map(|(key, value)| KeyValue::new(key.to_owned(), value))
-        .collect()
+    ]
+    .into_iter()
+    .chain(extra)
+    .map(|(key, value)| KeyValue::new(key.to_owned(), value))
+    .collect()
 }
 
-fn properties(kind: &Kind, step: u64) -> Result<Arc<WriterProperties>> {
-    let columns: serde_json::Value = kind
-        .fields
-        .iter()
-        .map(|field| {
-            serde_json::json!({"name": field.name, "unit": field.unit, "rollup": field.fold.label()})
-        })
-        .collect();
+fn properties(kind: &Kind, tier: &Tier) -> Result<Arc<WriterProperties>> {
+    let columns = serde_json::to_value(kind.fields)?;
+    let extra = vec![
+        ("wayline.description", kind.description.to_owned()),
+        ("wayline.step_seconds", tier.step.to_string()),
+        ("wayline.span_seconds", (tier.span * tier.step).to_string()),
+    ];
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))
         .set_created_by("wayline".into())
-        .set_key_value_metadata(Some(metadata(kind.name, Some(step), &columns)));
+        .set_key_value_metadata(Some(metadata(kind.name, &columns, extra)));
     for name in std::iter::once("ts").chain(kind.fields.iter().map(|field| field.name)) {
         builder = builder
             .set_column_dictionary_enabled(ColumnPath::from(name), false)
@@ -205,9 +177,10 @@ fn properties(kind: &Kind, step: u64) -> Result<Arc<WriterProperties>> {
     Ok(Arc::new(builder.build()))
 }
 
-fn encode(kind: &Kind, step: u64, chunk: &Chunk) -> Result<Vec<u8>> {
+fn encode(kind: &Kind, tier: &Tier, chunk: &Chunk) -> Result<Vec<u8>> {
+    let step = tier.step;
     let mut out = Vec::new();
-    let mut writer = SerializedFileWriter::new(&mut out, schema(kind)?, properties(kind, step)?)?;
+    let mut writer = SerializedFileWriter::new(&mut out, schema(kind)?, properties(kind, tier)?)?;
     let mut group = writer.next_row_group()?;
     let names: Vec<ByteArray> = chunk
         .keys()
@@ -248,7 +221,7 @@ fn encode(kind: &Kind, step: u64, chunk: &Chunk) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn integers(reader: ColumnReader, rows: usize, optional: bool) -> Result<Vec<Option<i64>>> {
+pub fn integers(reader: ColumnReader, rows: usize, optional: bool) -> Result<Vec<Option<i64>>> {
     let ColumnReader::Int64ColumnReader(mut reader) = reader else {
         anyhow::bail!("The history chunk has a column of the wrong type.");
     };
@@ -297,11 +270,7 @@ pub fn strings(reader: ColumnReader, rows: usize) -> Result<Vec<String>> {
 
 fn decode(kind: &Kind, step: u64, bytes: Vec<u8>) -> Result<Chunk> {
     let reader = SerializedFileReader::new(Bytes::from(bytes))?;
-    let expected: Vec<&str> = ["series", "ts"]
-        .into_iter()
-        .chain(kind.fields.iter().map(|field| field.name))
-        .collect();
-    let found: Vec<String> = reader
+    let names: Vec<String> = reader
         .metadata()
         .file_metadata()
         .schema_descr()
@@ -309,18 +278,26 @@ fn decode(kind: &Kind, step: u64, bytes: Vec<u8>) -> Result<Chunk> {
         .iter()
         .map(|column| column.name().to_owned())
         .collect();
-    ensure!(
-        found == expected,
-        "The history chunk has an unexpected schema."
-    );
+    let position = |name: &str| names.iter().position(|found| found == name);
+    let series_at = position("series").context("The history chunk has no series column.")?;
+    let time_at = position("ts").context("The history chunk has no ts column.")?;
+    let fields: Vec<Option<usize>> = kind
+        .fields
+        .iter()
+        .map(|field| position(field.name))
+        .collect();
     let mut chunk = Chunk::new();
     for index in 0..reader.num_row_groups() {
         let group = reader.get_row_group(index)?;
         let rows = usize::try_from(group.metadata().num_rows())?;
-        let series = strings(group.get_column_reader(0)?, rows)?;
-        let times = integers(group.get_column_reader(1)?, rows, false)?;
-        let columns = (0..kind.fields.len())
-            .map(|field| integers(group.get_column_reader(field + 2)?, rows, true))
+        let series = strings(group.get_column_reader(series_at)?, rows)?;
+        let times = integers(group.get_column_reader(time_at)?, rows, false)?;
+        let columns = fields
+            .iter()
+            .map(|column| match column {
+                Some(column) => integers(group.get_column_reader(*column)?, rows, true),
+                None => Ok(vec![None; rows]),
+            })
             .collect::<Result<Vec<_>>>()?;
         for (row, (name, at)) in series.into_iter().zip(times).enumerate() {
             let at = u64::try_from(at.context("The history chunk has a row without a time.")?)?;
@@ -343,6 +320,7 @@ fn damaged(root: &Path, path: &Path) -> Result<()> {
         root,
         [Event {
             at: runtime::now() * 1000,
+            seq: 0,
             subject: "history".into(),
             kind: "history".into(),
             text: DAMAGED.into(),
@@ -370,14 +348,14 @@ pub fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     wayline_support::atomic(path, bytes)
 }
 
-fn save(kind: &Kind, step: u64, path: &Path, chunk: &Chunk) -> Result<()> {
+fn save(kind: &Kind, tier: &Tier, path: &Path, chunk: &Chunk) -> Result<()> {
     if chunk.is_empty() {
         return match fs::remove_file(path) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
             _ => Ok(()),
         };
     }
-    write(path, &encode(kind, step, chunk)?)
+    write(path, &encode(kind, tier, chunk)?)
 }
 
 fn starts(dir: &Path, step: u64) -> Vec<u64> {
@@ -415,7 +393,7 @@ pub fn fold(kind: &Kind, rows: &[&Row]) -> Row {
                 ),
                 Fold::Min => values.iter().min().copied(),
                 Fold::Max => values.iter().max().copied(),
-                Fold::Median => {
+                Fold::MedianOfMedians => {
                     values.sort_unstable();
                     values.get((values.len() - 1) / 2).copied()
                 }
@@ -462,7 +440,7 @@ fn merge(root: &Path, kind: &Kind, tier: &Tier, rows: Chunk, replace: bool) -> R
             }
         }
         if changed || chunk.len() != before {
-            save(kind, tier.step, &path, &chunk)?;
+            save(kind, tier, &path, &chunk)?;
         }
     }
     Ok(())
@@ -677,20 +655,38 @@ pub fn report(root: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, Fold, Kind, fold, measure, series, stamp, store, unstamp};
+    use super::{Entry, Fold, Kind, fold, series, stamp, store, unstamp};
     use crate::history::{HOUR, LEVELS};
     use crate::runtime;
     use anyhow::{Context, Result, ensure};
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::fs;
+    use wayline_protocol::schema::{Measure, measure};
+
+    static FIELDS: [Measure; 4] = [
+        measure("total", Fold::Sum, "count", "Total"),
+        measure("low", Fold::Min, "value", "Lowest"),
+        measure("high", Fold::Max, "value", "Highest"),
+        measure("middle", Fold::MedianOfMedians, "value", "Middle"),
+    ];
 
     static TEST: Kind = Kind {
         name: "test",
+        description: "Test kind",
+        fields: &FIELDS,
+    };
+
+    static NARROW: Kind = Kind {
+        name: "test",
+        description: "Test kind before a column was added",
         fields: &[
-            measure("total", Fold::Sum, "count"),
-            measure("low", Fold::Min, "value"),
-            measure("high", Fold::Max, "value"),
-            measure("middle", Fold::Median, "value"),
+            measure("total", Fold::Sum, "count", "Total"),
+            measure(
+                "retired",
+                Fold::Max,
+                "value",
+                "A column a later version dropped",
+            ),
         ],
     };
 
@@ -767,7 +763,17 @@ mod tests {
             .find(|(key, _)| key == "wayline.columns")
             .map(|(_, value)| value.clone())
             .unwrap_or_default();
-        ensure!(columns.contains("\"rollup\":\"median\""), "{columns}");
+        ensure!(
+            columns.contains("\"rollup\":\"median_of_medians\""),
+            "{columns}"
+        );
+        ensure!(columns.contains("\"description\":\"Middle\""), "{columns}");
+        ensure!(pairs.contains(&("wayline.span_seconds".into(), "3600".into())));
+        ensure!(
+            pairs
+                .iter()
+                .any(|(key, value)| key == "wayline.device" && !value.is_empty())
+        );
         let time = meta.schema_descr().column(1);
         ensure!(time.name() == "ts");
         ensure!(
@@ -829,6 +835,36 @@ mod tests {
             .filter(|(_, _, path)| path.to_string_lossy().contains(&old_hour))
             .count();
         ensure!(remaining == 0, "Expired chunks remain: {remaining}");
+        Ok(())
+    }
+
+    #[test]
+    fn older_and_newer_schemas_stay_readable() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let now = runtime::now();
+        let at = now / 900 * 900 - 900;
+        let narrow = Entry {
+            link: "a".into(),
+            at,
+            row: vec![Some(7), Some(99)],
+        };
+        store(root, 7, &NARROW, &[narrow], now)?;
+        let read = series(root, &TEST, 15, (at / 15, at / 15), &[])?;
+        let row = read
+            .get("a")
+            .and_then(|rows| rows.get(&(at / 15)))
+            .cloned()
+            .unwrap_or_default();
+        ensure!(
+            row == vec![Some(7), None, None, None],
+            "Older file read as {row:?}"
+        );
+        let events = root.join("events.json");
+        ensure!(!events.exists(), "A readable file was treated as damaged.");
+        store(root, 7, &TEST, &[entry("a", at + 15, 3)], now)?;
+        let back = series(root, &NARROW, 15, (at / 15, at / 15 + 1), &[])?;
+        ensure!(back.get("a").map_or(0, std::collections::BTreeMap::len) == 2);
         Ok(())
     }
 

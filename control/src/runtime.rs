@@ -78,6 +78,9 @@ pub struct Parts {
     pub series: Vec<Series>,
     pub wifi: Option<WifiStatus>,
     pub telemetry: Option<TelemetryStatus>,
+    pub boot_id: String,
+    pub boot_ms: u64,
+    pub wall_ms: u64,
 }
 
 pub fn current() -> Parts {
@@ -93,6 +96,9 @@ fn parts(status: Option<Status>) -> Parts {
         series: status.tunnels,
         wifi: status.wifi,
         telemetry: status.telemetry,
+        boot_id: status.boot_id,
+        boot_ms: status.boot_ms,
+        wall_ms: status.wall_ms,
     })
 }
 

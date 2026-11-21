@@ -1,4 +1,4 @@
-use crate::probe::{bucket_start, millis, unix_millis};
+use crate::probe::{boot_start, bucket_start, millis, unix_millis};
 use crate::wifi::valid_device;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -350,8 +350,10 @@ impl Record {
             uptime: observation.uptime.unwrap_or_default(),
         };
         self.system = Some(system);
+        let uptime_ms = boot_start(wall_ms, at);
         let bucket = self.open.get_or_insert_with(|| SystemBucket {
             at,
+            uptime_ms,
             ..SystemBucket::default()
         });
         bucket.samples += 1;
@@ -386,14 +388,14 @@ impl Record {
                     .cloned()
                     .unwrap_or_default();
             }
-            Self::advance(track, now, at, now_seconds, counters);
+            Self::advance(track, now, (at, uptime_ms), now_seconds, counters);
         }
     }
 
     fn advance(
         track: &mut Track,
         now: Instant,
-        at: u64,
+        (at, uptime_ms): (u64, u64),
         now_seconds: u64,
         counters: Option<Counters>,
     ) {
@@ -426,6 +428,7 @@ impl Record {
         track.live.drops = rx_drops.saturating_add(tx_drops);
         let bucket = track.open.get_or_insert_with(|| LinkBucket {
             at,
+            uptime_ms,
             ..LinkBucket::default()
         });
         bucket.samples += 1;
