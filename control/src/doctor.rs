@@ -84,24 +84,20 @@ fn history(warnings: &mut usize, settings: &Result<Settings>) {
         return;
     };
     println!("probe interval: {} s", config.interval);
-    match history::report(config) {
-        Ok(report) => {
-            println!(
-                "history database: {} bytes of {} bytes cap",
-                report.bytes, report.cap
-            );
-            for line in &report.lines {
-                println!("history {line}");
-            }
-            if report.bytes * 5 > report.cap * 4 {
-                warn(
-                    warnings,
-                    "history database",
-                    "Above 80% of its cap. The oldest rows of the coarsest tiers are removed when it fills.",
-                );
-            }
-        }
-        Err(error) => warn(warnings, "history database", &error.to_string()),
+    let report = history::report(config);
+    println!(
+        "history storage: {} bytes of {} bytes cap (Arrow IPC chunks, zstd)",
+        report.bytes, report.cap
+    );
+    for line in &report.lines {
+        println!("{line}");
+    }
+    if report.bytes * 5 > report.cap * 4 {
+        warn(
+            warnings,
+            "history storage",
+            "Above 80% of its cap. The oldest chunks are removed when it fills.",
+        );
     }
 }
 
@@ -152,9 +148,6 @@ fn wifi_status(
                 .kbps
                 .map_or_else(|| "?".into(), |value| value.to_string()),
         );
-    }
-    for line in crate::store::report(config) {
-        println!("{line}");
     }
 }
 

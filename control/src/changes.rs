@@ -29,8 +29,7 @@ pub struct Fact<'subject> {
 }
 
 pub fn read(config: &Settings) -> Vec<Event> {
-    let mut events: Vec<Event> =
-        runtime::load(history::database(config).with_file_name("events.json"));
+    let mut events: Vec<Event> = runtime::load(history::root(config).join("events.json"));
     for event in &mut events {
         if event.kind == "server" {
             event.text =
@@ -167,8 +166,8 @@ pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
 }
 
 fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
-    let database = history::database(config);
-    let facts_path = database.with_file_name("facts.json");
+    let root = history::root(config);
+    let facts_path = root.join("facts.json");
     runtime::directory(facts_path.parent().context("Invalid history directory.")?)?;
     let mut stored: BTreeMap<String, String> = runtime::load(&facts_path);
     let cache = Cache::view(config, inventory);
@@ -213,13 +212,13 @@ fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
         runtime::store(&facts_path, &stored)?;
     }
     if !added.is_empty() {
-        append(&database, added)?;
+        append(&root, added)?;
     }
     Ok(())
 }
 
-pub fn append(database: &Path, added: impl IntoIterator<Item = Event>) -> Result<()> {
-    let path = database.with_file_name("events.json");
+pub fn append(root: &Path, added: impl IntoIterator<Item = Event>) -> Result<()> {
+    let path = root.join("events.json");
     let mut events: Vec<Event> = runtime::load(&path);
     events.extend(added);
     let excess = events.len().saturating_sub(MAX_EVENTS);

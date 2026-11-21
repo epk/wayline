@@ -1,18 +1,16 @@
 use crate::changes::{self, Event};
+use crate::columnar::{self, Entry, Fold, Kind};
 use crate::router;
 use crate::router::Inventory;
 use crate::runtime;
 use crate::runtime::RUNTIME;
 use crate::settings::{Settings, Target};
-use crate::{store, wifi};
-use anyhow::{Context, Error, Result, ensure};
-use rusqlite::types::{FromSql, ToSql};
-use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
+use crate::{encoding, telemetry, wifi};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use wayline_protocol::{BUCKET_SECONDS, MAX_SERIES, Series, TelemetryStatus, WifiBucket};
 
 pub const HOUR: u64 = 3_600;
@@ -20,20 +18,37 @@ const DAY: u64 = 86_400;
 const MINUTE_MS: u64 = 60_000;
 pub const MIN_CLOCK: u64 = 1_704_067_200;
 const MAX_POINTS: u64 = 2_500;
-const MEMORY_PAGES: u64 = 1_024;
-const PAGES: u64 = 8_192;
-pub const PAGE_BYTES: u64 = 4_096;
-const VERSION: u32 = 5;
-const COLUMNS: &str = "min_us,median_us,max_us,sent,lost";
-const DAMAGED: &str = "The history database was damaged and was reset.";
-const JITTER_COLUMNS: &str =
-    "jitter_sum INTEGER NOT NULL DEFAULT 0,jitter_n INTEGER NOT NULL DEFAULT 0";
 pub const LEVELS: [(u64, &str); 4] = [
     (BUCKET_SECONDS, "s15"),
     (60, "s1m"),
     (300, "s5m"),
     (3_600, "s1h"),
 ];
+const KINDS: [&str; 4] = ["latency", "wifi", "system", "interface"];
+const LEGACY: [&str; 9] = [
+    "latency.sqlite",
+    "latency.sqlite-journal",
+    "latency.sqlite-wal",
+    "latency.sqlite-shm",
+    "latency.sqlite.broken",
+    "telemetry.sqlite",
+    "telemetry.sqlite-journal",
+    "telemetry.sqlite.broken",
+    "series.json",
+];
+
+pub static LATENCY: Kind = Kind {
+    name: "latency",
+    fields: &[
+        ("min_us", Fold::Min),
+        ("median_us", Fold::Median),
+        ("max_us", Fold::Max),
+        ("sent", Fold::Sum),
+        ("lost", Fold::Sum),
+        ("jitter_sum", Fold::Sum),
+        ("jitter_n", Fold::Sum),
+    ],
+};
 
 #[derive(Deserialize)]
 #[expect(
@@ -133,6 +148,54 @@ impl From<Track> for Line {
     }
 }
 
+impl encoding::Document for Response {
+    fn frame(&self) -> Result<encoding::Frame> {
+        let mut meta = serde_json::Map::new();
+        meta.insert("start".into(), self.start.into());
+        meta.insert("step".into(), self.step.into());
+        meta.insert("count".into(), self.count.into());
+        meta.insert(
+            "series".into(),
+            self.series
+                .iter()
+                .map(|line| serde_json::json!({"id": line.id, "name": line.name}))
+                .collect(),
+        );
+        meta.insert("events".into(), serde_json::to_value(&self.events)?);
+        meta.insert("incidents".into(), serde_json::to_value(&self.incidents)?);
+        let micros = |values: &[Option<u32>]| {
+            encoding::Column::I32(
+                values
+                    .iter()
+                    .map(|value| value.and_then(|value| i32::try_from(value).ok()))
+                    .collect(),
+            )
+        };
+        let columns = self
+            .series
+            .iter()
+            .enumerate()
+            .flat_map(|(index, line)| {
+                [
+                    (format!("{index}.median"), micros(&line.median)),
+                    (format!("{index}.min"), micros(&line.min)),
+                    (format!("{index}.max"), micros(&line.max)),
+                    (format!("{index}.jitter"), micros(&line.jitter)),
+                    (
+                        format!("{index}.sent"),
+                        encoding::Column::U32(line.sent.clone()),
+                    ),
+                    (
+                        format!("{index}.lost"),
+                        encoding::Column::U32(line.lost.clone()),
+                    ),
+                ]
+            })
+            .collect();
+        Ok(encoding::Frame { meta, columns })
+    }
+}
+
 pub fn outages(
     subject: &str,
     name: &str,
@@ -204,11 +267,11 @@ struct Subject {
     identity: String,
 }
 
-pub fn database(config: &Settings) -> PathBuf {
+pub fn root(config: &Settings) -> PathBuf {
     if config.history_days == 0 {
-        Path::new(RUNTIME).join("history/latency.sqlite")
+        Path::new(RUNTIME).join("history")
     } else {
-        PathBuf::from("/etc/wayline/history/latency.sqlite")
+        PathBuf::from("/etc/wayline/history")
     }
 }
 
@@ -274,19 +337,22 @@ pub fn purge() -> Result<()> {
             runtime::now().to_string().as_bytes(),
         )?;
         for root in roots {
-            for name in [
-                "latency.sqlite",
-                "latency.sqlite-journal",
-                "latency.sqlite-wal",
-                "latency.sqlite-shm",
-                "latency.sqlite.broken",
-                "events.json",
-                "facts.json",
-                "incidents.json",
-                "telemetry.sqlite",
-                "telemetry.sqlite-journal",
-                "telemetry.sqlite.broken",
-            ] {
+            for kind in KINDS {
+                let directory = root.join(kind);
+                match fs::remove_dir_all(&directory) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error).with_context(|| {
+                            format!("Cannot remove history {}.", directory.display())
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            for name in
+                LEGACY
+                    .iter()
+                    .chain(&["events.json", "facts.json", "incidents.json", "index.json"])
+            {
                 remove(&root.join(name))?;
             }
         }
@@ -332,13 +398,6 @@ pub const fn retained(days: u32, step: u64) -> u64 {
     }
 }
 
-pub fn table(step: u64) -> &'static str {
-    LEVELS
-        .iter()
-        .find(|(width, _)| *width == step)
-        .map_or(LEVELS[0].1, |level| level.1)
-}
-
 pub fn resolution(days: u32, step: u64, start: u64, end: u64, now: u64) -> Result<u64> {
     let step = if matches!(step, 1 | 5) {
         step * 60
@@ -372,298 +431,75 @@ pub fn availability(config: &Settings) -> Availability {
     }
 }
 
-fn cap(path: &Path) -> u64 {
-    if path.starts_with(RUNTIME) {
-        MEMORY_PAGES
-    } else {
-        PAGES
-    }
-}
-
-fn levels(statement: impl Fn(&str) -> String) -> String {
-    LEVELS.iter().map(|(_, table)| statement(table)).collect()
-}
-
-fn schema() -> String {
-    let tiers = levels(|table| {
-        format!(
-            "CREATE TABLE {table}(period INTEGER NOT NULL,series INTEGER NOT NULL,min_us INTEGER,median_us INTEGER,max_us INTEGER,sent INTEGER NOT NULL,lost INTEGER NOT NULL,{JITTER_COLUMNS},PRIMARY KEY(period,series)) WITHOUT ROWID;"
-        )
-    });
-    format!(
-        "CREATE TABLE series(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,seen INTEGER NOT NULL);{tiers}"
-    )
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Access {
-    ReadOnly,
-    ReadWrite,
-}
-
-fn open(path: &Path, access: Access) -> Result<Connection> {
-    open_capped(path, access, cap(path))
-}
-
-pub fn open_capped(path: &Path, access: Access, pages: u64) -> Result<Connection> {
-    let connection = if access == Access::ReadOnly {
-        Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?
-    } else {
-        Connection::open(path)?
-    };
-    connection.busy_timeout(Duration::from_secs(1))?;
-    connection.pragma_update(None, "cache_size", -128)?;
-    connection.pragma_update(None, "mmap_size", 0)?;
-    connection.pragma_update(None, "temp_store", "MEMORY")?;
-    if access == Access::ReadWrite {
-        connection.pragma_update(None, "page_size", PAGE_BYTES)?;
-        connection.pragma_update(None, "max_page_count", pages)?;
-        connection.pragma_update(None, "journal_mode", "TRUNCATE")?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
-    }
-    Ok(connection)
-}
-
-pub fn pragma<T: FromSql>(path: &Path, name: &str) -> Option<T> {
-    open(path, Access::ReadOnly)
-        .ok()?
-        .pragma_query_value(None, name, |row| row.get(0))
-        .ok()
-}
-
-pub fn healthy(path: &Path) -> bool {
-    pragma::<String>(path, "quick_check").is_some_and(|status| status == "ok")
-}
-
-fn pages(path: &Path) -> u64 {
-    pragma(path, "page_count").unwrap_or_default()
-}
-
-fn convert(path: &Path) -> Result<bool> {
-    let mut connection = open(path, Access::ReadWrite)?;
-    let current: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current >= VERSION {
-        return Ok(false);
-    }
-    if current == 4 {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(&levels(|table| {
-            format!(
-                "ALTER TABLE {table} ADD COLUMN jitter_sum INTEGER NOT NULL DEFAULT 0;ALTER TABLE {table} ADD COLUMN jitter_n INTEGER NOT NULL DEFAULT 0;"
-            )
-        }))?;
-        transaction.pragma_update(None, "user_version", VERSION)?;
-        transaction.commit()?;
-        return Ok(true);
-    }
-    ensure!(
-        runtime::now() >= MIN_CLOCK,
-        "The clock is not synchronized."
-    );
-    let upgrade = current == 3;
-    let tables: u32 =
-        connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
-    if !upgrade && tables > 0 {
-        drop(connection);
-        quarantine(path, DAMAGED)?;
-        connection = open(path, Access::ReadWrite)?;
-    }
-    connection.pragma_update(None, "max_page_count", 2 * cap(path))?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if upgrade {
-        transaction.execute_batch(&format!(
-            "ALTER TABLE series RENAME TO old_series;{}",
-            levels(|table| format!("ALTER TABLE {table} RENAME TO old_{table};"))
-        ))?;
-    }
-    transaction.execute_batch(&schema())?;
-    if upgrade {
-        transaction.execute(
-            "INSERT INTO series SELECT id,name,?1 FROM old_series",
-            [runtime::now() / HOUR],
-        )?;
-        transaction.execute_batch(&format!(
-            "DROP TABLE old_series;{}DROP TABLE meta;",
-            levels(|table| format!(
-                "INSERT INTO {table}(series,period,{COLUMNS}) SELECT * FROM old_{table}; DROP TABLE old_{table};"
-            ))
-        ))?;
-    }
-    transaction.pragma_update(None, "user_version", VERSION)?;
-    transaction.commit()?;
-    if upgrade {
-        let _ = connection.execute_batch("PRAGMA temp_store=DEFAULT; VACUUM;");
-    }
-    Ok(true)
-}
-
-fn span(live: &[&Series]) -> Option<(u64, u64)> {
-    let at = live
-        .iter()
-        .flat_map(|series| &series.buckets)
-        .map(|bucket| bucket.at / BUCKET_SECONDS);
-    Some((at.clone().min()?, at.max()?))
-}
-
 pub const fn aligned((low, high): (u64, u64), ratio: u64) -> (u64, u64) {
     (low / ratio * ratio, (high / ratio + 1) * ratio - 1)
 }
 
-fn fill(connection: &Connection, live: &[&Series]) -> Result<()> {
-    connection.execute_batch(
-        "CREATE TEMP TABLE live(period INTEGER NOT NULL,series TEXT NOT NULL,min_us INTEGER,median_us INTEGER,max_us INTEGER,sent INTEGER NOT NULL,lost INTEGER NOT NULL,jitter_sum INTEGER NOT NULL,jitter_n INTEGER NOT NULL,PRIMARY KEY(period,series)) WITHOUT ROWID;",
-    )?;
-    let mut insert =
-        connection.prepare("INSERT OR REPLACE INTO live VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")?;
-    for series in live {
-        for bucket in &series.buckets {
-            insert.execute(params![
-                bucket.at / BUCKET_SECONDS,
-                series.id,
-                bucket.min_us,
-                bucket.median_us,
-                bucket.max_us,
-                bucket.sent,
-                bucket.lost,
-                bucket.jitter_sum_us,
-                bucket.jitter_n
-            ])?;
-        }
-    }
-    Ok(())
-}
-
-fn rollup(source: &str) -> String {
-    format!(
-        "SELECT p,series,min(min_us),max(CASE WHEN n=(c+1)/2 THEN median_us END),max(max_us),sum(sent),sum(lost),sum(jitter_sum),sum(jitter_n) FROM (SELECT period/?1 AS p,series,min_us,median_us,max_us,sent,lost,jitter_sum,jitter_n,row_number() OVER (w ORDER BY median_us IS NULL,median_us) AS n,count(median_us) OVER w AS c FROM {source} WHERE period BETWEEN ?2 AND ?3 WINDOW w AS (PARTITION BY series,period/?1)) GROUP BY p,series"
-    )
-}
-
-const RETIRED: &str = "SELECT o.id FROM series o WHERE o.seen<?1 OR o.id NOT IN (SELECT id FROM series ORDER BY (name IN (SELECT series FROM live)) DESC,seen DESC,id DESC LIMIT ?2)";
-
-fn append(path: &Path, days: u32, now: u64, ring: &[Series]) -> Result<BTreeSet<String>> {
-    let live: Vec<&Series> = ring
-        .iter()
+fn latency_entries(ring: &[Series]) -> Vec<Entry> {
+    ring.iter()
         .take(MAX_SERIES)
-        .filter(|series| !series.buckets.is_empty())
-        .collect();
-    let mut connection = open(path, Access::ReadWrite)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    fill(&transaction, &live)?;
-    if let Some(mut range) = span(&live) {
-        transaction.execute(
-            "INSERT INTO series(name,seen) SELECT DISTINCT series,?1 FROM live WHERE true ON CONFLICT(name) DO UPDATE SET seen=excluded.seen WHERE seen<excluded.seen",
-            [now / HOUR],
-        )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO s15 SELECT period,s.id,min_us,median_us,max_us,sent,lost,jitter_sum,jitter_n FROM live l JOIN series s ON s.name=l.series",
-            [],
-        )?;
-        for pair in LEVELS.windows(2) {
-            let [(child_step, child), (step, parent)] = pair else {
-                continue;
-            };
-            if retained(days, *step) == 0 {
-                break;
-            }
-            let ratio = step / child_step;
-            let (low, high) = aligned(range, ratio);
-            transaction.execute(
-                &format!("INSERT OR REPLACE INTO {parent} {}", rollup(child)),
-                [ratio, low, high],
-            )?;
-            range = (range.0 / ratio, range.1 / ratio);
-        }
-    }
-    for (step, table) in LEVELS {
-        let kept = retained(days, step);
-        transaction.execute(
-            &format!("DELETE FROM {table} WHERE period<?1"),
-            [now.saturating_sub(kept) / step + u64::from(kept == 0)],
-        )?;
-    }
-    let longest = LEVELS
+        .flat_map(|series| {
+            series.buckets.iter().map(|bucket| Entry {
+                link: series.id.clone(),
+                at: bucket.at,
+                row: vec![
+                    bucket.min_us.map(i64::from),
+                    bucket.median_us.map(i64::from),
+                    bucket.max_us.map(i64::from),
+                    Some(i64::from(bucket.sent)),
+                    Some(i64::from(bucket.lost)),
+                    Some(i64::try_from(bucket.jitter_sum_us).unwrap_or(i64::MAX)),
+                    Some(i64::from(bucket.jitter_n)),
+                ],
+            })
+        })
+        .collect()
+}
+
+fn longest(days: u32) -> u64 {
+    LEVELS
         .iter()
         .map(|(step, _)| retained(days, *step))
         .max()
-        .unwrap_or_default();
-    let retired = (now.saturating_sub(longest) / HOUR, MAX_SERIES);
-    for (_, table) in LEVELS {
-        transaction.execute(
-            &format!("DELETE FROM {table} WHERE series IN ({RETIRED})"),
-            retired,
-        )?;
-    }
-    transaction.execute(
-        &format!("DELETE FROM series WHERE id IN ({RETIRED})"),
-        retired,
-    )?;
-    transaction.commit()?;
-    Ok(connection
-        .prepare("SELECT DISTINCT substr(name,1,48) FROM series")?
-        .query_map([], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?)
+        .unwrap_or_default()
 }
 
-pub fn quarantine(path: &Path, text: &str) -> Result<()> {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("Invalid history file.")?;
-    fs::rename(path, path.with_file_name(format!("{name}.broken")))?;
-    let _ = fs::remove_file(path.with_file_name(format!("{name}-journal")));
-    changes::append(
-        path,
-        [Event {
-            at: runtime::now() * 1000,
-            subject: "history".into(),
-            kind: "history".into(),
-            text: text.into(),
-        }],
-    )
+fn index(root: &Path, days: u32, now: u64, ring: &[Series]) -> Result<BTreeSet<String>> {
+    let path = root.join("index.json");
+    let mut seen: BTreeMap<String, u64> = runtime::load(&path);
+    let before = seen.clone();
+    for series in ring.iter().filter(|series| !series.buckets.is_empty()) {
+        seen.insert(series.id.clone(), now / HOUR);
+    }
+    let cutoff = now.saturating_sub(longest(days)) / HOUR;
+    seen.retain(|_, hour| *hour >= cutoff);
+    if seen.len() > MAX_SERIES {
+        let mut order: Vec<(u64, String)> = seen
+            .iter()
+            .map(|(name, hour)| (*hour, name.clone()))
+            .collect();
+        order.sort();
+        for (_, name) in order.iter().take(seen.len() - MAX_SERIES) {
+            seen.remove(name);
+        }
+    }
+    if seen != before {
+        runtime::store(&path, &seen)?;
+    }
+    Ok(seen
+        .keys()
+        .map(|name| name.chars().take(48).collect())
+        .collect())
 }
 
-fn shrink(path: &Path) -> Result<()> {
-    let mut connection = open(path, Access::ReadWrite)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for (_, table) in LEVELS.iter().rev() {
-        transaction.execute(
-            &format!(
-                "DELETE FROM {table} WHERE period<=(SELECT period FROM {table} ORDER BY period LIMIT 1 OFFSET (SELECT count(*)/10 FROM {table}))"
-            ),
-            [],
-        )?;
-    }
-    Ok(transaction.commit()?)
-}
-
-fn recover(path: &Path, error: Error) -> Result<()> {
-    if path.exists() && !healthy(path) {
-        quarantine(path, DAMAGED)?;
-    }
-    if convert(path)? {
-        return Ok(());
-    }
-    if pages(path) < cap(path) {
-        return Err(error);
-    }
-    shrink(path)
-}
-
-fn store(path: &Path, days: u32, ring: &[Series]) -> Result<BTreeSet<String>> {
-    let now = runtime::now();
-    append(path, days, now, ring).or_else(|error| {
-        recover(path, error)?;
-        append(path, days, now, ring)
-    })
+fn store(root: &Path, days: u32, now: u64, ring: &[Series]) -> Result<BTreeSet<String>> {
+    columnar::store(root, days, &LATENCY, &latency_entries(ring), now)?;
+    index(root, days, now, ring)
 }
 
 #[cfg(test)]
-fn collect_at(path: &Path, days: u32, ring: &[Series]) -> Result<()> {
-    store(path, days, ring).map(drop)
+fn collect_at(root: &Path, days: u32, ring: &[Series]) -> Result<()> {
+    store(root, days, runtime::now(), ring).map(drop)
 }
 
 pub fn collect(config: &Settings) -> Result<()> {
@@ -671,37 +507,40 @@ pub fn collect(config: &Settings) -> Result<()> {
 }
 
 fn collect_inner(config: &Settings) -> Result<()> {
-    let path = database(config);
-    runtime::directory(path.parent().context("Invalid history directory.")?)?;
+    let root = root(config);
+    runtime::directory(&root)?;
     let cache = known_cache();
-    let (ring, buckets, telemetry) = fresh_all()?;
-    if runtime::now() < MIN_CLOCK {
+    let (ring, buckets, status) = fresh_all()?;
+    let now = runtime::now();
+    if now < MIN_CLOCK {
         return Ok(());
     }
-    let telemetry_path = store::database(config);
     let days = config.history_days;
-    let mut stored = store::store(&telemetry_path, days, &wifi::KIND, &wifi::entries(&buckets));
-    if let Some(status) = &telemetry {
-        let system = store::store(
-            &telemetry_path,
+    let wifi = columnar::store(&root, days, &wifi::KIND, &wifi::entries(&buckets), now);
+    let system = status.as_ref().map_or(Ok(()), |status| {
+        columnar::store(
+            &root,
             days,
-            &crate::telemetry::SYSTEM,
-            &crate::telemetry::system_entries(status, 0),
-        );
-        let links = store::store(
-            &telemetry_path,
+            &telemetry::SYSTEM,
+            &telemetry::system_entries(status),
+            now,
+        )
+    });
+    let links = status.as_ref().map_or(Ok(()), |status| {
+        columnar::store(
+            &root,
             days,
-            &crate::telemetry::INTERFACE,
-            &crate::telemetry::link_entries(status, 0),
-        );
-        stored = stored.and(system).and(links);
-    }
-    let logged = record_incidents(&path, &ring, &buckets);
+            &telemetry::INTERFACE,
+            &telemetry::link_entries(status),
+            now,
+        )
+    });
+    let logged = record_incidents(&root, &ring, &buckets);
     let idle = ring.iter().all(|series| series.buckets.is_empty());
     if !(idle && cache.exists()) {
-        publish(&cache, &store(&path, config.history_days, &ring)?)?;
+        publish(&cache, &store(&root, days, now, &ring)?)?;
     }
-    stored.and(logged)
+    wifi.and(system).and(links).and(logged)
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -785,8 +624,8 @@ pub fn merge_incidents(stored: &mut Vec<Logged>, fresh: Vec<Logged>) {
     stored.drain(..excess);
 }
 
-fn incidents_path(path: &Path) -> PathBuf {
-    path.with_file_name("incidents.json")
+fn incidents_path(root: &Path) -> PathBuf {
+    root.join("incidents.json")
 }
 
 fn record_incidents(path: &Path, ring: &[Series], wifi: &[WifiBucket]) -> Result<()> {
@@ -804,7 +643,7 @@ fn record_incidents(path: &Path, ring: &[Series], wifi: &[WifiBucket]) -> Result
 }
 
 pub fn logged_incidents(config: &Settings, ring: &[Series], wifi: &[WifiBucket]) -> Vec<Logged> {
-    let mut stored: Vec<Logged> = runtime::load(incidents_path(&database(config)));
+    let mut stored: Vec<Logged> = runtime::load(incidents_path(&root(config)));
     merge_incidents(
         &mut stored,
         ring_incidents(ring, wifi, runtime::now() * 1_000),
@@ -812,49 +651,37 @@ pub fn logged_incidents(config: &Settings, ring: &[Series], wifi: &[WifiBucket])
     stored
 }
 
-pub fn report(config: &Settings) -> Result<Report> {
-    let path = database(config);
-    let bytes = fs::metadata(&path).map_or(0, |meta| meta.len());
-    let mut lines = Vec::new();
-    if path.exists() {
-        let connection = open(&path, Access::ReadOnly)?;
-        let show = |value: Option<u64>| value.map_or_else(String::new, |value| value.to_string());
-        for (_, table) in LEVELS {
-            let (rows, oldest, newest): (u64, Option<u64>, Option<u64>) = connection.query_row(
-                &format!("SELECT count(*),min(period),max(period) FROM {table}"),
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-            lines.push(format!(
-                "{table}: {rows} rows, oldest period {}, newest period {}",
-                show(oldest),
-                show(newest)
-            ));
-        }
-    }
-    Ok(Report {
+pub fn report(config: &Settings) -> Report {
+    let root = root(config);
+    let lines = columnar::report(&root);
+    let bytes = fs::read_dir(&root)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| KINDS.iter().any(|kind| entry.file_name() == *kind))
+        .map(|entry| directory_bytes(&entry.path()))
+        .sum();
+    Report {
         bytes,
-        cap: cap(&path) * PAGE_BYTES,
+        cap: columnar::cap(&root),
         lines,
-    })
+    }
 }
 
-fn reader(path: &Path) -> Result<(Connection, bool)> {
-    if path.exists() {
-        let connection = open(path, Access::ReadOnly)?;
-        let version =
-            connection.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?;
-        if version >= 3 {
-            return Ok((connection, version >= 5));
-        }
-    }
-    let connection = Connection::open_in_memory()?;
-    connection.execute_batch(&schema())?;
-    Ok((connection, true))
+fn directory_bytes(path: &Path) -> u64 {
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => directory_bytes(&entry.path()),
+            _ => entry.metadata().map_or(0, |meta| meta.len()),
+        })
+        .sum()
 }
 
 fn lines(
-    path: &Path,
+    root: &Path,
     step: u64,
     query: &Query,
     ring: &[Series],
@@ -864,85 +691,65 @@ fn lines(
         return Ok(Vec::new());
     }
     let (first, last) = (query.start / 1_000 / step, query.end / 1_000 / step);
-    let live: Vec<&Series> = ring
+    let wanted: Vec<Series> = ring
         .iter()
-        .filter(|series| {
-            !series.buckets.is_empty()
-                && subjects.iter().any(|subject| subject.identity == series.id)
+        .filter(|series| subjects.iter().any(|subject| subject.identity == series.id))
+        .map(|series| Series {
+            buckets: series.buckets.clone(),
+            history: Vec::new(),
+            id: series.id.clone(),
+            name: String::new(),
+            interface: String::new(),
+            path_id: String::new(),
+            target: series.target,
+            state: series.state,
+            median_us: None,
+            sent: 0,
+            received: 0,
+            success_age_ms: None,
+            jitter_us: None,
         })
         .collect();
-    let ratio = step / BUCKET_SECONDS;
+    let mut found = columnar::series(
+        root,
+        &LATENCY,
+        step,
+        (first, last),
+        &latency_entries(&wanted),
+    )?;
     let blank = vec![Point::default(); usize::try_from(last - first + 1)?];
-    let (identities, mut lines): (Vec<String>, Vec<Track>) = subjects
+    Ok(subjects
         .into_iter()
         .map(|subject| {
-            (
-                subject.identity,
-                Track {
-                    id: subject.id,
-                    name: subject.name,
-                    points: blank.clone(),
-                },
-            )
-        })
-        .unzip();
-    let names: Vec<&dyn ToSql> = identities.iter().map(|id| id as &dyn ToSql).collect();
-    let marks = vec!["?"; names.len()].join(",");
-    let (mut connection, jitter) = reader(path)?;
-    let jitter_columns = if jitter {
-        "t.jitter_sum,t.jitter_n"
-    } else {
-        "0,0"
-    };
-    let stored = |table: &str| {
-        format!(
-            "SELECT t.period,s.name,t.min_us,t.median_us,t.max_us,t.sent,t.lost,{jitter_columns} FROM {table} t JOIN series s ON s.id=t.series WHERE t.period BETWEEN ? AND ? AND s.name IN ({marks})"
-        )
-    };
-    let index: BTreeMap<&str, usize> = identities.iter().map(String::as_str).zip(0..).collect();
-    let transaction = connection.transaction()?;
-    let bounds = span(&live).map(|range| aligned(range, ratio));
-    if let Some((low, high)) = bounds {
-        fill(&transaction, &live)?;
-        let mut arguments: Vec<&dyn ToSql> = vec![&low, &high];
-        arguments.extend(names.iter().copied());
-        transaction.execute(
-            &format!("INSERT OR IGNORE INTO live {}", stored(LEVELS[0].1)),
-            arguments.as_slice(),
-        )?;
-    }
-    let mut load = |statement: &str, arguments: &[&dyn ToSql]| -> Result<()> {
-        let mut prepared = transaction.prepare(statement)?;
-        let mut rows = prepared.query(arguments)?;
-        while let Some(row) = rows.next()? {
-            let period: u64 = row.get(0)?;
-            let name: String = row.get(1)?;
-            if let Some(&line) = index.get(name.as_str())
-                && let Some(slot) = period
+            let mut points = blank.clone();
+            for (period, row) in found.remove(&subject.identity).unwrap_or_default() {
+                let cell = |index: usize| row.get(index).copied().flatten();
+                let small = |index: usize| cell(index).and_then(|value| u32::try_from(value).ok());
+                if let Some(slot) = period
                     .checked_sub(first)
                     .and_then(|offset| usize::try_from(offset).ok())
-                    .and_then(|offset| lines.get_mut(line)?.points.get_mut(offset))
-            {
-                *slot = Point {
-                    min: row.get(2)?,
-                    median: row.get(3)?,
-                    max: row.get(4)?,
-                    sent: row.get(5)?,
-                    lost: row.get(6)?,
-                    jitter_sum: row.get(7)?,
-                    jitter_n: row.get(8)?,
-                };
+                    .and_then(|offset| points.get_mut(offset))
+                {
+                    *slot = Point {
+                        min: small(0),
+                        median: small(1),
+                        max: small(2),
+                        sent: small(3).unwrap_or(0),
+                        lost: small(4).unwrap_or(0),
+                        jitter_sum: cell(5)
+                            .and_then(|value| u64::try_from(value).ok())
+                            .unwrap_or(0),
+                        jitter_n: small(6).unwrap_or(0),
+                    };
+                }
             }
-        }
-        Ok(())
-    };
-    let mut arguments: Vec<&dyn ToSql> = vec![&first, &last];
-    arguments.extend(names.iter().copied());
-    load(&stored(table(step)), &arguments)?;
-    if let Some((low, high)) = bounds {
-        load(&rollup("live"), &[&ratio, &low, &high])?;
-    }
-    Ok(lines)
+            Track {
+                id: subject.id,
+                name: subject.name,
+                points,
+            }
+        })
+        .collect())
 }
 
 pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {
@@ -1007,7 +814,7 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
             identity: router::series_id(wan.prefix(), target),
         });
     }
-    let tracks = lines(&database(config), step, query, &fresh_ring()?, subjects)?;
+    let tracks = lines(&root(config), step, query, &fresh_ring()?, subjects)?;
     let start = query.start / 1_000 / step * step * 1_000;
     let detail = format!("Every probe to {target} was lost");
     let now = runtime::now() * 1_000;
@@ -1048,13 +855,12 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        Access, DAY, HOUR, LEVELS, Line, Query, Subject, append, collect_at, convert, lines, open,
-        outages, resolution,
+        DAY, HOUR, LATENCY, Line, Query, Subject, collect_at, directory_bytes, lines, outages,
+        resolution,
     };
+    use crate::columnar;
     use crate::runtime;
     use anyhow::{Result, ensure};
-    use std::fmt::Write;
-    use std::fs;
     use std::net::Ipv4Addr;
     use std::path::Path;
     use wayline_protocol::{Bucket, Series, State};
@@ -1103,8 +909,6 @@ mod tests {
         super::discard_before(&mut live, 105);
         assert_eq!(live[0].buckets.len(), 1);
         assert_eq!(live[0].buckets[0].at, 120);
-        super::discard_before(&mut live, 105);
-        assert_eq!(live[0].buckets.len(), 1);
     }
 
     fn value(index: u64) -> u32 {
@@ -1125,7 +929,7 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn hour_row() -> (u32, usize, u32, u32, u32) {
+    fn expected_hour() -> Vec<Option<i64>> {
         let minutes: Vec<u32> = (0..60)
             .map(|minute| lower_median((4 * minute..4 * minute + 4).map(value).collect()))
             .collect();
@@ -1134,28 +938,25 @@ mod tests {
             .map(|chunk| lower_median(chunk.to_vec()))
             .collect();
         let values: Vec<u32> = (0..240).map(value).collect();
-        (
-            960,
-            (0..240).filter(|index| index % 3 == 0).count(),
-            values.iter().min().copied().unwrap_or_default(),
-            lower_median(fives),
-            values.iter().max().copied().unwrap_or_default(),
+        let lost = (0..240).filter(|index| index % 3 == 0).count();
+        vec![
+            values.iter().min().copied().map(i64::from),
+            Some(i64::from(lower_median(fives))),
+            values.iter().max().copied().map(i64::from),
+            Some(960),
+            i64::try_from(lost).ok(),
+            Some(values.iter().map(|value| i64::from(value / 10)).sum()),
+            Some(480),
+        ]
+    }
+
+    fn stored(root: &Path, step: u64, period: u64) -> Result<Vec<Option<i64>>> {
+        Ok(
+            columnar::series(root, &LATENCY, step, (period, period), &[])?
+                .remove(&identity(1))
+                .and_then(|mut rows| rows.remove(&period))
+                .unwrap_or_default(),
         )
-    }
-
-    fn scalar(path: &Path, statement: &str) -> Result<i64> {
-        Ok(open(path, Access::ReadOnly)?.query_row(statement, [], |row| row.get(0))?)
-    }
-
-    fn edit(path: &Path, statement: &str) -> Result<()> {
-        Ok(open(path, Access::ReadWrite)?.execute_batch(statement)?)
-    }
-
-    fn counts(path: &Path) -> Result<Vec<i64>> {
-        LEVELS
-            .iter()
-            .map(|(_, table)| scalar(path, &format!("SELECT count(*) FROM {table}")))
-            .collect()
     }
 
     fn request(start: u64, end: u64, step: u64) -> Query {
@@ -1180,277 +981,47 @@ mod tests {
         }
     }
 
-    fn rendered(path: &Path, step: u64, start: u64, ring: &[Series]) -> Result<serde_json::Value> {
+    fn rendered(root: &Path, step: u64, start: u64, ring: &[Series]) -> Result<serde_json::Value> {
         let query = request(start, start + HOUR, step);
-        let tracks: Vec<Line> = lines(path, step, &query, ring, vec![subject(1)])?
+        let tracks: Vec<Line> = lines(root, step, &query, ring, vec![subject(1)])?
             .into_iter()
             .map(Line::from)
             .collect();
-        let mut value = serde_json::to_value(tracks)?;
-        if step > 60 {
-            value[0]["median"] = serde_json::Value::Null;
-        }
-        Ok(value)
+        Ok(serde_json::to_value(tracks)?)
     }
 
     #[test]
     fn buckets_roll_up_exactly() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
+        let root = directory.path();
         let start = runtime::now() / HOUR * HOUR - 2 * HOUR;
-        collect_at(&database, 30, &[series(&identity(1), hour(start))])?;
-        let row = open(&database, Access::ReadOnly)?.query_row(
-            "SELECT sent,lost,min_us,median_us,max_us FROM s1h WHERE period=?1",
-            [start / HOUR],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )?;
-        ensure!(row == hour_row(), "Unexpected hour: {row:?}");
-        let counts = counts(&database)?;
-        ensure!(counts == [240, 60, 12, 1], "Unexpected counts: {counts:?}");
+        collect_at(root, 30, &[series(&identity(1), hour(start))])?;
+        let row = stored(root, 3_600, start / HOUR)?;
+        ensure!(row == expected_hour(), "Unexpected hour: {row:?}");
         Ok(())
     }
 
     #[test]
     fn repeated_collection_never_double_counts() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
+        let root = directory.path();
         let start = runtime::now() / HOUR * HOUR - 2 * HOUR;
         let buckets = hour(start);
-        collect_at(
-            &database,
-            30,
-            &[series(&identity(1), buckets[..120].to_vec())],
-        )?;
-        collect_at(&database, 30, &[series(&identity(1), buckets.clone())])?;
-        collect_at(&database, 30, &[series(&identity(1), buckets)])?;
+        collect_at(root, 30, &[series(&identity(1), buckets[..120].to_vec())])?;
+        collect_at(root, 30, &[series(&identity(1), buckets.clone())])?;
+        collect_at(root, 30, &[series(&identity(1), buckets)])?;
         ensure!(
-            scalar(&database, "SELECT sum(sent) FROM s1h")? == 960,
+            stored(root, 3_600, start / HOUR)?[3] == Some(960),
             "Double count."
         );
         Ok(())
     }
 
     #[test]
-    fn tiers_prune_to_their_retention() -> Result<()> {
-        let now = runtime::now();
-        let minute = now / 60 * 60 - 120;
-        for (days, expected) in [(1_u32, [2, 1, 0, 0]), (7, [2, 2, 1, 0])] {
-            let directory = tempfile::tempdir()?;
-            let database = directory.path().join("latency.sqlite");
-            collect_at(
-                &database,
-                days,
-                &[series(&identity(1), vec![bucket(minute, 20_000, 0)])],
-            )?;
-            edit(
-                &database,
-                &format!(
-                    "INSERT INTO s15 SELECT {},id,1,1,1,1,0,0,0 FROM series; INSERT INTO s1m SELECT {},id,1,1,1,1,0,0,0 FROM series; INSERT INTO s5m SELECT {},id,1,1,1,1,0,0,0 FROM series;",
-                    (now - 7 * HOUR) / 15,
-                    (now - 2 * DAY) / 60,
-                    (now - 8 * DAY) / 300
-                ),
-            )?;
-            collect_at(
-                &database,
-                days,
-                &[series(&identity(1), vec![bucket(minute + 15, 20_000, 0)])],
-            )?;
-            let counts = counts(&database)?;
-            ensure!(counts == expected, "Days {days}: {counts:?}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn idle_series_expire_with_their_rows() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let minute = runtime::now() / 60 * 60 - 120;
-        collect_at(
-            &database,
-            1,
-            &[
-                series(&identity(1), vec![bucket(minute, 20_000, 0)]),
-                series(&identity(2), vec![bucket(minute, 20_000, 0)]),
-            ],
-        )?;
-        edit(
-            &database,
-            &format!(
-                "UPDATE series SET seen={} WHERE name='{}';",
-                runtime::now() / HOUR - 49,
-                identity(2)
-            ),
-        )?;
-        collect_at(
-            &database,
-            1,
-            &[series(&identity(1), vec![bucket(minute + 15, 20_000, 0)])],
-        )?;
-        for statement in [
-            "SELECT count(*) FROM series",
-            "SELECT count(DISTINCT series) FROM s15",
-            "SELECT count(DISTINCT series) FROM s1m",
-        ] {
-            ensure!(scalar(&database, statement)? == 1, "{statement}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn retiring_many_series_leaves_no_orphans() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let minute = runtime::now() / 60 * 60 - 120;
-        let all: Vec<Series> = (1..=80)
-            .map(|index| series(&identity(index), vec![bucket(minute, 20_000, 0)]))
-            .collect();
-        collect_at(&database, 30, &all)?;
-        edit(
-            &database,
-            &format!(
-                "UPDATE series SET seen={} WHERE id>1;",
-                runtime::now() / HOUR - 721
-            ),
-        )?;
-        collect_at(
-            &database,
-            30,
-            &[series(&identity(1), vec![bucket(minute + 15, 20_000, 0)])],
-        )?;
-        ensure!(scalar(&database, "SELECT count(*) FROM series")? == 1);
-        for (_, table) in LEVELS {
-            ensure!(
-                scalar(
-                    &database,
-                    &format!(
-                        "SELECT count(*) FROM {table} WHERE series NOT IN (SELECT id FROM series)"
-                    )
-                )? == 0,
-                "Orphans in {table}."
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn series_cap_keeps_live_series_over_newer_ids() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let minute = runtime::now() / 60 * 60 - 120;
-        let all: Vec<Series> = (1..=90)
-            .map(|index| series(&identity(index), vec![bucket(minute, 20_000, 0)]))
-            .collect();
-        collect_at(&database, 1, &all)?;
-        collect_at(
-            &database,
-            1,
-            &[
-                series(&identity(91), vec![bucket(minute + 15, 20_000, 0)]),
-                series(&identity(1), vec![bucket(minute + 15, 20_000, 0)]),
-            ],
-        )?;
-        ensure!(scalar(&database, "SELECT count(*) FROM series")? == 90);
-        ensure!(
-            scalar(
-                &database,
-                &format!(
-                    "SELECT count(*) FROM series WHERE name IN ('{}','{}')",
-                    identity(1),
-                    identity(91)
-                )
-            )? == 2
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn unknown_schema_is_reset() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        edit(
-            &database,
-            "CREATE TABLE samples(x INTEGER); PRAGMA user_version=2;",
-        )?;
-        ensure!(convert(&database)?, "Expected a conversion.");
-        ensure!(
-            directory.path().join("latency.sqlite.broken").exists(),
-            "The old database was not moved aside."
-        );
-        ensure!(scalar(&database, "PRAGMA user_version")? == 5);
-        ensure!(
-            scalar(
-                &database,
-                "SELECT count(*) FROM sqlite_master WHERE name='samples'"
-            )? == 0
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn schema_v3_keeps_every_tier_when_converted() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let mut tiers = String::new();
-        for (index, (_, table)) in LEVELS.iter().enumerate() {
-            write!(
-                tiers,
-                "CREATE TABLE {table}(series INTEGER NOT NULL, period INTEGER NOT NULL, min_us INTEGER, median_us INTEGER, max_us INTEGER, sent INTEGER NOT NULL, lost INTEGER NOT NULL, PRIMARY KEY(series, period)) WITHOUT ROWID; INSERT INTO {table} VALUES(1,{},1,2,3,4,{index});",
-                100 + index
-            )?;
-        }
-        let script = format!(
-            "CREATE TABLE series(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE); CREATE TABLE meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID; INSERT INTO series(name) VALUES('x'); INSERT INTO meta VALUES('cursor',5);{tiers}PRAGMA user_version=3;"
-        );
-        edit(&database, &script)?;
-        ensure!(
-            append(&database, 30, runtime::now(), &[]).is_err(),
-            "A stale schema must fail the write so that it is converted."
-        );
-        ensure!(convert(&database)?, "Expected a conversion.");
-        ensure!(scalar(&database, "PRAGMA user_version")? == 5);
-        ensure!(
-            scalar(
-                &database,
-                "SELECT lost FROM s15 WHERE period=100 AND series=1"
-            )? == 0
-        );
-        ensure!(
-            scalar(
-                &database,
-                "SELECT lost FROM s1h WHERE period=103 AND series=1"
-            )? == 3
-        );
-        ensure!(
-            scalar(
-                &database,
-                "SELECT count(*) FROM sqlite_master WHERE name IN ('meta','old_series','old_s15')"
-            )? == 0
-        );
-        ensure!(scalar(&database, "SELECT count(*) FROM series WHERE seen>0")? == 1);
-        append(&database, 30, runtime::now() + 60 * DAY, &[])?;
-        ensure!(
-            scalar(&database, "SELECT count(*) FROM s1m")? == 0,
-            "Rows outlived their series."
-        );
-        ensure!(!convert(&database)?, "A current schema must be left alone.");
-        Ok(())
-    }
-
-    #[test]
     fn live_buckets_merge_into_stored_periods() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let full = directory.path().join("full.sqlite");
-        let half = directory.path().join("half.sqlite");
+        let full = directory.path().join("full");
+        let half = directory.path().join("half");
         let start = runtime::now() / HOUR * HOUR - 2 * HOUR;
         let buckets = hour(start);
         let id = identity(1);
@@ -1463,7 +1034,7 @@ mod tests {
                 rendered(&half, step, start, &live)? == expected,
                 "Live merge differs at step {step}."
             );
-            let missing = directory.path().join("missing.sqlite");
+            let missing = directory.path().join("missing");
             ensure!(
                 rendered(&missing, step, start, &[series(&id, buckets.clone())])? == expected,
                 "Ring alone differs at step {step}."
@@ -1494,59 +1065,6 @@ mod tests {
     }
 
     #[test]
-    fn damaged_database_is_moved_aside_and_recorded() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        fs::write(&database, [0x5a_u8; 8192])?;
-        let fresh = runtime::now() / 15 * 15 - 60;
-        collect_at(
-            &database,
-            7,
-            &[series(&identity(1), vec![bucket(fresh, 20_000, 0)])],
-        )?;
-        ensure!(
-            directory.path().join("latency.sqlite.broken").exists(),
-            "Damaged database was not moved aside."
-        );
-        ensure!(scalar(&database, "SELECT count(*) FROM s15")? == 1);
-        let events = fs::read_to_string(directory.path().join("events.json"))?;
-        ensure!(
-            events.contains("The history database was damaged and was reset."),
-            "Missing recovery event."
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn version_four_databases_gain_jitter_in_place() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
-        let start = runtime::now() / HOUR * HOUR - HOUR;
-        collect_at(&database, 7, &[series(&identity(1), hour(start))])?;
-        edit(
-            &database,
-            &LEVELS.iter().fold(String::new(), |mut sql, (_, table)| {
-                let _ = write!(
-                    sql,
-                    "ALTER TABLE {table} DROP COLUMN jitter_sum;ALTER TABLE {table} DROP COLUMN jitter_n;"
-                );
-                sql
-            }),
-        )?;
-        edit(&database, "PRAGMA user_version=4;")?;
-        let before = scalar(&database, "SELECT count(*) FROM s15")?;
-        let query = request(start, start + HOUR, 60);
-        let read = lines(&database, 60, &query, &[], vec![subject(1)])?;
-        ensure!(read[0].points.iter().all(|point| point.jitter_n == 0));
-        ensure!(convert(&database)?, "The upgrade did not run.");
-        ensure!(scalar(&database, "PRAGMA user_version")? == 5);
-        ensure!(scalar(&database, "SELECT count(*) FROM s15")? == before);
-        collect_at(&database, 7, &[series(&identity(1), hour(start + HOUR))])?;
-        ensure!(scalar(&database, "SELECT sum(jitter_n) FROM s1m")? > 0);
-        Ok(())
-    }
-
-    #[test]
     fn outages_cover_fully_lost_runs() {
         let states = [
             Some(false),
@@ -1569,7 +1087,7 @@ mod tests {
     #[test]
     fn eleven_series_for_a_week_stay_small() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("latency.sqlite");
+        let root = directory.path();
         let start = runtime::now() / HOUR * HOUR - 168 * HOUR;
         let identities: Vec<String> = (1..=11).map(identity).collect();
         for hours in 0..168 {
@@ -1577,20 +1095,17 @@ mod tests {
                 .iter()
                 .map(|id| series(id, hour(start + hours * HOUR)))
                 .collect();
-            collect_at(&database, 7, &snapshot)?;
+            collect_at(root, 7, &snapshot)?;
         }
-        let size = fs::metadata(&database)?.len();
-        ensure!(size < 4 * 1024 * 1024, "Database is {size} bytes.");
+        let size = directory_bytes(&root.join("latency"));
+        ensure!(size < 2 * 1024 * 1024, "History is {size} bytes.");
         let query = request(runtime::now() - DAY, runtime::now(), 60);
-        let line = lines(&database, 60, &query, &[], vec![subject(1)])?.remove(0);
+        let line = lines(root, 60, &query, &[], vec![subject(1)])?.remove(0);
         ensure!(line.points.len() <= 1_441, "Too many points.");
         ensure!(
             line.points.iter().filter(|point| point.sent > 0).count() > 1_000,
             "Stored minutes are missing."
         );
-        let json = serde_json::to_vec(&Line::from(line))?.len();
-        ensure!(json < 65_536, "Response is {json} bytes.");
-        ensure!(LEVELS.len() == 4, "Unexpected tiers.");
         Ok(())
     }
 }

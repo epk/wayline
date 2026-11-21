@@ -1,14 +1,34 @@
+use crate::columnar;
 use anyhow::{Result, bail};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use arrow_array::{ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, UInt32Array};
+use arrow_ipc::writer::StreamWriter;
+use arrow_schema::{DataType, Field, Schema};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::sync::Arc;
 
-const LEVEL: i32 = 6;
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub enum Column {
+    F64(Vec<Option<f64>>),
+    I32(Vec<Option<i32>>),
+    U32(Vec<u32>),
+    I64(Vec<Option<i64>>),
+}
+
+pub struct Frame {
+    pub meta: Map<String, Value>,
+    pub columns: Vec<(String, Column)>,
+}
+
+pub trait Document: Serialize {
+    fn frame(&self) -> Result<Frame>;
+}
 
 #[derive(Default, Deserialize)]
 struct Request {
     #[serde(default)]
-    encoding: Option<String>,
+    format: Option<String>,
 }
 
 pub fn base64(data: &[u8]) -> String {
@@ -33,25 +53,54 @@ pub fn base64(data: &[u8]) -> String {
     out
 }
 
-pub fn encode(raw: &str, document: Value) -> Result<Value> {
+pub fn ipc(columns: Vec<(String, Column)>) -> Result<Vec<u8>> {
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+    for (name, column) in columns {
+        let (kind, nullable, array): (DataType, bool, ArrayRef) = match column {
+            Column::F64(values) => (
+                DataType::Float64,
+                true,
+                Arc::new(Float64Array::from(values)),
+            ),
+            Column::I32(values) => (DataType::Int32, true, Arc::new(Int32Array::from(values))),
+            Column::U32(values) => (DataType::UInt32, false, Arc::new(UInt32Array::from(values))),
+            Column::I64(values) => (DataType::Int64, true, Arc::new(Int64Array::from(values))),
+        };
+        fields.push(Field::new(name, kind, nullable));
+        arrays.push(array);
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+    let mut writer = StreamWriter::try_new_with_options(Vec::new(), &schema, columnar::options()?)?;
+    writer.write(&batch)?;
+    writer.finish()?;
+    Ok(writer.into_inner()?)
+}
+
+pub fn reply(raw: &str, document: &impl Document) -> Result<Value> {
     let request: Request = serde_json::from_str(raw).unwrap_or_default();
-    match request.encoding.as_deref() {
-        None => Ok(document),
-        Some("zstd") => {
-            let packed = zstd::bulk::compress(&serde_json::to_vec(&document)?, LEVEL)?;
-            Ok(json!({"encoding":"zstd","data":base64(&packed)}))
+    match request.format.as_deref() {
+        None => Ok(serde_json::to_value(document)?),
+        Some("arrow") => {
+            let Frame { mut meta, columns } = document.frame()?;
+            meta.insert("format".into(), Value::String("arrow".into()));
+            meta.insert("data".into(), Value::String(base64(&ipc(columns)?)));
+            Ok(Value::Object(meta))
         }
-        Some(other) => bail!("Unknown encoding {other}."),
+        Some(other) => bail!("Unknown format {other}."),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{base64, encode};
+pub mod tests {
+    use super::{Column, base64, ipc};
     use anyhow::{Context, Result, ensure};
-    use serde_json::json;
+    use arrow_array::{Array, Float64Array, Int32Array, RecordBatch, UInt32Array};
+    use arrow_ipc::reader::StreamReader;
+    use std::io::Cursor;
 
-    fn decode(text: &str) -> Vec<u8> {
+    pub fn decode(text: &str) -> Vec<u8> {
         let value = |byte: u8| -> u32 {
             super::ALPHABET
                 .iter()
@@ -71,6 +120,13 @@ mod tests {
         out
     }
 
+    pub fn batch(data: &str) -> Result<RecordBatch> {
+        StreamReader::try_new(Cursor::new(decode(data)), None)?
+            .next()
+            .context("The stream has no batch.")?
+            .map_err(Into::into)
+    }
+
     #[test]
     fn base64_matches_rfc_4648_vectors() {
         for (plain, encoded) in [
@@ -88,15 +144,41 @@ mod tests {
     }
 
     #[test]
-    fn documents_round_trip_through_zstd() -> Result<()> {
-        let document = json!({"start": 1, "series": [{"median": [1, null, 3]}]});
-        ensure!(encode("{}", document.clone())? == document);
-        let packed = encode(r#"{"encoding":"zstd"}"#, document.clone())?;
-        ensure!(packed["encoding"] == "zstd");
-        let data = packed["data"].as_str().context("Missing data.")?;
-        let plain = zstd::bulk::decompress(&decode(data), 1 << 20)?;
-        ensure!(serde_json::from_slice::<serde_json::Value>(&plain)? == document);
-        ensure!(encode(r#"{"encoding":"brotli"}"#, document).is_err());
+    fn frames_round_trip_through_compressed_ipc() -> Result<()> {
+        let data = ipc(vec![
+            (
+                "0.median".into(),
+                Column::I32(vec![Some(20_000), None, Some(31_500)]),
+            ),
+            ("0.sent".into(), Column::U32(vec![4, 0, 4])),
+            (
+                "signal".into(),
+                Column::F64(vec![None, Some(-61.5), Some(-60.0)]),
+            ),
+        ])?;
+        let found = batch(&base64(&data))?;
+        ensure!(found.num_rows() == 3);
+        let median = found
+            .column_by_name("0.median")
+            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+            .context("median")?;
+        ensure!(median.value(0) == 20_000 && median.is_null(1));
+        let sent = found
+            .column_by_name("0.sent")
+            .and_then(|column| column.as_any().downcast_ref::<UInt32Array>())
+            .context("sent")?;
+        ensure!(sent.values().to_vec() == [4, 0, 4]);
+        let signal = found
+            .column_by_name("signal")
+            .and_then(|column| column.as_any().downcast_ref::<Float64Array>())
+            .context("signal")?;
+        ensure!(signal.is_null(0) && (signal.value(1) + 61.5).abs() < f64::EPSILON);
+        let plain = ipc(vec![("x".into(), Column::U32(vec![7; 4096]))])?;
+        ensure!(
+            plain.len() < 4096,
+            "Buffers were not compressed: {}",
+            plain.len()
+        );
         Ok(())
     }
 }

@@ -1,4 +1,4 @@
-# Wayline page API (contract v2)
+# Wayline page API (contract v3)
 
 The page talks to `wayline-ctl` through the GL.iNet RPC bridge in
 `package/files/usr/lib/oui-httpd/rpc/wayline`. Reads use the RPC object
@@ -12,28 +12,34 @@ Writes: `set_config`, `select_tunnel`, `set_tunnel_enabled`, `purge_history`,
 Times are Unix milliseconds unless a field name ends in `Seconds` or the field
 is documented as seconds. Latency values on the wire are integer microseconds.
 
-## Compressed documents
+## Measurement data is Arrow
 
-History reads accept `"encoding": "zstd"`. The reply is then
-
-```json
-{ "encoding": "zstd", "data": "<base64>" }
-```
-
-`data` is base64 of a zstd frame whose content is UTF-8 JSON: the document
-described for that method. Without `encoding`, the reply is the document
-itself (used by tools and stale pages).
-
-## Columnar series
-
-History documents are columnar with an implicit time axis:
+Measurement data is columnar from disk to chart. History reads accept
+`"format": "arrow"`, and the page always sends it. The reply is JSON:
 
 ```json
-{ "start": 1763700000000, "step": 60, "count": 1441, ... }
+{ "format": "arrow", "start": 1763700000000, "step": 60, "count": 1441, "...": "metadata", "data": "<base64>" }
 ```
 
-Point `i` covers `[start + i * step * 1000, start + (i + 1) * step * 1000)`.
-Every column array has exactly `count` entries. `null` means no data.
+`data` is base64 of an Arrow IPC stream (one record batch) whose buffers use
+Arrow body compression ZSTD. Any Arrow implementation reads it: arrow-rs,
+pyarrow, Polars, or flechette in the page. The table has exactly `count` rows,
+and row `i` covers `[start + i * step * 1000, start + (i + 1) * step * 1000)`.
+A null cell means no data.
+
+Decode in the browser with flechette and fzstd. Pass a preallocated output
+buffer, because fzstd otherwise returns an unaligned view:
+
+```js
+setCompressionCodec(CompressionType.ZSTD, {
+  decode: (bytes, length) => decompress(bytes, new Uint8Array(length)),
+});
+const table = tableFromIPC(bytes, { useBigInt: false });
+```
+
+Without `format`, the reply is the same data as a plain JSON document (shapes
+below), for tools. Control-plane state (`get_state`) and commands stay JSON:
+they are small nested objects, not tables.
 
 ## get_state
 
@@ -84,9 +90,13 @@ sample. Rates are bits per second over the last sampling interval.
 ## get_history
 
 Request: v1 fields (`start`, `end`, `step`, `tunnel`, `target`, `all`,
-`include_wan`, `endpoints`, `uplinks`) plus `encoding`.
+`include_wan`, `endpoints`, `uplinks`) plus `format`.
 
-Document:
+Arrow metadata: `series: [{id, name}]`, `events`, `incidents`. Columns for
+series index `k` (0-based, in `series` order): `k.median`, `k.min`, `k.max`,
+`k.jitter` (Int32 microseconds, nullable), `k.sent`, `k.lost` (UInt32).
+
+JSON document:
 
 ```json
 {
@@ -104,7 +114,15 @@ Document:
 
 ## get_wifi_history
 
-Request: `start`, `end`, `step`, `encoding`. Document:
+Request: `start`, `end`, `step`, `format`.
+
+Arrow metadata: `summary`, `events`. Columns use the JSON `columns` names.
+Float64 nullable: `uptime`, `signal`, `noise`, `snr`, `txRate`, `txRateMin`,
+`rxRate`, `expected`, `retries`, `failures`, `busy`, `rxAir`, `txAir`,
+`upload`, `download`. Int32 nullable: `signalMin`, `signalMax`. UInt32:
+`samples`, `disconnects`, `roams`. Int64 nullable: `txBytes`, `rxBytes`.
+
+JSON document:
 
 ```json
 {
@@ -128,7 +146,16 @@ Units: dBm, dB, Mbit/s for rates and `upload`/`download`, percent for
 
 ## get_telemetry_history
 
-Request: `start`, `end`, `step`, `encoding`. Document:
+Request: `start`, `end`, `step`, `format`.
+
+Arrow metadata: `interfaces: [{id, name, device, kind}]`, `conntrackMax`.
+Float64 nullable: `system.cpu`, `system.cpuMax`, `system.load`,
+`system.memUsed`, `system.temperature`, `system.temperatureMax`. Int64
+nullable: `system.memAvailableMin`, `system.conntrack`, and for interface index
+`k`: `k.rxBps`, `k.txBps`, `k.rxPeakBps`, `k.txPeakBps`, `k.rxBytes`,
+`k.txBytes`, `k.errors`, `k.drops`, `k.handshakeAgeMax`.
+
+JSON document:
 
 ```json
 {

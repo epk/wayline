@@ -1,8 +1,8 @@
+use crate::columnar::{self, Entry, Fold, Kind, Row};
 use crate::history;
 use crate::router::Inventory;
 use crate::runtime;
 use crate::settings::Settings;
-use crate::store::{self, Entry, Fold, Kind, Row};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -12,7 +12,7 @@ pub const INTERVAL_MS: u64 = 5_000;
 const SYSTEM_LINK: &str = "system";
 
 pub static SYSTEM: Kind = Kind {
-    table: "system",
+    name: "system",
     fields: &[
         ("samples", Fold::Sum),
         ("cpu_n", Fold::Sum),
@@ -31,7 +31,7 @@ pub static SYSTEM: Kind = Kind {
 };
 
 pub static INTERFACE: Kind = Kind {
-    table: "interface",
+    name: "interface",
     fields: &[
         ("samples", Fold::Sum),
         ("seconds_ms", Fold::Sum),
@@ -89,11 +89,10 @@ fn link_row(bucket: &LinkBucket) -> Row {
     ]
 }
 
-pub fn system_entries(status: &TelemetryStatus, cutoff: u64) -> Vec<Entry> {
+pub fn system_entries(status: &TelemetryStatus) -> Vec<Entry> {
     status
         .system_buckets
         .iter()
-        .filter(|bucket| bucket.at > cutoff)
         .map(|bucket| Entry {
             link: SYSTEM_LINK.into(),
             at: bucket.at,
@@ -102,19 +101,16 @@ pub fn system_entries(status: &TelemetryStatus, cutoff: u64) -> Vec<Entry> {
         .collect()
 }
 
-pub fn link_entries(status: &TelemetryStatus, cutoff: u64) -> Vec<Entry> {
+pub fn link_entries(status: &TelemetryStatus) -> Vec<Entry> {
     status
         .link_buckets
         .iter()
         .flat_map(|link| {
-            link.buckets
-                .iter()
-                .filter(move |bucket| bucket.at > cutoff)
-                .map(|bucket| Entry {
-                    link: link.id.clone(),
-                    at: bucket.at,
-                    row: link_row(bucket),
-                })
+            link.buckets.iter().map(|bucket| Entry {
+                link: link.id.clone(),
+                at: bucket.at,
+                row: link_row(bucket),
+            })
         })
         .collect()
 }
@@ -295,6 +291,70 @@ pub struct Response {
     interfaces: Vec<InterfaceColumns>,
 }
 
+impl crate::encoding::Document for Response {
+    fn frame(&self) -> Result<crate::encoding::Frame> {
+        use crate::encoding::Column;
+        let mut meta = serde_json::Map::new();
+        meta.insert("start".into(), self.start.into());
+        meta.insert("step".into(), self.step.into());
+        meta.insert("count".into(), self.count.into());
+        meta.insert(
+            "interfaces".into(),
+            self.interfaces
+                .iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "id": item.id, "name": item.name, "device": item.device, "kind": item.kind
+                    })
+                })
+                .collect(),
+        );
+        meta.insert(
+            "conntrackMax".into(),
+            serde_json::to_value(self.system.conntrack_max)?,
+        );
+        let s = &self.system;
+        let mut columns = vec![
+            ("system.cpu".to_owned(), Column::F64(s.cpu.clone())),
+            ("system.cpuMax".to_owned(), Column::F64(s.cpu_max.clone())),
+            ("system.load".to_owned(), Column::F64(s.load.clone())),
+            ("system.memUsed".to_owned(), Column::F64(s.mem_used.clone())),
+            (
+                "system.temperature".to_owned(),
+                Column::F64(s.temperature.clone()),
+            ),
+            (
+                "system.temperatureMax".to_owned(),
+                Column::F64(s.temperature_max.clone()),
+            ),
+            (
+                "system.memAvailableMin".to_owned(),
+                Column::I64(s.mem_available_min.clone()),
+            ),
+            (
+                "system.conntrack".to_owned(),
+                Column::I64(s.conntrack.clone()),
+            ),
+        ];
+        for (index, item) in self.interfaces.iter().enumerate() {
+            for (name, values) in [
+                ("rxBps", &item.rx_bps),
+                ("txBps", &item.tx_bps),
+                ("rxPeakBps", &item.rx_peak_bps),
+                ("txPeakBps", &item.tx_peak_bps),
+                ("rxBytes", &item.rx_bytes),
+                ("txBytes", &item.tx_bytes),
+                ("errors", &item.errors),
+                ("drops", &item.drops),
+                ("handshakeAgeMax", &item.handshake_age_max),
+            ] {
+                columns.push((format!("{index}.{name}"), Column::I64(values.clone())));
+            }
+        }
+        Ok(crate::encoding::Frame { meta, columns })
+    }
+}
+
 #[expect(
     clippy::cast_precision_loss,
     reason = "Telemetry sums stay far below the 53-bit mantissa."
@@ -389,18 +449,12 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
         runtime::now() * 1_000,
     )?;
     let (first, last) = (query.start / 1_000 / step, query.end / 1_000 / step);
-    let path = store::database(config);
+    let path = history::root(config);
     let (_, _, status) = history::fresh_all()?;
-    let system_live = status
-        .as_ref()
-        .map(|status| system_entries(status, 0))
-        .unwrap_or_default();
-    let link_live = status
-        .as_ref()
-        .map(|status| link_entries(status, 0))
-        .unwrap_or_default();
-    let mut system = store::series(&path, &SYSTEM, step, (first, last), &system_live)?;
-    let mut links = store::series(&path, &INTERFACE, step, (first, last), &link_live)?;
+    let system_live = status.as_ref().map(system_entries).unwrap_or_default();
+    let link_live = status.as_ref().map(link_entries).unwrap_or_default();
+    let mut system = columnar::series(&path, &SYSTEM, step, (first, last), &system_live)?;
+    let mut links = columnar::series(&path, &INTERFACE, step, (first, last), &link_live)?;
     let mut known = counters(inventory);
     for id in links.keys() {
         if !known.iter().any(|counter| &counter.id == id) {
@@ -435,7 +489,7 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{INTERFACE, SYSTEM, link_row, rate, system_columns, system_row};
-    use crate::store;
+    use crate::columnar;
     use anyhow::{Result, ensure};
     use std::collections::BTreeMap;
     use wayline_protocol::{LinkBucket, SystemBucket};
@@ -457,7 +511,7 @@ mod tests {
     #[test]
     fn system_rows_store_and_render() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("telemetry.sqlite");
+        let database = directory.path().to_path_buf();
         let now = crate::runtime::now() / 60 * 60 - 120;
         let bucket = SystemBucket {
             at: now,
@@ -475,13 +529,13 @@ mod tests {
             conntrack_max: Some(400),
             conntrack_limit: Some(16_384),
         };
-        let entries = vec![store::Entry {
+        let entries = vec![columnar::Entry {
             link: "system".into(),
             at: now,
             row: system_row(&bucket),
         }];
-        store::store(&database, 7, &SYSTEM, &entries)?;
-        let found = store::series(&database, &SYSTEM, 60, (now / 60, now / 60), &[])?;
+        columnar::store(&database, 7, &SYSTEM, &entries, crate::runtime::now())?;
+        let found = columnar::series(&database, &SYSTEM, 60, (now / 60, now / 60), &[])?;
         let rows = found.get("system").cloned().unwrap_or_else(BTreeMap::new);
         let columns = system_columns(&rows, now / 60, now / 60);
         ensure!(columns.cpu == [Some(25.0)], "{:?}", columns.cpu);

@@ -1,9 +1,9 @@
 use crate::changes::{self, Event};
+use crate::columnar::{self, Entry, Fold, Kind, Row};
 use crate::history;
 use crate::router::Inventory;
 use crate::runtime;
 use crate::settings::Settings;
-use crate::store::{self, Entry, Fold, Kind, Row};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -42,7 +42,7 @@ static FIELDS: [(&str, Fold); 26] = [
 ];
 
 pub static KIND: Kind = Kind {
-    table: "wifi",
+    name: "wifi",
     fields: &FIELDS,
 };
 
@@ -131,6 +131,70 @@ impl Columns {
         self.rx_bytes.push(point.rx_bytes);
         self.disconnects.push(point.disconnects);
         self.roams.push(point.roams);
+    }
+}
+
+impl crate::encoding::Document for Response {
+    fn frame(&self) -> Result<crate::encoding::Frame> {
+        use crate::encoding::Column;
+        let mut meta = serde_json::Map::new();
+        meta.insert("start".into(), self.start.into());
+        meta.insert("step".into(), self.step.into());
+        meta.insert("count".into(), self.count.into());
+        meta.insert("summary".into(), serde_json::to_value(&self.summary)?);
+        meta.insert("events".into(), serde_json::to_value(&self.events)?);
+        let c = &self.columns;
+        let float =
+            |name: &str, values: &[Option<f64>]| (name.to_owned(), Column::F64(values.to_vec()));
+        let level = |name: &str, values: &[Option<i64>]| {
+            (
+                name.to_owned(),
+                Column::I32(
+                    values
+                        .iter()
+                        .map(|value| value.and_then(|value| i32::try_from(value).ok()))
+                        .collect(),
+                ),
+            )
+        };
+        let bytes = |name: &str, values: &[u64]| {
+            (
+                name.to_owned(),
+                Column::I64(
+                    values
+                        .iter()
+                        .map(|value| i64::try_from(*value).ok())
+                        .collect(),
+                ),
+            )
+        };
+        Ok(crate::encoding::Frame {
+            meta,
+            columns: vec![
+                ("samples".into(), Column::U32(c.samples.clone())),
+                float("uptime", &c.uptime),
+                float("signal", &c.signal),
+                level("signalMin", &c.signal_min),
+                level("signalMax", &c.signal_max),
+                float("noise", &c.noise),
+                float("snr", &c.snr),
+                float("txRate", &c.tx_rate),
+                float("txRateMin", &c.tx_rate_min),
+                float("rxRate", &c.rx_rate),
+                float("expected", &c.expected),
+                float("retries", &c.retries),
+                float("failures", &c.failures),
+                float("busy", &c.busy),
+                float("rxAir", &c.rx_air),
+                float("txAir", &c.tx_air),
+                float("upload", &c.upload),
+                float("download", &c.download),
+                bytes("txBytes", &c.tx_bytes),
+                bytes("rxBytes", &c.rx_bytes),
+                ("disconnects".into(), Column::U32(c.disconnects.clone())),
+                ("roams".into(), Column::U32(c.roams.clone())),
+            ],
+        })
     }
 }
 
@@ -323,8 +387,8 @@ fn periods(
     last: u64,
     live: &[WifiBucket],
 ) -> Result<BTreeMap<u64, WifiBucket>> {
-    let mut found = store::series(
-        &store::database(config),
+    let mut found = columnar::series(
+        &history::root(config),
         &KIND,
         step,
         (first, last),
@@ -439,7 +503,7 @@ pub fn view(config: &Settings, inventory: Option<&Inventory>, status: Option<Wif
             .find(|uplink| Some(&uplink.interface) == interface.as_ref())
             .map(|uplink| uplink.id.clone())
     });
-    let history_available = store::database(config).exists()
+    let history_available = history::root(config).join(KIND.name).exists()
         || status
             .as_ref()
             .is_some_and(|status| !status.buckets.is_empty());
@@ -480,9 +544,9 @@ pub const fn disabled() -> View {
 #[cfg(test)]
 mod tests {
     use super::{KIND, entries, point};
+    use crate::columnar;
     use crate::history::{HOUR, LEVELS};
     use crate::runtime;
-    use crate::store;
     use anyhow::{Result, ensure};
     use wayline_protocol::{BUCKET_SECONDS, WifiBucket};
 
@@ -534,20 +598,31 @@ mod tests {
     #[test]
     fn buckets_store_and_roll_up_exactly() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("telemetry.sqlite");
+        let database = directory.path().to_path_buf();
         let start = runtime::now() / HOUR * HOUR - 2 * HOUR;
         let buckets = hour(start);
-        store::store(&database, 30, &KIND, &entries(&buckets))?;
-        store::store(&database, 30, &KIND, &entries(&buckets))?;
-        let connection = store::open_for_test(&database)?;
-        for ((_, table), expected) in LEVELS.iter().zip([240, 60, 12, 1]) {
-            let rows: i64 =
-                connection.query_row(&format!("SELECT count(*) FROM wifi_{table}"), [], |row| {
-                    row.get(0)
-                })?;
-            ensure!(rows == expected, "{table} has {rows} rows.");
+        columnar::store(
+            &database,
+            30,
+            &KIND,
+            &entries(&buckets),
+            crate::runtime::now(),
+        )?;
+        columnar::store(
+            &database,
+            30,
+            &KIND,
+            &entries(&buckets),
+            crate::runtime::now(),
+        )?;
+        for ((step, _), expected) in LEVELS.iter().zip([240, 60, 12, 1]) {
+            let first = start / step;
+            let rows = columnar::series(&database, &KIND, *step, (first, first + 239), &[])?
+                .get("upstream")
+                .map_or(0, std::collections::BTreeMap::len);
+            ensure!(rows == expected, "Step {step} has {rows} rows.");
         }
-        let found = store::series(&database, &KIND, 3_600, (start / HOUR, start / HOUR), &[])?;
+        let found = columnar::series(&database, &KIND, 3_600, (start / HOUR, start / HOUR), &[])?;
         let row = found
             .get("upstream")
             .and_then(|rows| rows.get(&(start / HOUR)))
@@ -571,12 +646,12 @@ mod tests {
     #[test]
     fn live_buckets_fill_recent_periods() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("telemetry.sqlite");
+        let database = directory.path().to_path_buf();
         let start = runtime::now() / HOUR * HOUR - HOUR;
         let buckets = hour(start);
         let (old, live) = buckets.split_at(200);
-        store::store(&database, 7, &KIND, &entries(old))?;
-        let found = store::series(
+        columnar::store(&database, 7, &KIND, &entries(old), crate::runtime::now())?;
+        let found = columnar::series(
             &database,
             &KIND,
             60,

@@ -15,7 +15,38 @@ shows the inputs next to each score.
 With 30 days, 5-minute and 1-hour tiers keep 30 days. With 1 day, 1-minute
 data keeps 1 day. In memory only, 15 s data keeps 3 hours and 1-minute data 1 day.
 Coarser tiers are exact rollups of finer ones: sums, minimums and maximums
-combine without loss, and latency medians are medians of child medians.
+combine without loss, and latency medians are lower medians of child medians.
+Live data not yet saved is rolled up through the same tiers at query time, so a
+period reads the same before and after it is saved.
+
+## Storage
+
+History is columnar on disk, in the same Arrow format the page receives.
+Each kind (`latency`, `wifi`, `system`, `interface`) has a directory per tier,
+holding Arrow IPC files with ZSTD-compressed buffers, one file per time chunk:
+
+| Tier | Chunk |
+| --- | --- |
+| 15 s | 1 hour |
+| 1 min | 6 hours |
+| 5 min | 1 day |
+| 1 hour | 7 days |
+
+Each file has the columns `series` (UTF-8), `period` (bucket start / step) and
+the kind's measurement columns (Int64, nullable). Every 5 minutes wayline-ctl
+merges new 15-second rows into the open chunk, recomputes the affected coarser
+periods, and rewrites each changed file atomically (write, fsync, rename).
+Retention deletes whole files, so it can keep up to one chunk longer than the
+nominal period. A file that cannot be read is renamed to `.broken`, logged in
+Recent changes, and only that chunk is lost. Storage is capped at 96 MB on
+flash and 8 MB in memory; the oldest chunks go first.
+
+A week of eleven latency series takes about 360 KB; the SQLite store it
+replaced took 2.9 MB for the same data. Read the files with any Arrow tool,
+for example `pyarrow.ipc.open_file("…/latency/s1m/1795291800.arrow")`.
+
+`latency.sqlite` from earlier versions is left in place and no longer read.
+Purge history deletes it.
 
 ## Latency, loss, jitter
 

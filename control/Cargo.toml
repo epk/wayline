@@ -23,8 +23,9 @@ serde.workspace = true
 serde_json.workspace = true
 socket2.workspace = true
 tempfile.workspace = true
-rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "fallible_uint"] }
-zstd = { version = "0.13", default-features = false }
+arrow-array = { version = "60", default-features = false }
+arrow-ipc = { version = "60", default-features = false, features = ["zstd"] }
+arrow-schema = { version = "60", default-features = false }
 
 [lints]
 workspace = true

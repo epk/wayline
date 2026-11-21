@@ -3,6 +3,7 @@
 mod api;
 mod auto;
 mod changes;
+mod columnar;
 mod doctor;
 mod egress;
 mod encoding;
@@ -13,7 +14,6 @@ mod router;
 mod runtime;
 mod service;
 mod settings;
-mod store;
 mod telemetry;
 mod update;
 mod wifi;
@@ -55,11 +55,9 @@ fn run() -> Result<Value> {
     );
     match method.as_str() {
         "get_state" => reply(api::state()?),
-        "get_history" => encoding::encode(&raw, reply(api::history(&parse(&raw)?)?)?),
-        "get_wifi_history" => encoding::encode(&raw, reply(api::wifi_history(&parse(&raw)?)?)?),
-        "get_telemetry_history" => {
-            encoding::encode(&raw, reply(api::telemetry_history(&parse(&raw)?)?)?)
-        }
+        "get_history" => encoding::reply(&raw, &api::history(&parse(&raw)?)?),
+        "get_wifi_history" => encoding::reply(&raw, &api::wifi_history(&parse(&raw)?)?),
+        "get_telemetry_history" => encoding::reply(&raw, &api::telemetry_history(&parse(&raw)?)?),
         "purge_history" => api::purge_history(&parse(&raw)?),
         "set_config" => api::set_config(parse(&raw)?),
         "select_tunnel" => api::select(&parse(&raw)?),
