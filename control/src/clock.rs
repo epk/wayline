@@ -7,7 +7,7 @@ use wayline_protocol::{BUCKET_SECONDS, Bucket, LinkBucket, SystemBucket, WifiBuc
 const STEP_MS: i64 = 60_000;
 const DRIFT_MS: i64 = 30_000;
 const SETTLE_MS: u64 = 15 * 60_000;
-const MARKER: &str = "clock-synced";
+const NTP_VALID: &str = "/var/state/ntp-valid";
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -44,7 +44,7 @@ fn signed(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn decide(state: &mut State, observation: &Observation, marker: Option<&str>) -> Clock {
+fn decide(state: &mut State, observation: &Observation, ntp_valid: bool) -> Clock {
     let offset = signed(observation.wall_ms) - signed(observation.boot_ms);
     if state.boot != observation.boot {
         *state = State {
@@ -54,7 +54,7 @@ fn decide(state: &mut State, observation: &Observation, marker: Option<&str>) ->
         };
     }
     if state.synced.is_none() {
-        state.synced = if marker.is_some_and(|boot| boot.trim() == observation.boot) {
+        state.synced = if ntp_valid {
             Some(Source::Ntp)
         } else if (offset - state.first_offset_ms).abs() > STEP_MS {
             Some(Source::Step)
@@ -73,15 +73,14 @@ fn decide(state: &mut State, observation: &Observation, marker: Option<&str>) ->
 }
 
 pub fn observe(observation: &Observation) -> Result<Clock> {
-    observe_in(Path::new(RUNTIME), observation)
+    observe_in(Path::new(RUNTIME), Path::new(NTP_VALID), observation)
 }
 
-fn observe_in(directory: &Path, observation: &Observation) -> Result<Clock> {
+fn observe_in(directory: &Path, ntp_valid: &Path, observation: &Observation) -> Result<Clock> {
     let path = directory.join("clock.json");
     let mut state: State = runtime::load(&path);
     let before = serde_json::to_vec(&state)?;
-    let marker = std::fs::read_to_string(directory.join(MARKER)).ok();
-    let clock = decide(&mut state, observation, marker.as_deref());
+    let clock = decide(&mut state, observation, ntp_valid.exists());
     if serde_json::to_vec(&state)? != before {
         runtime::store(&path, &state)?;
     }
@@ -153,43 +152,43 @@ mod tests {
         let early = decide(
             &mut state,
             &seen("b1", 30_000, 1_700_000_030_000, true),
-            None,
+            false,
         );
         assert!(!early.synced);
         let ntp = decide(
             &mut state,
             &seen("b1", 40_000, 1_700_000_040_000, false),
-            Some("b1\n"),
+            true,
         );
         assert!(ntp.synced && ntp.source == Some(Source::Ntp));
         let mut state = State::default();
         decide(
             &mut state,
             &seen("b2", 30_000, 1_700_000_030_000, false),
-            Some("old-boot"),
+            false,
         );
         let stepped = decide(
             &mut state,
             &seen("b2", 90_000, 1_800_000_000_000, false),
-            None,
+            false,
         );
         assert!(stepped.synced && stepped.source == Some(Source::Step));
         let mut state = State::default();
         decide(
             &mut state,
             &seen("b3", 60_000, 1_700_000_060_000, true),
-            None,
+            false,
         );
         let settled = decide(
             &mut state,
             &seen("b3", 16 * 60_000, 1_700_000_960_000, true),
-            None,
+            false,
         );
         assert!(settled.synced && settled.source == Some(Source::Connectivity));
         let fresh = decide(
             &mut state,
             &seen("b4", 1_000, 1_700_000_001_000, false),
-            None,
+            false,
         );
         assert!(!fresh.synced, "A new boot keeps the old sync.");
     }
@@ -218,40 +217,33 @@ mod tests {
         assert_eq!(buckets[0].at % 15, 0);
     }
 
-    fn hotplug(directory: &std::path::Path, action: &str, stratum: &str) -> anyhow::Result<()> {
-        let script = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../package/files/etc/hotplug.d/ntp/95-wayline"
-        );
-        let status = std::process::Command::new("sh")
-            .arg(script)
-            .env("ACTION", action)
-            .env("stratum", stratum)
-            .env("WAYLINE_RUNTIME", directory)
-            .env("WAYLINE_BOOT_ID", directory.join("boot_id"))
-            .status()?;
-        anyhow::ensure!(status.success(), "The hotplug script failed.");
-        Ok(())
-    }
-
     #[test]
-    fn the_ntp_hotplug_script_marks_this_boot_synced() -> anyhow::Result<()> {
+    fn firmware_ntp_validity_marks_the_clock_synced() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let root = directory.path();
-        std::fs::write(root.join("boot_id"), "boot-a\n")?;
+        let valid = root.join("ntp-valid");
         let early = seen("boot-a", 20_000, 1_700_000_020_000, false);
-        anyhow::ensure!(!observe_in(root, &early)?.synced);
-        hotplug(root, "stratum", "16")?;
-        hotplug(root, "periodic", "2")?;
-        anyhow::ensure!(
-            !observe_in(root, &early)?.synced,
-            "An unsynced event marked sync."
-        );
-        hotplug(root, "stratum", "2")?;
-        let clock = observe_in(root, &seen("boot-a", 25_000, 1_700_000_025_000, false))?;
+        anyhow::ensure!(!observe_in(root, &valid, &early)?.synced);
+        std::fs::write(&valid, "kmwan set success\n")?;
+        let clock = observe_in(
+            root,
+            &valid,
+            &seen("boot-a", 25_000, 1_700_000_025_000, false),
+        )?;
         anyhow::ensure!(clock.synced && clock.source == Some(Source::Ntp));
-        let next = observe_in(root, &seen("boot-b", 5_000, 1_700_000_005_000, false))?;
-        anyhow::ensure!(!next.synced, "A marker from an earlier boot counted.");
+        std::fs::remove_file(&valid)?;
+        let kept = observe_in(
+            root,
+            &valid,
+            &seen("boot-a", 30_000, 1_700_000_030_000, false),
+        )?;
+        anyhow::ensure!(kept.synced, "Sync for a boot is kept once seen.");
+        let next = observe_in(
+            root,
+            &valid,
+            &seen("boot-b", 5_000, 1_700_000_005_000, false),
+        )?;
+        anyhow::ensure!(!next.synced, "A new boot starts unsynced.");
         Ok(())
     }
 }

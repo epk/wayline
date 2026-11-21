@@ -140,9 +140,11 @@ later, or never on a captive network.
   its wall-clock start. Each status snapshot carries the kernel boot id, the
   uptime and the wall clock at the same moment.
 - The clock counts as synced for a boot when any of these happens first: the
-  NTP hotplug hook (`/etc/hotplug.d/ntp/95-wayline`) reports a stratum other
-  than 16; the wall clock steps more than 60 s against uptime; or the router has
-  been up 15 minutes and a probe has a reply.
+  firmware marks time valid (`/var/state/ntp-valid`, written on tmpfs by GL.iNet
+  firmware after chrony reports a normal leap status within 5 s, by busybox
+  ntpd's stratum hook on older 4.x releases, or by a manual time sync); the
+  wall clock steps more than 60 s against uptime; or the router has been up
+  15 minutes and a probe has a reply.
 - Until then, every 5-minute collection appends the closed buckets to
   `history/pending/<boot id>.ndjson` instead of the Parquet store. On sync the
   staged buckets are moved to `uptime_ms + (wall − uptime)`, floored to

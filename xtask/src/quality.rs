@@ -9,11 +9,10 @@ const LUA: [&str; 2] = [
     "package/files/usr/share/gl-validator.d/wayline.lua",
 ];
 const NIX: [&str; 3] = ["devenv.nix", "nix/bootstrap.nix", "nix/usign.nix"];
-const SHELL_SCRIPTS: [&str; 5] = [
+const SHELL_SCRIPTS: [&str; 4] = [
     "package/postinst",
     "package/prerm",
     "package/files/etc/hotplug.d/iface/95-wayline",
-    "package/files/etc/hotplug.d/ntp/95-wayline",
     "install.sh",
 ];
 

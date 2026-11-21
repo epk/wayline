@@ -1,6 +1,0 @@
-#!/bin/sh
-[ "$ACTION" = stratum ] || exit 0
-[ "${stratum:-16}" != 16 ] || exit 0
-runtime="${WAYLINE_RUNTIME:-/var/run/wayline}"
-mkdir -p "$runtime"
-cat "${WAYLINE_BOOT_ID:-/proc/sys/kernel/random/boot_id}" >"$runtime/clock-synced"
