@@ -24,10 +24,30 @@ period reads the same before and after it is saved.
 Columnar end to end, with each format used for what it was designed for:
 Parquet at rest, Arrow in motion.
 
-- **Disk: Parquet.** Each kind (`latency`, `wifi`, `system`, `interface`) has
-  a directory per tier with one Parquet file per time chunk. Series names use
-  dictionary encoding; integer columns use delta binary packing; every page is
-  zstd-compressed and carries min/max statistics.
+- **Disk: Parquet.** Self-describing, Hive-partitioned files that make sense
+  off the router:
+
+  ```
+  /etc/wayline/history/            (memory only: /var/run/wayline/history/)
+    kind=latency/step=15/20261121T180000Z.parquet
+    kind=latency/step=60/20261121T180000Z.parquet
+    kind=wifi/...  kind=system/...  kind=interface/...
+    dimensions.parquet
+  ```
+
+  Each chunk is named by its UTC start. Columns: `series` (UTF-8, dictionary
+  encoded), `ts` (TIMESTAMP, milliseconds, UTC: the bucket start) and the
+  kind's measurements (INT64, nullable, delta encoded). Pages are
+  zstd-compressed with min/max statistics. Key-value metadata records
+  `wayline.schema`, `wayline.kind`, `wayline.step_seconds` and
+  `wayline.columns`, which lists every column's unit and rollup rule (`sum`,
+  `min`, `max` or `median`). The rollup rule tells a consumer how to aggregate
+  further: sums add, medians must not be averaged.
+- **Dimensions.** Series keys are digests that keep tunnel identities private.
+  `dimensions.parquet` maps `(table, series)` to `kind` (tunnel, wan, uplink,
+  endpoint, wifi, system), `subject` (the id the page and API use), `name`,
+  `target`, `device` and `current`. Rows for paths that were removed stay with
+  `current = false`, so old history still joins to a name.
 - **Wire and page: Arrow IPC.** History replies are one Arrow IPC stream with
   zstd buffers, decoded in the page straight into typed arrays for the charts.
 - **Control plane: JSON.** `get_state` and commands are small nested objects.
@@ -41,10 +61,12 @@ Parquet at rest, Arrow in motion.
 
 Every 5 minutes wayline-ctl merges new 15-second rows into the open chunk,
 recomputes the affected coarser periods, and rewrites each changed file
-atomically (write, fsync, rename). Retention deletes whole files, so data can
-outlive the nominal period by up to one chunk. A file that cannot be read is
-renamed to `.broken` and logged in Recent changes; only that chunk is lost.
-Storage is capped at 96 MB on flash and 8 MB in memory, oldest chunks first.
+atomically (write, fsync, rename). Only the chunks of the current period
+change; older files are immutable, which keeps incremental copies cheap.
+Retention deletes whole files, so data can outlive the nominal period by up to
+one chunk. A file that cannot be read is renamed to `.broken` and logged in
+Recent changes; only that chunk is lost. Storage is capped at 96 MB on flash
+and 8 MB in memory, oldest chunks first.
 
 Measured for one week of eleven latency series, all tiers:
 
@@ -57,18 +79,31 @@ Measured for one week of eleven latency series, all tiers:
 Parquet adds about 57 KB to wayline-ctl on top of the Arrow writer the wire
 needs, and writes and reads a week of chunks faster than Arrow IPC files.
 
-Query the files directly with DuckDB, Polars or pyarrow, on the router's copy
-or one taken off it:
+Query the files with DuckDB, Polars or pyarrow, on the router or a copy:
 
 ```sql
-SELECT series, avg(median_us) / 1000 AS avg_ms, sum(lost) * 100.0 / sum(sent) AS loss_pct,
-       sum(jitter_sum) / sum(jitter_n) / 1000 AS jitter_ms
-FROM '/etc/wayline/history/latency/s5m/*.parquet' GROUP BY series;
+SELECT d.name, date_trunc('hour', h.ts) AS hour,
+       avg(h.median_us) / 1000 AS avg_ms,
+       sum(h.lost) * 100.0 / sum(h.sent) AS loss_pct,
+       sum(h.jitter_sum) / sum(h.jitter_n) / 1000 AS jitter_ms
+FROM read_parquet('history/kind=latency/step=300/*.parquet') h
+JOIN 'history/dimensions.parquet' d ON d.table = 'latency' AND d.series = h.series
+GROUP BY ALL ORDER BY hour;
 ```
 
-Series names are path digests; `wayline-ctl doctor` and the page map them to
-tunnel and uplink names. `latency.sqlite` from earlier versions is left in
-place and no longer read. Purge history deletes it.
+`latency.sqlite` from earlier versions is left in place and no longer read.
+Purge history deletes it.
+
+### Planned: export and off-router views
+
+The layout is meant to be copied as is. A scheduled export can upload changed
+files to any S3-compatible bucket (Cloudflare R2, AWS S3, or Google Cloud
+Storage through its S3 interoperability API) under `router=<id>/`, keeping
+`kind=`/`step=` partitions. A Cloudflare-hosted MCP server or the hosted page
+can then query the same Parquet with DuckDB or R2 SQL, using `dimensions.parquet`
+for names and the column metadata for units and rollup rules. The page
+reads through one data-source interface, so a hosted build only needs a new
+source.
 
 ## Latency, loss, jitter
 

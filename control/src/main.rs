@@ -4,6 +4,7 @@ mod api;
 mod auto;
 mod changes;
 mod columnar;
+mod dimensions;
 mod doctor;
 mod egress;
 mod encoding;

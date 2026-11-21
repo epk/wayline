@@ -1,5 +1,5 @@
 use crate::changes::{self, Event};
-use crate::columnar::{self, Entry, Fold, Kind, Row};
+use crate::columnar::{self, Entry, Fold, Kind, Measure, Row, measure};
 use crate::history;
 use crate::router::Inventory;
 use crate::runtime;
@@ -9,36 +9,36 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use wayline_protocol::{WifiBucket, WifiLink, WifiSample, WifiState, WifiStatus};
 
-const UPSTREAM: &str = "upstream";
+pub const UPSTREAM: &str = "upstream";
 pub const SUBJECT: &str = "wifi";
 
-static FIELDS: [(&str, Fold); 26] = [
-    ("samples", Fold::Sum),
-    ("connected", Fold::Sum),
-    ("signal_n", Fold::Sum),
-    ("signal_sum", Fold::Sum),
-    ("signal_min", Fold::Min),
-    ("signal_max", Fold::Max),
-    ("noise_n", Fold::Sum),
-    ("noise_sum", Fold::Sum),
-    ("tx_rate_n", Fold::Sum),
-    ("tx_rate_sum", Fold::Sum),
-    ("tx_rate_min", Fold::Min),
-    ("rx_rate_n", Fold::Sum),
-    ("rx_rate_sum", Fold::Sum),
-    ("expected_n", Fold::Sum),
-    ("expected_sum", Fold::Sum),
-    ("frames", Fold::Sum),
-    ("retries", Fold::Sum),
-    ("failed", Fold::Sum),
-    ("tx_bytes", Fold::Sum),
-    ("rx_bytes", Fold::Sum),
-    ("active_ms", Fold::Sum),
-    ("busy_ms", Fold::Sum),
-    ("rx_ms", Fold::Sum),
-    ("tx_ms", Fold::Sum),
-    ("disconnects", Fold::Sum),
-    ("roams", Fold::Sum),
+static FIELDS: [Measure; 26] = [
+    measure("samples", Fold::Sum, "samples"),
+    measure("connected", Fold::Sum, "samples"),
+    measure("signal_n", Fold::Sum, "samples"),
+    measure("signal_sum", Fold::Sum, "dBm (sum)"),
+    measure("signal_min", Fold::Min, "dBm"),
+    measure("signal_max", Fold::Max, "dBm"),
+    measure("noise_n", Fold::Sum, "samples"),
+    measure("noise_sum", Fold::Sum, "dBm (sum)"),
+    measure("tx_rate_n", Fold::Sum, "samples"),
+    measure("tx_rate_sum", Fold::Sum, "kbit/s (sum)"),
+    measure("tx_rate_min", Fold::Min, "kbit/s"),
+    measure("rx_rate_n", Fold::Sum, "samples"),
+    measure("rx_rate_sum", Fold::Sum, "kbit/s (sum)"),
+    measure("expected_n", Fold::Sum, "samples"),
+    measure("expected_sum", Fold::Sum, "kbit/s (sum)"),
+    measure("frames", Fold::Sum, "frames"),
+    measure("retries", Fold::Sum, "frames"),
+    measure("failed", Fold::Sum, "frames"),
+    measure("tx_bytes", Fold::Sum, "bytes"),
+    measure("rx_bytes", Fold::Sum, "bytes"),
+    measure("active_ms", Fold::Sum, "ms"),
+    measure("busy_ms", Fold::Sum, "ms"),
+    measure("rx_ms", Fold::Sum, "ms"),
+    measure("tx_ms", Fold::Sum, "ms"),
+    measure("disconnects", Fold::Sum, "events"),
+    measure("roams", Fold::Sum, "events"),
 ];
 
 pub static KIND: Kind = Kind {
@@ -503,7 +503,7 @@ pub fn view(config: &Settings, inventory: Option<&Inventory>, status: Option<Wif
             .find(|uplink| Some(&uplink.interface) == interface.as_ref())
             .map(|uplink| uplink.id.clone())
     });
-    let history_available = history::root(config).join(KIND.name).exists()
+    let history_available = columnar::kind_dir(&history::root(config), &KIND).exists()
         || status
             .as_ref()
             .is_some_and(|status| !status.buckets.is_empty());

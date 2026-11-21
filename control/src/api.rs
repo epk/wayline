@@ -440,38 +440,25 @@ fn incidents(
     snapshot: &[Series],
     wifi: Option<&WifiStatus>,
 ) -> Vec<history::Incident> {
-    let mut names: BTreeMap<String, (String, String, String)> = BTreeMap::new();
-    for target in &config.targets {
-        let detail = format!("Every probe to {target} was lost");
-        for path in inventory
-            .paths
-            .iter()
-            .chain(inventory.wan.iter())
-            .chain(inventory.uplinks.iter())
-        {
-            names
-                .entry(path.series(target))
-                .or_insert_with(|| (path.id.clone(), path.name.clone(), detail.clone()));
-        }
-    }
-    for path in &inventory.paths {
-        names.insert(
-            router::endpoint_series(&path.key),
-            (
-                format!("endpoint:{}", path.id),
-                format!("{} server", path.name),
-                "Every probe to the VPN server was lost".into(),
-            ),
-        );
-    }
-    names.insert(
-        "wifi".into(),
-        (
-            wifi::SUBJECT.into(),
-            "Upstream Wi-Fi".into(),
-            "The repeater was not connected".into(),
-        ),
-    );
+    let names: BTreeMap<String, (String, String, String)> =
+        crate::dimensions::current(config, inventory)
+            .into_iter()
+            .filter(|item| item.table == history::LATENCY.name || item.table == wifi::KIND.name)
+            .map(|item| {
+                let detail = match (item.kind.as_str(), &item.target) {
+                    ("wifi", _) => "The repeater was not connected".to_owned(),
+                    ("endpoint", _) => "Every probe to the VPN server was lost".to_owned(),
+                    (_, Some(target)) => format!("Every probe to {target} was lost"),
+                    (_, None) => "Every probe was lost".to_owned(),
+                };
+                let key = if item.table == wifi::KIND.name {
+                    "wifi".to_owned()
+                } else {
+                    item.series
+                };
+                (key, (item.subject, item.name, detail))
+            })
+            .collect();
     let buckets = wifi.map(|wifi| wifi.buckets.as_slice()).unwrap_or_default();
     let since = (runtime::now() * 1_000).saturating_sub(INCIDENT_WINDOW);
     let mut found: Vec<history::Incident> = history::logged_incidents(config, snapshot, buckets)

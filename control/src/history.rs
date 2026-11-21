@@ -1,5 +1,5 @@
 use crate::changes::{self, Event};
-use crate::columnar::{self, Entry, Fold, Kind};
+use crate::columnar::{self, Entry, Fold, Kind, measure};
 use crate::router;
 use crate::router::Inventory;
 use crate::runtime;
@@ -24,7 +24,6 @@ pub const LEVELS: [(u64, &str); 4] = [
     (300, "s5m"),
     (3_600, "s1h"),
 ];
-const KINDS: [&str; 4] = ["latency", "wifi", "system", "interface"];
 const LEGACY: [&str; 9] = [
     "latency.sqlite",
     "latency.sqlite-journal",
@@ -40,13 +39,13 @@ const LEGACY: [&str; 9] = [
 pub static LATENCY: Kind = Kind {
     name: "latency",
     fields: &[
-        ("min_us", Fold::Min),
-        ("median_us", Fold::Median),
-        ("max_us", Fold::Max),
-        ("sent", Fold::Sum),
-        ("lost", Fold::Sum),
-        ("jitter_sum", Fold::Sum),
-        ("jitter_n", Fold::Sum),
+        measure("min_us", Fold::Min, "us"),
+        measure("median_us", Fold::Median, "us"),
+        measure("max_us", Fold::Max, "us"),
+        measure("sent", Fold::Sum, "probes"),
+        measure("lost", Fold::Sum, "probes"),
+        measure("jitter_sum", Fold::Sum, "us (sum of |RTT difference|)"),
+        measure("jitter_n", Fold::Sum, "RTT pairs"),
     ],
 };
 
@@ -337,8 +336,7 @@ pub fn purge() -> Result<()> {
             runtime::now().to_string().as_bytes(),
         )?;
         for root in roots {
-            for kind in KINDS {
-                let directory = root.join(kind);
+            for directory in columnar::kinds(&root) {
                 match fs::remove_dir_all(&directory) {
                     Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                         return Err(error).with_context(|| {
@@ -348,11 +346,13 @@ pub fn purge() -> Result<()> {
                     _ => {}
                 }
             }
-            for name in
-                LEGACY
-                    .iter()
-                    .chain(&["events.json", "facts.json", "incidents.json", "index.json"])
-            {
+            for name in LEGACY.iter().chain(&[
+                "events.json",
+                "facts.json",
+                "incidents.json",
+                "index.json",
+                "dimensions.parquet",
+            ]) {
                 remove(&root.join(name))?;
             }
         }
@@ -653,31 +653,11 @@ pub fn logged_incidents(config: &Settings, ring: &[Series], wifi: &[WifiBucket])
 
 pub fn report(config: &Settings) -> Report {
     let root = root(config);
-    let lines = columnar::report(&root);
-    let bytes = fs::read_dir(&root)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter(|entry| KINDS.iter().any(|kind| entry.file_name() == *kind))
-        .map(|entry| directory_bytes(&entry.path()))
-        .sum();
     Report {
-        bytes,
+        bytes: columnar::bytes(&root),
         cap: columnar::cap(&root),
-        lines,
+        lines: columnar::report(&root),
     }
-}
-
-fn directory_bytes(path: &Path) -> u64 {
-    fs::read_dir(path)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|entry| match entry.file_type() {
-            Ok(kind) if kind.is_dir() => directory_bytes(&entry.path()),
-            _ => entry.metadata().map_or(0, |meta| meta.len()),
-        })
-        .sum()
 }
 
 fn lines(
@@ -854,10 +834,7 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DAY, HOUR, LATENCY, Line, Query, Subject, collect_at, directory_bytes, lines, outages,
-        resolution,
-    };
+    use super::{DAY, HOUR, LATENCY, Line, Query, Subject, collect_at, lines, outages, resolution};
     use crate::columnar;
     use crate::runtime;
     use anyhow::{Result, ensure};
@@ -1097,7 +1074,7 @@ mod tests {
                 .collect();
             collect_at(root, 7, &snapshot)?;
         }
-        let size = directory_bytes(&root.join("latency"));
+        let size = columnar::bytes(root);
         ensure!(size < 2 * 1024 * 1024, "History is {size} bytes.");
         let query = request(runtime::now() - DAY, runtime::now(), 60);
         let line = lines(root, 60, &query, &[], vec![subject(1)])?.remove(0);

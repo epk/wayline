@@ -3,7 +3,7 @@ use crate::router::{self, Inventory};
 use crate::runtime;
 use crate::runtime::{DAEMON, MONITOR_CONFIG, RUNTIME, STATUS_SOCKET};
 use crate::settings::Settings;
-use crate::{auto, changes, egress, history, native, update};
+use crate::{auto, changes, dimensions, egress, history, native, update};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::fs;
@@ -182,6 +182,10 @@ fn routine() -> Result<()> {
     let recorded = inventory
         .as_ref()
         .map_or(Ok(()), |inventory| changes::record(&config, inventory));
+    let described = inventory
+        .as_ref()
+        .filter(|_| config.monitoring())
+        .map_or(Ok(()), |inventory| dimensions::record(&config, inventory));
     refreshed?;
     let collected = format!("{RUNTIME}/last-collect");
     let last = fs::read_to_string(&collected)
@@ -195,5 +199,6 @@ fn routine() -> Result<()> {
         result?;
     }
     let _ = auto::step(&config);
-    failure.map_or(recorded, Err)
+    let outcome = recorded.and(described);
+    failure.map_or(outcome, Err)
 }

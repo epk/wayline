@@ -1,4 +1,4 @@
-use crate::columnar::{self, Entry, Fold, Kind, Row};
+use crate::columnar::{self, Entry, Fold, Kind, Row, measure};
 use crate::history;
 use crate::router::Inventory;
 use crate::runtime;
@@ -9,41 +9,41 @@ use std::collections::BTreeMap;
 use wayline_protocol::{Counter, LinkBucket, SystemBucket, TelemetryStatus};
 
 pub const INTERVAL_MS: u64 = 5_000;
-const SYSTEM_LINK: &str = "system";
+pub const SYSTEM_LINK: &str = "system";
 
 pub static SYSTEM: Kind = Kind {
     name: "system",
     fields: &[
-        ("samples", Fold::Sum),
-        ("cpu_n", Fold::Sum),
-        ("cpu_sum", Fold::Sum),
-        ("cpu_max", Fold::Max),
-        ("load_sum", Fold::Sum),
-        ("mem_n", Fold::Sum),
-        ("mem_used_sum", Fold::Sum),
-        ("mem_available_min", Fold::Min),
-        ("temp_n", Fold::Sum),
-        ("temp_sum", Fold::Sum),
-        ("temp_max", Fold::Max),
-        ("conntrack_max", Fold::Max),
-        ("conntrack_limit", Fold::Max),
+        measure("samples", Fold::Sum, "samples"),
+        measure("cpu_n", Fold::Sum, "samples"),
+        measure("cpu_sum", Fold::Sum, "permille (sum)"),
+        measure("cpu_max", Fold::Max, "permille"),
+        measure("load_sum", Fold::Sum, "load x100 (sum)"),
+        measure("mem_n", Fold::Sum, "samples"),
+        measure("mem_used_sum", Fold::Sum, "permille (sum)"),
+        measure("mem_available_min", Fold::Min, "bytes"),
+        measure("temp_n", Fold::Sum, "samples"),
+        measure("temp_sum", Fold::Sum, "millidegrees C (sum)"),
+        measure("temp_max", Fold::Max, "millidegrees C"),
+        measure("conntrack_max", Fold::Max, "entries"),
+        measure("conntrack_limit", Fold::Max, "entries"),
     ],
 };
 
 pub static INTERFACE: Kind = Kind {
     name: "interface",
     fields: &[
-        ("samples", Fold::Sum),
-        ("seconds_ms", Fold::Sum),
-        ("rx_bytes", Fold::Sum),
-        ("tx_bytes", Fold::Sum),
-        ("rx_packets", Fold::Sum),
-        ("tx_packets", Fold::Sum),
-        ("errors", Fold::Sum),
-        ("drops", Fold::Sum),
-        ("rx_peak_bps", Fold::Max),
-        ("tx_peak_bps", Fold::Max),
-        ("handshake_age_max", Fold::Max),
+        measure("samples", Fold::Sum, "samples"),
+        measure("seconds_ms", Fold::Sum, "ms"),
+        measure("rx_bytes", Fold::Sum, "bytes"),
+        measure("tx_bytes", Fold::Sum, "bytes"),
+        measure("rx_packets", Fold::Sum, "packets"),
+        measure("tx_packets", Fold::Sum, "packets"),
+        measure("errors", Fold::Sum, "packets"),
+        measure("drops", Fold::Sum, "packets"),
+        measure("rx_peak_bps", Fold::Max, "bit/s"),
+        measure("tx_peak_bps", Fold::Max, "bit/s"),
+        measure("handshake_age_max", Fold::Max, "seconds"),
     ],
 };
 
