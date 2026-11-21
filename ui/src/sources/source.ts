@@ -25,7 +25,6 @@ export interface UpdateReply {
 }
 
 export interface DataSource {
-  readonly readOnly?: boolean;
   getState(): Promise<unknown>;
   getHistory(query: LatencyQuery): Promise<LatencyDoc>;
   getWifiHistory(query: HistoryQuery): Promise<WifiDoc>;
@@ -47,6 +46,3 @@ export type WriteCommand =
   | 'purgeHistory'
   | 'checkUpdate'
   | 'installUpdate';
-
-export const supports = (source: DataSource | null, command: WriteCommand): boolean =>
-  !!source && !source.readOnly && typeof source[command] === 'function';

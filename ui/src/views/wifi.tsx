@@ -16,7 +16,7 @@ import {
   dateTime,
 } from '../format.ts';
 import { column, mapColumn, some, times } from '../series.ts';
-import { busy, can, enableSetting, range, readOnly, state, wifiData } from '../store.ts';
+import { busy, can, enableSetting, range, state, wifiData } from '../store.ts';
 import type { Column, Rate, WifiKey } from '../types.ts';
 import { Badge, Explain, Facts, Panel, scaleNote, type Tone } from '../ui.tsx';
 
@@ -101,7 +101,6 @@ export function WifiView() {
           </p>
           <Button
             className="wl-button wl-primary"
-            hidden={readOnly.value}
             disabled={!can.value.configure || busy.value}
             onClick={() =>
               void enableSetting(

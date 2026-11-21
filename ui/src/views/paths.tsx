@@ -45,7 +45,6 @@ import {
   isolated,
   latencyData,
   pendingStop,
-  readOnly,
   primarySelected,
   readError,
   ready,
@@ -216,11 +215,9 @@ function TunnelTable() {
             </th>
             <th scope="col">MOS</th>
             {showServer && <th scope="col">To server</th>}
-            {!readOnly.value && (
-              <th scope="col">
-                <span className="wl-sr">Actions</span>
-              </th>
-            )}
+            <th scope="col">
+              <span className="wl-sr">Actions</span>
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -328,59 +325,57 @@ function TunnelTable() {
                     )}
                   </td>
                 )}
-                {!readOnly.value && (
-                  <td className="wl-action">
-                    <div className="wl-actions">
-                      {!t.preferred && t.enabled && (
-                        <Button
-                          className="wl-button"
-                          focusableWhenDisabled
-                          title={
-                            !can.value.select
-                              ? selectReason.value
-                              : !selectable(t)
-                                ? t.selectReason || t.reason
-                                : undefined
-                          }
-                          disabled={busy.value || !selectable(t) || !can.value.select}
-                          onClick={() => void selectExit(t)}
+                <td className="wl-action">
+                  <div className="wl-actions">
+                    {!t.preferred && t.enabled && (
+                      <Button
+                        className="wl-button"
+                        focusableWhenDisabled
+                        title={
+                          !can.value.select
+                            ? selectReason.value
+                            : !selectable(t)
+                              ? t.selectReason || t.reason
+                              : undefined
+                        }
+                        disabled={busy.value || !selectable(t) || !can.value.select}
+                        onClick={() => void selectExit(t)}
+                      >
+                        {busyTunnel.value === t.id && busyAction.value === 'select'
+                          ? 'Applying…'
+                          : 'Use ' + t.name + ' as exit'}
+                      </Button>
+                    )}
+                    {busyTunnel.value === t.id && busyAction.value === 'toggle' ? (
+                      <span className="wl-muted" role="status">
+                        {t.enabled ? 'Stopping…' : 'Starting…'}
+                      </span>
+                    ) : (
+                      <label
+                        className="wl-switch"
+                        title={
+                          !t.controllable
+                            ? 'Native tunnel control is unavailable.'
+                            : !can.value.control
+                              ? controlReason.value
+                              : undefined
+                        }
+                      >
+                        <Switch
+                          checked={t.enabled}
+                          disabled={busy.value || !t.controllable || !can.value.control}
+                          onCheckedChange={(on, details) => {
+                            details.cancel();
+                            if (on !== t.enabled) askToggle(t);
+                          }}
                         >
-                          {busyTunnel.value === t.id && busyAction.value === 'select'
-                            ? 'Applying…'
-                            : 'Use ' + t.name + ' as exit'}
-                        </Button>
-                      )}
-                      {busyTunnel.value === t.id && busyAction.value === 'toggle' ? (
-                        <span className="wl-muted" role="status">
-                          {t.enabled ? 'Stopping…' : 'Starting…'}
-                        </span>
-                      ) : (
-                        <label
-                          className="wl-switch"
-                          title={
-                            !t.controllable
-                              ? 'Native tunnel control is unavailable.'
-                              : !can.value.control
-                                ? controlReason.value
-                                : undefined
-                          }
-                        >
-                          <Switch
-                            checked={t.enabled}
-                            disabled={busy.value || !t.controllable || !can.value.control}
-                            onCheckedChange={(on, details) => {
-                              details.cancel();
-                              if (on !== t.enabled) askToggle(t);
-                            }}
-                          >
-                            <SwitchThumb />
-                          </Switch>
-                          <span>Run {t.name}</span>
-                        </label>
-                      )}
-                    </div>
-                  </td>
-                )}
+                          <SwitchThumb />
+                        </Switch>
+                        <span>Run {t.name}</span>
+                      </label>
+                    )}
+                  </div>
+                </td>
               </tr>
             );
           })}
@@ -438,7 +433,7 @@ function TunnelTable() {
                 </td>
                 <td>{primary ? <Mos score={score(value, jitter, loss.pct)} /> : dash}</td>
                 {showServer && <td />}
-                {!readOnly.value && <td />}
+                <td />
               </tr>
             );
           })}

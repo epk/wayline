@@ -37,7 +37,6 @@ import {
   latencyData,
   primary,
   primarySelected,
-  readOnly,
   ready,
   selectedTarget,
   setView,
@@ -214,15 +213,13 @@ function Enable(props: { text: string; label: string; onClick: () => void }) {
   return (
     <div className="wl-cta">
       <p className="wl-muted">{props.text}</p>
-      {!readOnly.value && (
-        <Button
-          className="wl-button wl-primary"
-          disabled={!can.value.configure || busy.value}
-          onClick={props.onClick}
-        >
-          {props.label}
-        </Button>
-      )}
+      <Button
+        className="wl-button wl-primary"
+        disabled={!can.value.configure || busy.value}
+        onClick={props.onClick}
+      >
+        {props.label}
+      </Button>
     </div>
   );
 }

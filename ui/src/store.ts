@@ -1,4 +1,4 @@
-import { supports, type DataSource, type WriteCommand } from './sources/source.ts';
+import type { DataSource, WriteCommand } from './sources/source.ts';
 import { computed, signal, type Signal } from './signal.ts';
 import { finite } from './format.ts';
 import { legacyStep, offered, stepFor } from './series.ts';
@@ -201,13 +201,10 @@ export const showCompat = computed(() => level.value !== 'full' || !compat.value
 export const can = computed(() => {
   const c = state.value.capabilities || {};
   const full = level.value === 'full';
-  void state.value;
   return {
-    configure: !!c.configure && level.value !== 'unsupported' && supports(source, 'setConfig'),
-    select: !!c.select && full && supports(source, 'selectTunnel'),
-    control: !!c.control && full && supports(source, 'setTunnelEnabled'),
-    purge: supports(source, 'purgeHistory'),
-    update: supports(source, 'installUpdate') && supports(source, 'checkUpdate'),
+    configure: !!c.configure && level.value !== 'unsupported',
+    select: !!c.select && full,
+    control: !!c.control && full,
   };
 });
 export const configureReason = computed(() =>
@@ -283,15 +280,9 @@ export const updateState = computed(() => {
   };
 });
 export const updateActive = computed(() => updatePhases.includes(state.value.update?.phase || ''));
-export const updatesDisabled = computed(
-  () => state.value.capabilities.update === false || !can.value.update,
-);
+export const updatesDisabled = computed(() => state.value.capabilities.update === false);
 
 let source: DataSource | null = null;
-export const readOnly = computed(() => {
-  void state.value;
-  return !source || !!source.readOnly;
-});
 let stopped = true;
 let timer: ReturnType<typeof setTimeout> | undefined;
 let updateTimer: ReturnType<typeof setInterval> | undefined;
@@ -308,7 +299,8 @@ export const describe = (e: unknown, fallback: string): string => {
 };
 
 const write = <K extends WriteCommand>(command: K): NonNullable<DataSource[K]> => {
-  if (!source || !supports(source, command)) throw Error('This view is read-only.');
+  if (!source || typeof source[command] !== 'function')
+    throw Error('This firmware does not support that change.');
   const run = source[command] as unknown as (...args: unknown[]) => unknown;
   return run.bind(source) as unknown as NonNullable<DataSource[K]>;
 };

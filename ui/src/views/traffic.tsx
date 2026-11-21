@@ -3,7 +3,7 @@ import { useMemo } from 'react';
 import { Chart, type Line } from '../chart.tsx';
 import { bits, bytes, dash, finite, span } from '../format.ts';
 import { column, some, times } from '../series.ts';
-import { busy, can, enableSetting, readOnly, state, telemetryData } from '../store.ts';
+import { busy, can, enableSetting, state, telemetryData } from '../store.ts';
 import type { Column } from '../types.ts';
 import { Badge, Explain, Panel } from '../ui.tsx';
 
@@ -21,7 +21,6 @@ export function TelemetryOff(props: { title: string }) {
         </p>
         <Button
           className="wl-button wl-primary"
-          hidden={readOnly.value}
           disabled={!can.value.configure || busy.value}
           onClick={() =>
             void enableSetting(

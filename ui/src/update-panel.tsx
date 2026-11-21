@@ -2,7 +2,6 @@ import { Button } from '@ui-sdk/react/button';
 import { useEffect, useState } from 'react';
 import {
   bundleVersion,
-  can,
   checkUpdates,
   installUpdate,
   reloadPage,
@@ -84,7 +83,7 @@ export function UpdatePanel(props: { compact?: boolean }) {
       <p className={'wl-upd-status' + (failed ? ' wl-upd-failed' : '')} aria-live="polite">
         {status}
       </p>
-      <div className="wl-actions" hidden={!can.value.update}>
+      <div className="wl-actions">
         <Button className="wl-button" disabled={working} onClick={() => void checkUpdates()}>
           Check for update
         </Button>

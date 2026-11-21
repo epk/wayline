@@ -21,7 +21,6 @@ import {
   level,
   loading,
   readError,
-  readOnly,
   ready,
   reloadPage,
   retry,
@@ -214,11 +213,7 @@ function Dashboard() {
         {statusLine.value}
       </p>
       {!can.value.configure && ready.value && (
-        <p className="wl-muted wl-hint">
-          {readOnly.value
-            ? 'Read-only view. This data source accepts no changes.'
-            : configureReason.value}
-        </p>
+        <p className="wl-muted wl-hint">{configureReason.value}</p>
       )}
       <Messages />
       <Notice />

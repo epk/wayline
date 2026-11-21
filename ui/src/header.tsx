@@ -14,7 +14,6 @@ import {
   offset,
   openSettings,
   range,
-  readOnly,
   ranges,
   setView,
   shift,
@@ -100,15 +99,13 @@ export function Header() {
             </SegmentedControlItem>
           ))}
         </SegmentedControl>
-        {!readOnly.value && (
-          <Button
-            className="wl-button wl-settings"
-            disabled={!can.value.configure}
-            onClick={openSettings}
-          >
-            Settings
-          </Button>
-        )}
+        <Button
+          className="wl-button wl-settings"
+          disabled={!can.value.configure}
+          onClick={openSettings}
+        >
+          Settings
+        </Button>
       </div>
       <p className="wl-window wl-muted">
         <span className={'wl-live' + (live ? ' wl-live-on' : '')}>

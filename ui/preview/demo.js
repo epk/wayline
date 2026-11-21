@@ -1019,17 +1019,14 @@ window.previewRpc = (method, params) => {
 };
 
 class PreviewSource {
-  constructor(api, readOnly) {
+  constructor(api) {
     this.api = api;
-    this.readOnly = readOnly;
-    if (!readOnly) {
-      this.setConfig = (request) => api.set_config(request);
-      this.selectTunnel = (request) => api.select_tunnel(request);
-      this.setTunnelEnabled = (request) => api.set_tunnel_enabled(request);
-      this.purgeHistory = (request) => api.purge_history(request);
-      this.checkUpdate = () => api.check_update();
-      this.installUpdate = () => api.install_update();
-    }
+    this.setConfig = (request) => api.set_config(request);
+    this.selectTunnel = (request) => api.select_tunnel(request);
+    this.setTunnelEnabled = (request) => api.set_tunnel_enabled(request);
+    this.purgeHistory = (request) => api.purge_history(request);
+    this.checkUpdate = () => api.check_update();
+    this.installUpdate = () => api.install_update();
   }
   getState() {
     return this.api.get_state();
@@ -1049,6 +1046,4 @@ class PreviewSource {
 }
 
 window.previewSource =
-  query.get('transport') === 'rpc'
-    ? null
-    : new PreviewSource(window.previewApi, query.get('readonly') === '1');
+  query.get('transport') === 'rpc' ? null : new PreviewSource(window.previewApi);

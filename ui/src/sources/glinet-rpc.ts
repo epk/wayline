@@ -17,7 +17,6 @@ export const timeoutFor = (method: string): number =>
 export const staleMessage = 'The Wayline version changed. Reload the page before another change.';
 
 export class GlinetRpcSource implements DataSource {
-  readonly readOnly = false;
   private version = '';
   private readonly transport: Transport;
 
