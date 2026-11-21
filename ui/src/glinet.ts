@@ -1,5 +1,6 @@
 import { Decompress, decompress } from 'fzstd';
 import { manifest } from '\0wayline-manifest';
+import { fetchChunk, StaleFiles } from './chunk-fetch.ts';
 import type { MountOptions } from './core.tsx';
 import type { ChunkName } from './runtime.ts';
 import type { GlinetRpcSource, Transport } from './sources/glinet-rpc.ts';
@@ -31,12 +32,6 @@ const importUrl = (url: string): Promise<Module> => import(url);
 
 const describe = (e: unknown): string =>
   e && typeof e === 'object' && 'message' in e ? String(e.message) : String(e);
-
-async function fetchBytes(url: string): Promise<Uint8Array> {
-  const response = await fetch(url);
-  if (!response.ok) throw Error('HTTP ' + response.status + ' for ' + url);
-  return new Uint8Array(await response.arrayBuffer());
-}
 
 const yieldToMain = (): Promise<void> => {
   const s = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
@@ -77,7 +72,7 @@ async function blobsWork(): Promise<boolean> {
 async function unpack(file: string): Promise<string> {
   const deps = manifest.deps[file] || [];
   const [bytes, ...depUrls] = await Promise.all([
-    fetchBytes(manifest.base + file + '.zst'),
+    fetchChunk(manifest.base + file + '.zst'),
     ...deps.map(blobUrl),
   ]);
   const start = performance.now();
@@ -102,7 +97,11 @@ function blobUrl(file: string): Promise<string> {
 function load(file: string): Promise<Module> {
   let module = modules.get(file);
   if (!module) {
-    module = plain ? importUrl(manifest.base + file) : blobUrl(file).then(importUrl);
+    module = plain
+      ? importUrl(manifest.base + file).catch((error: unknown) => {
+          throw new StaleFiles(manifest.base + file + ': ' + describe(error));
+        })
+      : blobUrl(file).then(importUrl);
     modules.set(file, module);
   }
   return module;
@@ -116,7 +115,7 @@ async function loadCore(): Promise<Core> {
   try {
     return (await load(manifest.core)) as unknown as Core;
   } catch (error) {
-    if (plain) throw error;
+    if (plain || error instanceof StaleFiles) throw error;
     console.info(
       'Wayline loads plain JavaScript chunks because compressed chunks failed: ' + describe(error),
     );
@@ -152,9 +151,11 @@ async function draw(host: Host): Promise<void> {
     const message = document.createElement('p');
     message.setAttribute('role', 'alert');
     message.textContent =
-      'Wayline could not load its page files (' +
-      describe(error) +
-      '). Reload the page. If this persists, reinstall Wayline.';
+      error instanceof StaleFiles
+        ? describe(error)
+        : 'Wayline could not load its page files (' +
+          describe(error) +
+          '). Reload the page. If this persists, reinstall Wayline.';
     host.$el.replaceChildren(message);
   }
 }
