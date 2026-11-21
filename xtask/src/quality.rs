@@ -40,7 +40,7 @@ pub fn test() -> Result<()> {
     let sh = Shell::new()?;
     cmd!(
         sh,
-        "cargo test --locked --offline --package wayline-control --package xtask"
+        "cargo test --locked --offline --package wayline-control --package waylined --package xtask"
     )
     .run()?;
     Ok(())

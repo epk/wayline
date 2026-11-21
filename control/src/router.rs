@@ -11,13 +11,14 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
-use wayline_protocol::{Config, MAX_SERIES, Tunnel};
+use wayline_protocol::{Config, MAX_SERIES, Tunnel, WifiConfig};
 
 const VPN_PROTOCOLS: [&str; 4] = ["wgclient", "ovpnclient", "wireguard", "openvpn"];
 const NO_PEER: &str = "The tunnel has no active WireGuard peer endpoint yet.";
 const OPENVPN: &str = "OpenVPN endpoint discovery is not supported.";
 const IPV6: &str = "The endpoint is an IPv6 address, which Wayline does not measure.";
 const TOO_MANY: &str = "More than eight VPN tunnels are unsupported.";
+pub const WIFI_INTERVAL_MS: u64 = 5_000;
 
 const IGNORED: [&str; 9] = [
     ".name",
@@ -661,15 +662,20 @@ pub fn monitor<'a>(
     };
     let wan = || inventory.wan.iter();
     let wanted = monitored(settings, inventory)
+        .filter(|_| settings.enabled)
         .flat_map(per_target)
-        .chain(wan().filter(|_| settings.direct_wan).flat_map(per_target))
-        .chain(wan().flat_map(|wan| {
+        .chain(
+            wan()
+                .filter(|_| settings.enabled && settings.direct_wan)
+                .flat_map(per_target),
+        )
+        .chain(wan().filter(|_| settings.enabled).flat_map(|wan| {
             endpoints(settings, inventory).map(move |(key, target)| (wan, target, Some(key)))
         }))
         .chain(
             inventory
                 .standby_uplinks()
-                .filter(|_| settings.direct_wan)
+                .filter(|_| settings.enabled && settings.direct_wan)
                 .flat_map(per_target),
         );
     let mut seen = HashSet::new();
@@ -692,6 +698,9 @@ pub fn monitor<'a>(
         interval_ms: u64::from(settings.interval) * 1000,
         timeout_ms: 2000,
         tunnels,
+        wifi: settings.upstream_wifi.then_some(WifiConfig {
+            interval_ms: WIFI_INTERVAL_MS,
+        }),
     }
 }
 

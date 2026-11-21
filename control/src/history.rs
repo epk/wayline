@@ -4,6 +4,7 @@ use crate::router::Inventory;
 use crate::runtime;
 use crate::runtime::RUNTIME;
 use crate::settings::{Settings, Target};
+use crate::wifi;
 use anyhow::{Context, Error, Result, ensure};
 use rusqlite::types::{FromSql, ToSql};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
@@ -12,19 +13,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use wayline_protocol::{BUCKET_SECONDS, MAX_SERIES, Series};
+use wayline_protocol::{BUCKET_SECONDS, MAX_SERIES, Series, WifiBucket};
 
-const HOUR: u64 = 3_600;
+pub const HOUR: u64 = 3_600;
 const DAY: u64 = 86_400;
 const MINUTE_MS: u64 = 60_000;
-const MIN_CLOCK: u64 = 1_704_067_200;
+pub const MIN_CLOCK: u64 = 1_704_067_200;
 const MAX_POINTS: u64 = 2_500;
 const MEMORY_PAGES: u64 = 1_024;
 const PAGES: u64 = 8_192;
-const PAGE_BYTES: u64 = 4_096;
+pub const PAGE_BYTES: u64 = 4_096;
 const VERSION: u32 = 4;
 const COLUMNS: &str = "min_us,median_us,max_us,sent,lost";
-const LEVELS: [(u64, &str); 4] = [
+const DAMAGED: &str = "The history database was damaged and was reset.";
+pub const LEVELS: [(u64, &str); 4] = [
     (BUCKET_SECONDS, "s15"),
     (60, "s1m"),
     (300, "s5m"),
@@ -114,17 +116,27 @@ fn known_cache() -> PathBuf {
     Path::new(RUNTIME).join("stored-series.json")
 }
 
-fn fresh_ring() -> Result<Vec<Series>> {
-    let cutoff = match fs::read_to_string(Path::new(RUNTIME).join("history-cutoff")) {
+fn cutoff() -> Result<u64> {
+    match fs::read_to_string(Path::new(RUNTIME).join("history-cutoff")) {
         Ok(value) => value
             .parse::<u64>()
-            .context("Invalid history reset marker.")?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error.into()),
-    };
-    let mut samples = runtime::ring();
+            .context("Invalid history reset marker."),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn fresh_ring() -> Result<Vec<Series>> {
+    Ok(fresh()?.0)
+}
+
+pub fn fresh() -> Result<(Vec<Series>, Vec<WifiBucket>)> {
+    let cutoff = cutoff()?;
+    let (mut samples, wifi) = runtime::ring();
     discard_before(&mut samples, cutoff);
-    Ok(samples)
+    let mut buckets = wifi.map(|wifi| wifi.buckets).unwrap_or_default();
+    buckets.retain(|bucket| bucket.at > cutoff);
+    Ok((samples, buckets))
 }
 
 fn discard_before(samples: &mut [Series], cutoff: u64) {
@@ -157,6 +169,9 @@ pub fn purge() -> Result<()> {
                 "latency.sqlite.broken",
                 "events.json",
                 "facts.json",
+                "wifi.sqlite",
+                "wifi.sqlite-journal",
+                "wifi.sqlite.broken",
             ] {
                 remove(&root.join(name))?;
             }
@@ -191,7 +206,7 @@ fn publish(cache: &Path, prefixes: &BTreeSet<String>) -> Result<()> {
     wayline_support::atomic(cache, &encoded)
 }
 
-const fn retained(days: u32, step: u64) -> u64 {
+pub const fn retained(days: u32, step: u64) -> u64 {
     match (days, step) {
         (0, 15) => 3 * HOUR,
         (1 | 7 | 30, 15) => 6 * HOUR,
@@ -203,14 +218,14 @@ const fn retained(days: u32, step: u64) -> u64 {
     }
 }
 
-fn table(step: u64) -> &'static str {
+pub fn table(step: u64) -> &'static str {
     LEVELS
         .iter()
         .find(|(width, _)| *width == step)
         .map_or(LEVELS[0].1, |level| level.1)
 }
 
-fn resolution(days: u32, step: u64, start: u64, end: u64, now: u64) -> Result<u64> {
+pub fn resolution(days: u32, step: u64, start: u64, end: u64, now: u64) -> Result<u64> {
     let step = if matches!(step, 1 | 5) {
         step * 60
     } else {
@@ -267,12 +282,16 @@ fn schema() -> String {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Access {
+pub enum Access {
     ReadOnly,
     ReadWrite,
 }
 
 fn open(path: &Path, access: Access) -> Result<Connection> {
+    open_capped(path, access, cap(path))
+}
+
+pub fn open_capped(path: &Path, access: Access, pages: u64) -> Result<Connection> {
     let connection = if access == Access::ReadOnly {
         Connection::open_with_flags(
             path,
@@ -287,21 +306,21 @@ fn open(path: &Path, access: Access) -> Result<Connection> {
     connection.pragma_update(None, "temp_store", "MEMORY")?;
     if access == Access::ReadWrite {
         connection.pragma_update(None, "page_size", PAGE_BYTES)?;
-        connection.pragma_update(None, "max_page_count", cap(path))?;
+        connection.pragma_update(None, "max_page_count", pages)?;
         connection.pragma_update(None, "journal_mode", "TRUNCATE")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
     }
     Ok(connection)
 }
 
-fn pragma<T: FromSql>(path: &Path, name: &str) -> Option<T> {
+pub fn pragma<T: FromSql>(path: &Path, name: &str) -> Option<T> {
     open(path, Access::ReadOnly)
         .ok()?
         .pragma_query_value(None, name, |row| row.get(0))
         .ok()
 }
 
-fn healthy(path: &Path) -> bool {
+pub fn healthy(path: &Path) -> bool {
     pragma::<String>(path, "quick_check").is_some_and(|status| status == "ok")
 }
 
@@ -324,7 +343,7 @@ fn convert(path: &Path) -> Result<bool> {
         connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
     if !upgrade && tables > 0 {
         drop(connection);
-        quarantine(path)?;
+        quarantine(path, DAMAGED)?;
         connection = open(path, Access::ReadWrite)?;
     }
     connection.pragma_update(None, "max_page_count", 2 * cap(path))?;
@@ -364,7 +383,7 @@ fn span(live: &[&Series]) -> Option<(u64, u64)> {
     Some((at.clone().min()?, at.max()?))
 }
 
-const fn aligned((low, high): (u64, u64), ratio: u64) -> (u64, u64) {
+pub const fn aligned((low, high): (u64, u64), ratio: u64) -> (u64, u64) {
     (low / ratio * ratio, (high / ratio + 1) * ratio - 1)
 }
 
@@ -462,16 +481,20 @@ fn append(path: &Path, days: u32, now: u64, ring: &[Series]) -> Result<BTreeSet<
         .collect::<rusqlite::Result<_>>()?)
 }
 
-fn quarantine(path: &Path) -> Result<()> {
-    fs::rename(path, path.with_file_name("latency.sqlite.broken"))?;
-    let _ = fs::remove_file(path.with_file_name("latency.sqlite-journal"));
+pub fn quarantine(path: &Path, text: &str) -> Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Invalid history file.")?;
+    fs::rename(path, path.with_file_name(format!("{name}.broken")))?;
+    let _ = fs::remove_file(path.with_file_name(format!("{name}-journal")));
     changes::append(
         path,
         [Event {
             at: runtime::now() * 1000,
             subject: "history".into(),
             kind: "history".into(),
-            text: "The history database was damaged and was reset.".into(),
+            text: text.into(),
         }],
     )
 }
@@ -492,7 +515,7 @@ fn shrink(path: &Path) -> Result<()> {
 
 fn recover(path: &Path, error: Error) -> Result<()> {
     if path.exists() && !healthy(path) {
-        quarantine(path)?;
+        quarantine(path, DAMAGED)?;
     }
     if convert(path)? {
         return Ok(());
@@ -524,12 +547,20 @@ fn collect_inner(config: &Settings) -> Result<()> {
     let path = database(config);
     runtime::directory(path.parent().context("Invalid history directory.")?)?;
     let cache = known_cache();
-    let ring = fresh_ring()?;
-    let idle = ring.iter().all(|series| series.buckets.is_empty());
-    if runtime::now() < MIN_CLOCK || (idle && cache.exists()) {
+    let (ring, buckets) = fresh()?;
+    if runtime::now() < MIN_CLOCK {
         return Ok(());
     }
-    publish(&cache, &store(&path, config.history_days, &ring)?)
+    let stored = if buckets.is_empty() {
+        Ok(())
+    } else {
+        wifi::store(&wifi::database(config), config.history_days, &buckets)
+    };
+    let idle = ring.iter().all(|series| series.buckets.is_empty());
+    if !(idle && cache.exists()) {
+        publish(&cache, &store(&path, config.history_days, &ring)?)?;
+    }
+    stored
 }
 
 pub fn report(config: &Settings) -> Result<Report> {

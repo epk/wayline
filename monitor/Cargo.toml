@@ -10,11 +10,12 @@ autobenches = false
 [[bin]]
 name = "waylined"
 path = "src/main.rs"
-test = false
+test = true
 bench = false
 
 [dependencies]
 wayline-protocol.workspace = true
+wayline-support.workspace = true
 rustix = { workspace = true, features = ["process", "event"] }
 serde_json.workspace = true
 socket2.workspace = true

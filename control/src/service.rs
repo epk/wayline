@@ -12,7 +12,7 @@ use std::path::Path;
 
 fn flush() {
     if let Ok(config) = Settings::read()
-        && config.enabled
+        && config.monitoring()
     {
         let _ = history::collect(&config);
     }
@@ -60,7 +60,7 @@ pub fn reconcile() -> Result<()> {
 
 fn reconcile_inner() -> Result<()> {
     let config = Settings::read()?;
-    let inventory = (config.enabled && native::supported())
+    let inventory = (config.monitoring() && native::supported())
         .then(router::inventory)
         .transpose()?;
     apply(&config, inventory.as_ref())
@@ -76,7 +76,7 @@ pub fn restart() -> Result<()> {
 fn apply(config: &Settings, inventory: Option<&Inventory>) -> Result<()> {
     let desired = inventory
         .map(|inventory| router::monitor(config, inventory, &Resolved::read()))
-        .filter(|desired| !desired.tunnels.is_empty());
+        .filter(|desired| !desired.tunnels.is_empty() || desired.wifi.is_some());
     let Some(desired) = desired else {
         halt();
         return Ok(());
@@ -148,13 +148,13 @@ pub fn tick() -> Result<()> {
 
 fn routine() -> Result<()> {
     let config = Settings::read()?;
-    let (inventory, failure) = match config.enabled.then(router::inventory) {
+    let (inventory, failure) = match config.monitoring().then(router::inventory) {
         Some(Ok(inventory)) => (Some(inventory), None),
         Some(Err(error)) => (None, Some(error)),
         None => (None, None),
     };
     let monitored = inventory.as_ref().filter(|_| native::supported());
-    if let Some(inventory) = monitored {
+    if let Some(inventory) = monitored.filter(|_| config.enabled) {
         let hosts = router::hosts(&config, inventory);
         let mut resolved = Resolved::read();
         if resolved.stale(&hosts) {
@@ -187,7 +187,7 @@ fn routine() -> Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let now = runtime::now();
-    if config.enabled && (now.saturating_sub(last) >= 300 || now < last) {
+    if config.monitoring() && (now.saturating_sub(last) >= 300 || now < last) {
         let result = history::collect(&config);
         wayline_support::atomic(Path::new(&collected), now.to_string().as_bytes())?;
         result?;

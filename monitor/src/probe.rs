@@ -64,7 +64,7 @@ pub fn unix_millis() -> u64 {
     )
 }
 
-const fn bucket_start(wall_ms: u64) -> u64 {
+pub const fn bucket_start(wall_ms: u64) -> u64 {
     let seconds = wall_ms / 1000;
     seconds - seconds % BUCKET_SECONDS
 }

@@ -2,7 +2,7 @@ use crate::native::{self, Level};
 use crate::runtime;
 use crate::runtime::{MONITOR_CONFIG, SETTINGS, STATUS_SOCKET};
 use crate::settings::Settings;
-use crate::{changes, history, router, update};
+use crate::{changes, history, router, update, wifi};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::fs;
@@ -105,6 +105,59 @@ fn history(warnings: &mut usize, settings: &Result<Settings>) {
     }
 }
 
+fn wifi_status(
+    warnings: &mut usize,
+    settings: &Result<Settings>,
+    status: Option<&wayline_protocol::WifiStatus>,
+) {
+    let Ok(config) = settings else {
+        return;
+    };
+    if !config.upstream_wifi {
+        println!("upstream Wi-Fi monitoring: off by setting");
+        return;
+    }
+    let Some(status) = status else {
+        warn(
+            warnings,
+            "upstream Wi-Fi",
+            "The monitor reports no Wi-Fi status.",
+        );
+        return;
+    };
+    let state = serde_json::to_value(status.state).unwrap_or_default();
+    println!(
+        "upstream Wi-Fi: {} on {} (candidates: {}), sample age {} ms, {} live bucket(s)",
+        state.as_str().unwrap_or("unknown"),
+        status.interface.as_deref().unwrap_or("none"),
+        status.candidates.join(", "),
+        status
+            .sample_age_ms
+            .map_or_else(|| "unknown".into(), |age| age.to_string()),
+        status.buckets.len()
+    );
+    if let Some(link) = &status.link {
+        println!(
+            "upstream Wi-Fi link: channel {}, signal {} dBm, noise {} dBm, tx {} kbit/s ({}), rx {} kbit/s",
+            wifi::channel(link),
+            link.signal
+                .map_or_else(|| "?".into(), |value| value.to_string()),
+            link.noise
+                .map_or_else(|| "?".into(), |value| value.to_string()),
+            link.tx
+                .kbps
+                .map_or_else(|| "?".into(), |value| value.to_string()),
+            link.tx.mode.as_deref().unwrap_or("?"),
+            link.rx
+                .kbps
+                .map_or_else(|| "?".into(), |value| value.to_string()),
+        );
+    }
+    for line in wifi::report(config) {
+        println!("{line}");
+    }
+}
+
 fn recent_changes(settings: &Result<Settings>) {
     if let Ok(config) = settings {
         for event in changes::read(config).iter().rev().take(5) {
@@ -176,7 +229,7 @@ pub fn run() -> bool {
     show(list.is_ok(), "native VPN reply", &detail);
     let service = native::bus::<Value>("service", "list", &json!({"name":"wayline"}))
         .is_ok_and(|value| value["wayline"]["instances"]["monitor"]["running"] == true);
-    let wanted = settings.as_ref().is_ok_and(|value| value.enabled);
+    let wanted = settings.as_ref().is_ok_and(Settings::monitoring);
     healthy &= show(
         service || !wanted,
         "monitor service",
@@ -193,7 +246,9 @@ pub fn run() -> bool {
         size(MONITOR_CONFIG),
         size(STATUS_SOCKET)
     );
-    println!("measurement series: {}", runtime::snapshot().len());
+    let (series, wifi) = runtime::current();
+    println!("measurement series: {}", series.len());
+    wifi_status(&mut warnings, &settings, wifi.as_ref());
     if let Some(status) = update::Status::read() {
         let value = serde_json::to_value(&status).unwrap_or_default();
         println!("last update check: {value}");

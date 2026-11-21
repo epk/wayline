@@ -4,7 +4,7 @@ use crate::runtime;
 use crate::runtime::SETTINGS;
 use crate::service;
 use crate::settings::{self, Settings, Target};
-use crate::{auto, changes, egress, history, native, update};
+use crate::{auto, changes, egress, history, native, update, wifi};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::thread;
 use std::time::Duration;
-use wayline_protocol::{Series, State as Measurement};
+use wayline_protocol::{Series, State as Measurement, WifiStatus};
 
 const RECENT: usize = 8;
 const MAX_RECENT_LOSS: usize = 2;
@@ -40,6 +40,7 @@ pub struct State {
     compat: native::Compat,
     monitoring_issue: Option<String>,
     update: update::Status,
+    wifi: wifi::View,
 }
 
 #[derive(Serialize)]
@@ -147,6 +148,7 @@ struct Discovery {
     config: Settings,
     inventory: Inventory,
     snapshot: Vec<Series>,
+    wifi: Option<WifiStatus>,
     native: Result<native::List>,
     compat: native::Compat,
 }
@@ -162,7 +164,7 @@ impl Discovery {
         };
         let inventory = router::inventory_with(endpoints)?;
         router::normalize(&mut config, &inventory);
-        let snapshot = runtime::snapshot();
+        let (snapshot, wifi) = runtime::current();
         let native = native::List::read();
         if compat.level == native::Level::Full && native.is_err() {
             compat.monitoring_only();
@@ -172,6 +174,7 @@ impl Discovery {
             config,
             inventory,
             snapshot,
+            wifi,
             native,
             compat,
         })
@@ -450,6 +453,7 @@ fn unsupported(compat: native::Compat) -> State {
         compat,
         monitoring_issue: None,
         update: update::view(),
+        wifi: wifi::disabled(),
     }
 }
 
@@ -466,6 +470,7 @@ pub fn state() -> Result<State> {
         config,
         inventory,
         snapshot,
+        wifi,
         compat,
         ..
     } = discovery;
@@ -516,6 +521,7 @@ pub fn state() -> Result<State> {
             reason: compat.message.clone(),
         },
         compat,
+        wifi: wifi::view(&config, Some(&inventory), wifi),
         config,
         update: update::view(),
     };
@@ -542,6 +548,10 @@ pub fn history(query: &history::Query) -> Result<history::Response> {
         &router::inventory_with(router::Endpoints::Omit)?,
         query,
     )
+}
+
+pub fn wifi_history(query: &wifi::Query) -> Result<wifi::Response> {
+    wifi::query(&Settings::read()?, query)
 }
 
 #[derive(Deserialize)]

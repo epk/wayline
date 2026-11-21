@@ -3,6 +3,7 @@ use crate::history;
 use crate::router::{Inventory, PathInfo};
 use crate::runtime;
 use crate::settings::Settings;
+use crate::wifi;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -116,6 +117,8 @@ fn describe(label: &str, field: &str, before: &str, after: &str) -> String {
         "server" => format!("{label} endpoint changed from {before} to {after}."),
         "egress" => format!("{label} public exit IP changed from {before} to {after}."),
         "address" => format!("{label} address changed from {before} to {after}."),
+        "network" => format!("{label} network changed from {before} to {after}."),
+        "access_point" => format!("{label} access point changed from {before} to {after}."),
         _ => format!("{label} {field} changed from {before} to {after}."),
     }
 }
@@ -130,15 +133,23 @@ pub fn diff(at: u64, stored: &mut BTreeMap<String, String>, facts: &[Fact]) -> (
             Some(previous) => {
                 let before: BTreeMap<String, String> =
                     serde_json::from_str(previous).unwrap_or_default();
-                events.extend(fact.fields.iter().filter_map(|(field, after)| {
-                    let old = before.get(*field).filter(|old| *old != after)?;
-                    Some(Event {
-                        at,
-                        subject: fact.subject.into(),
-                        kind: (*field).into(),
-                        text: describe(fact.label, field, old, after),
+                let mut found: Vec<Event> = fact
+                    .fields
+                    .iter()
+                    .filter_map(|(field, after)| {
+                        let old = before.get(*field).filter(|old| *old != after)?;
+                        Some(Event {
+                            at,
+                            subject: fact.subject.into(),
+                            kind: (*field).into(),
+                            text: describe(fact.label, field, old, after),
+                        })
                     })
-                }));
+                    .collect();
+                if found.iter().any(|event| event.kind == "network") {
+                    found.retain(|event| event.kind == "network");
+                }
+                events.extend(found);
                 *previous = encoded;
                 changed = true;
             }
@@ -177,6 +188,26 @@ fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
             [("egress", ip.clone())],
         ))
     }));
+    if config.upstream_wifi
+        && let (_, Some(status)) = runtime::current()
+        && let Some(link) = status.link
+    {
+        let network = if link.ssid.is_empty() {
+            "a hidden network".to_owned()
+        } else {
+            link.ssid.clone()
+        };
+        current.push(fact(
+            "wifi:upstream".into(),
+            wifi::SUBJECT,
+            "Upstream Wi-Fi",
+            [
+                ("network", network),
+                ("access_point", link.bssid.clone()),
+                ("channel", wifi::channel(&link)),
+            ],
+        ));
+    }
     let (added, changed) = diff(runtime::now() * 1000, &mut stored, &current);
     if changed {
         runtime::store(&facts_path, &stored)?;
@@ -243,6 +274,48 @@ mod tests {
         ensure!(events.len() == 1 && events[0].kind == "egress");
         ensure!(
             events[0].text == "Tunnel A public exit IP changed from 203.0.113.1 to 203.0.113.2."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wifi_network_changes_report_one_event() -> Result<()> {
+        let link = |network: &str, access_point: &str, channel: &str| {
+            vec![fact(
+                "wifi:upstream".into(),
+                "wifi",
+                "Upstream Wi-Fi",
+                [
+                    ("network", network.into()),
+                    ("access_point", access_point.into()),
+                    ("channel", channel.into()),
+                ],
+            )]
+        };
+        let mut stored = BTreeMap::new();
+        diff(
+            1,
+            &mut stored,
+            &link("Hotel", "aa:aa:aa:aa:aa:01", "36 · 5 GHz · 80 MHz"),
+        );
+        let (events, _) = diff(
+            2,
+            &mut stored,
+            &link("Hotel", "aa:aa:aa:aa:aa:02", "36 · 5 GHz · 80 MHz"),
+        );
+        ensure!(events.len() == 1 && events[0].kind == "access_point");
+        ensure!(
+            events[0].text
+                == "Upstream Wi-Fi access point changed from aa:aa:aa:aa:aa:01 to aa:aa:aa:aa:aa:02."
+        );
+        let (events, _) = diff(
+            3,
+            &mut stored,
+            &link("Cafe", "bb:bb:bb:bb:bb:01", "6 · 2.4 GHz · 20 MHz"),
+        );
+        ensure!(
+            events.len() == 1
+                && events[0].text == "Upstream Wi-Fi network changed from Hotel to Cafe."
         );
         Ok(())
     }

@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use wayline_protocol::{MAX_STATUS, Series, Status};
+use wayline_protocol::{MAX_STATUS, Series, Status, WifiStatus};
 
 pub const RUNTIME: &str = "/var/run/wayline";
 pub const MONITOR_CONFIG: &str = "/var/run/wayline/monitor.json";
@@ -73,19 +73,30 @@ fn private(path: &Path, owner: u32) -> Result<()> {
     Ok(())
 }
 
-pub fn snapshot() -> Vec<Series> {
-    status(Path::new(STATUS_SOCKET), "")
+pub fn current() -> (Vec<Series>, Option<WifiStatus>) {
+    parts(full(Path::new(STATUS_SOCKET), ""))
 }
 
-pub fn ring() -> Vec<Series> {
-    status(Path::new(STATUS_SOCKET), "since=0")
+pub fn ring() -> (Vec<Series>, Option<WifiStatus>) {
+    parts(full(Path::new(STATUS_SOCKET), "since=0"))
 }
 
-fn status(socket: &Path, request: &str) -> Vec<Series> {
+fn parts(status: Option<Status>) -> (Vec<Series>, Option<WifiStatus>) {
+    status.map_or_else(
+        || (Vec::new(), None),
+        |status| (status.tunnels, status.wifi),
+    )
+}
+
+fn full(socket: &Path, request: &str) -> Option<Status> {
     fetch(socket, request)
         .ok()
         .and_then(|data| serde_json::from_slice::<Status>(&data).ok())
-        .map_or_else(Vec::new, |status| status.tunnels)
+}
+
+#[cfg(test)]
+fn status(socket: &Path, request: &str) -> Vec<Series> {
+    parts(full(socket, request)).0
 }
 
 fn fetch(socket: &Path, request: &str) -> Result<Vec<u8>> {

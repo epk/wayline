@@ -16,6 +16,9 @@
   const release = '0.1.0-alpha.24';
   const installed = query.get('stale') === '1' ? '0.0.0' : release;
   const directExit = query.get('exit') === 'direct';
+  const wifiMode = ['off', 'disconnected', 'none'].includes(query.get('wifi'))
+    ? query.get('wifi')
+    : 'connected';
   const wanMs = wanDown ? null : 14.37;
   const compatMessages = {
     full: '',
@@ -91,6 +94,7 @@
       autoExit: true,
       autoTunnels: ['home', 'backup'],
       endpointDiagnostics: true,
+      upstreamWifi: wifiMode !== 'off',
     },
     egress: {
       checkedAt: Math.floor(Date.now() / 1000) - 90,
@@ -308,6 +312,144 @@
     },
   };
   state.tunnels.forEach((tunnel) => (tunnel.monitorId = tunnel.id));
+  const wifiReasons = {
+    off: 'Upstream Wi-Fi monitoring is off.',
+    disconnected: 'The repeater interface apclix0 is not connected to a Wi-Fi network.',
+    none: "The router has no Wi-Fi client interface. Connect to a Wi-Fi network as a repeater in the router's Internet page.",
+    connected: '',
+  };
+  state.wifi = {
+    enabled: wifiMode !== 'off',
+    state: { off: null, none: 'no_client_interface' }[wifiMode] || wifiMode,
+    reason: wifiReasons[wifiMode],
+    interface: ['connected', 'disconnected'].includes(wifiMode) ? 'apclix0' : null,
+    candidates: ['connected', 'disconnected'].includes(wifiMode) ? ['apclix0', 'apcli0'] : [],
+    sampleAgeMs: 1800,
+    interval: 5,
+    uplink: wifiMode === 'connected' ? 'uplink:wwan' : null,
+    historyAvailable: wifiMode !== 'off',
+    recent: [],
+    link:
+      wifiMode === 'connected'
+        ? {
+            ssid: 'Example Hotel',
+            bssid: '02:00:5e:10:00:01',
+            channel: 44,
+            frequency: 5220,
+            width: 80,
+            htmode: 'HE80',
+            hwmode: 'ax',
+            encryption: 'WPA2 PSK',
+            hardware: 'MediaTek',
+            txpower: 20,
+            signal: -63,
+            signal_avg: -62,
+            noise: -94,
+            quality: 47,
+            quality_max: 70,
+            tx: { kbps: 576500, mode: 'HE', mcs: 9, nss: 2, mhz: 80, short_gi: null },
+            rx: { kbps: 720600, mode: 'HE', mcs: 11, nss: 2, mhz: 80, short_gi: null },
+            expected_kbps: 312000,
+            connected_seconds: 15240,
+            inactive_ms: 40,
+            busy_permille: 284,
+          }
+        : null,
+  };
+  function wifiHistory(start, end, step) {
+    const points = [];
+    const total = {
+      samples: 0,
+      connected: 0,
+      signal: [],
+      noise: [],
+      txRate: [],
+      retries: [],
+      busy: [],
+      disconnects: 0,
+      roams: 0,
+      txBytes: 0,
+      rxBytes: 0,
+    };
+    const mean = (list) => (list.length ? list.reduce((a, b) => a + b, 0) / list.length : null);
+    for (let at = start - (start % (step * 1000)); at <= end; at += step * 1000) {
+      const n = Math.round((at - anchor) / 60000) + 1440;
+      const gap = n > 700 && n < 708;
+      if (at <= historyCutoff || wifiMode === 'none' || gap) {
+        points.push({ at, samples: gap ? 3 : 0, uptime: gap ? 0 : null, disconnects: 0, roams: 0 });
+        continue;
+      }
+      const evening = Math.sin(n / 180) * 6;
+      const signal = Math.round((-62 + evening + Math.sin(n * 1.3) * 2) * 10) / 10;
+      const busy = Math.max(4, Math.round((28 - evening * 2 + Math.sin(n / 7) * 6) * 10) / 10);
+      const txRate = Math.round(560 + evening * 25 + Math.sin(n / 5) * 40);
+      const retries = Math.max(
+        0.5,
+        Math.round((6 - evening * 0.6 + Math.sin(n * 0.7) * 2) * 10) / 10,
+      );
+      const disconnects = n === 708 ? 1 : 0;
+      const roams = n % 397 === 0 ? 1 : 0;
+      const txBytes = Math.round(step * 120000 * (1.2 + Math.sin(n / 30)));
+      const rxBytes = txBytes * 6;
+      points.push({
+        at,
+        samples: 3,
+        uptime: 100,
+        signal,
+        signalMin: Math.round(signal - 4),
+        signalMax: Math.round(signal + 3),
+        noise: -94,
+        snr: Math.round((signal + 94) * 10) / 10,
+        txRate,
+        txRateMin: txRate - 120,
+        rxRate: txRate + 140,
+        expected: Math.round(txRate * 0.55),
+        retries,
+        failures: 0.2,
+        busy,
+        rxAir: busy / 2,
+        txAir: busy / 5,
+        upload: (txBytes * 8) / step / 1e6,
+        download: (rxBytes * 8) / step / 1e6,
+        txBytes,
+        rxBytes,
+        disconnects,
+        roams,
+      });
+      total.samples += 3;
+      total.connected += 3;
+      total.signal.push(signal);
+      total.noise.push(-94);
+      total.txRate.push(txRate);
+      total.retries.push(retries);
+      total.busy.push(busy);
+      total.disconnects += disconnects;
+      total.roams += roams;
+      total.txBytes += txBytes;
+      total.rxBytes += rxBytes;
+    }
+    const signal = mean(total.signal);
+    return {
+      step,
+      points,
+      events: [],
+      summary: {
+        at: start,
+        samples: total.samples,
+        uptime: total.samples ? 99.4 : null,
+        signal,
+        signalMin: total.signal.length ? Math.round(Math.min(...total.signal) - 4) : null,
+        snr: signal === null ? null : signal + 94,
+        txRate: mean(total.txRate),
+        retries: mean(total.retries),
+        busy: mean(total.busy),
+        disconnects: total.disconnects,
+        roams: total.roams,
+        txBytes: total.txBytes,
+        rxBytes: total.rxBytes,
+      },
+    };
+  }
   const copy = (o) => JSON.parse(JSON.stringify(o));
   let historyCutoff = 0;
   const delay = (o) => new Promise((resolve) => setTimeout(() => resolve(copy(o)), 180));
@@ -409,6 +551,9 @@
       if (Object.keys(config).some((key) => !known.includes(key)))
         throw Error('The settings contain an unknown field.');
       state.config = copy(config);
+      state.wifi.enabled = !!config.upstreamWifi;
+      state.wifi.reason = config.upstreamWifi ? wifiReasons[wifiMode] : wifiReasons.off;
+      if (wifiMode === 'off') state.wifi.reason = config.upstreamWifi ? '' : wifiReasons.off;
       state.revision = String(++revision);
       return delay({ applied: true });
     },
@@ -489,6 +634,10 @@
         events,
       };
     },
+    get_wifi_history: async ({ start, end, step }) => {
+      if (!state.config.upstreamWifi) throw Error('Upstream Wi-Fi monitoring is off.');
+      return delay(wifiHistory(start, end, step));
+    },
     check_update: () =>
       startUpdate('checking', [
         [
@@ -520,7 +669,7 @@
   };
   window.previewRpc = (method, params) => {
     const [sid, object, operation, request] = params;
-    const expected = ['get_state', 'get_history'].includes(operation)
+    const expected = ['get_state', 'get_history', 'get_wifi_history'].includes(operation)
       ? 'wayline'
       : 'wayline_' + release.replace(/\./g, '_');
     if (

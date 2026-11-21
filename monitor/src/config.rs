@@ -39,8 +39,15 @@ pub fn read(path: &Path) -> Result<Config, Box<dyn Error>> {
         return Err("configuration exceeds 32 KiB".into());
     }
     let config: Config = serde_json::from_slice(&bytes)?;
-    if config.tunnels.is_empty() || config.tunnels.len() > MAX_SERIES {
+    if (config.tunnels.is_empty() && config.wifi.is_none()) || config.tunnels.len() > MAX_SERIES {
         return Err(format!("configure between one and {MAX_SERIES} measurement series").into());
+    }
+    if config
+        .wifi
+        .as_ref()
+        .is_some_and(|wifi| !(1_000..=60_000).contains(&wifi.interval_ms))
+    {
+        return Err("the Wi-Fi interval must be 1000..60000 ms".into());
     }
     if !(1_000..=300_000).contains(&config.interval_ms)
         || !(50..=5_000).contains(&config.timeout_ms)

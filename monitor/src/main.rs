@@ -6,6 +6,7 @@ compile_error!("waylined requires Linux. Cross-compile the ARM64 musl executable
 mod config;
 mod probe;
 mod route;
+mod wifi;
 
 use probe::Probe;
 use rustix::event::{self, PollFd, PollFlags, Timespec};
@@ -111,6 +112,7 @@ struct Monitor<'config> {
     nonce: [u8; 16],
     run_id: String,
     reply_hint: usize,
+    wifi: Option<wifi::Wifi>,
 }
 
 impl<'config> Monitor<'config> {
@@ -118,7 +120,7 @@ impl<'config> Monitor<'config> {
         let started = Instant::now();
         let interval = Duration::from_millis(config.interval_ms);
         let timeout = Duration::from_millis(config.timeout_ms);
-        let step = interval / u32::try_from(config.tunnels.len()).unwrap_or(1);
+        let step = interval / u32::try_from(config.tunnels.len()).unwrap_or(1).max(1);
         let probes = config
             .tunnels
             .iter()
@@ -147,13 +149,14 @@ impl<'config> Monitor<'config> {
                     out
                 }),
             reply_hint: 0,
+            wifi: config.wifi.as_ref().map(wifi::Wifi::start).transpose()?,
         })
     }
 
     fn snapshot(&mut self, since: Option<u64>) -> io::Result<Vec<u8>> {
         let now = Instant::now();
         let mut status = Status {
-            schema: 3,
+            schema: 4,
             run_id: self.run_id.clone(),
             target: self.config.target,
             uptime_ms: probe::millis(now.duration_since(self.started)),
@@ -163,6 +166,7 @@ impl<'config> Monitor<'config> {
                 .iter()
                 .map(|probe| probe.series(now, since))
                 .collect(),
+            wifi: self.wifi.as_ref().map(|wifi| wifi.status(now, since)),
         };
         let data = fit(&mut status, self.reply_hint)?;
         self.reply_hint = data.len();
@@ -183,6 +187,12 @@ fn fit(status: &mut Status, hint: usize) -> io::Result<Vec<u8>> {
             .tunnels
             .iter()
             .flat_map(|series| series.buckets.iter().map(|bucket| bucket.at))
+            .chain(
+                status
+                    .wifi
+                    .iter()
+                    .flat_map(|wifi| wifi.buckets.iter().map(|bucket| bucket.at)),
+            )
             .collect();
         times.sort_unstable();
         let excess = data.len() - MAX_STATUS;
@@ -196,6 +206,9 @@ fn fit(status: &mut Status, hint: usize) -> io::Result<Vec<u8>> {
         };
         for series in &mut status.tunnels {
             series.buckets.retain(|bucket| bucket.at > cut);
+        }
+        if let Some(wifi) = &mut status.wifi {
+            wifi.buckets.retain(|bucket| bucket.at > cut);
         }
     }
 }
@@ -391,7 +404,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let command = args.next().unwrap_or_default();
     if command == "--help" || command == "-h" || command.is_empty() {
         println!(
-            "waylined monitor --config FILE --socket ABSOLUTE_PATH [--run-for SECONDS]\nwaylined status --socket ABSOLUTE_PATH [--since UNIX_SECONDS]\nIPv4 ICMP monitor. The monitor does not change routes. Socket clients receive one JSON snapshot."
+            "waylined monitor --config FILE --socket ABSOLUTE_PATH [--run-for SECONDS]\nwaylined status --socket ABSOLUTE_PATH [--since UNIX_SECONDS]\nIPv4 ICMP and upstream Wi-Fi monitor. The monitor does not change routes. Socket clients receive one JSON snapshot."
         );
         return Ok(());
     }

@@ -266,6 +266,14 @@
           The public address of each monitored server. It shows the route, not latency through the
           tunnel.
         </p>
+        <label class="vph-check"
+          ><input type="checkbox" v-model="draft.upstreamWifi" /> Upstream Wi-Fi link
+          (repeater)</label
+        >
+        <p class="vph-muted">
+          Signal, noise, link rate, retries, and channel load of the network this router joins. It
+          works without VPN tunnels and keeps history like latency.
+        </p>
       </section>
       <section class="vph-set" aria-labelledby="vph-set-exit">
         <h3 id="vph-set-exit">Exit</h3>
@@ -310,8 +318,8 @@
           to limit flash writes.
         </p>
         <p class="vph-muted">
-          Purge stored latency history and change events from memory and flash. Live measurements
-          continue. Settings and VPN tunnels stay unchanged.
+          Purge stored latency and Wi-Fi history and change events from memory and flash. Live
+          measurements continue. Settings and VPN tunnels stay unchanged.
         </p>
         <button
           v-if="!purgeConfirm"
@@ -721,6 +729,17 @@
       </div>
     </section>
 
+    <wifi-panel
+      v-if="ready && level !== 'unsupported'"
+      :wifi="state.wifi"
+      :uplinks="state.uplinks"
+      :tiers="historyTiers"
+      :call="call"
+      :can-enable="can.configure"
+      :busy="busy"
+      @enable="enableWifi"
+    />
+
     <section v-if="recentEvents.length" class="vph-panel vph-changes">
       <h2>Recent changes</h2>
       <ul>
@@ -744,6 +763,7 @@
 
 <script>
 import UpdatePanel from './update-panel.vue';
+import WifiPanel from './wifi-panel.vue';
 import 'uplot/dist/uPlot.min.css';
 
 const defaults = () => ({
@@ -757,6 +777,7 @@ const defaults = () => ({
   autoExit: false,
   autoTunnels: [],
   endpointDiagnostics: false,
+  upstreamWifi: false,
 });
 const validTarget = (value) =>
   typeof value === 'string' &&
@@ -883,7 +904,7 @@ const CursorCell = {
 
 export default {
   name: 'WaylineDashboard',
-  components: { UpdatePanel, CursorCell },
+  components: { UpdatePanel, WifiPanel, CursorCell },
   props: { api: Object, preview: Boolean },
   data() {
     return {
@@ -900,6 +921,7 @@ export default {
         endpoints: [],
         resolved: {},
         wan: { available: true, interface: null, reason: '' },
+        wifi: { enabled: false, recent: [] },
       },
       ready: false,
       updateError: '',
@@ -1185,6 +1207,10 @@ export default {
     destinations() {
       return this.state.config.targets;
     },
+    historyTiers() {
+      const tiers = this.state.history && this.state.history.tiers;
+      return Array.isArray(tiers) ? tiers : [];
+    },
     maxMinutes() {
       const tiers = (this.state.history && this.state.history.tiers) || [];
       const seconds = Math.max(86400, ...tiers.map((t) => Number(t.keptSeconds) || 0));
@@ -1293,7 +1319,7 @@ export default {
         const timeout =
           method === 'set_tunnel_enabled' ? 75000 : method === 'select_tunnel' ? 45000 : 12000;
         try {
-          const read = method === 'get_state' || method === 'get_history';
+          const read = ['get_state', 'get_history', 'get_wifi_history'].includes(method);
           if (!read && this.staleBundle)
             throw Error('The Wayline version changed. Reload the page before another change.');
           if (this.api) request = this.api[method](params || {});
@@ -1357,6 +1383,7 @@ export default {
         next.events = Array.isArray(next.events) ? next.events : [];
         next.resolved = next.resolved || {};
         next.wan = Object.assign({ available: true, interface: null, reason: '' }, next.wan);
+        next.wifi = Object.assign({ enabled: false, recent: [] }, next.wifi);
         if (
           next.tunnels.some(
             (row) =>
@@ -1629,6 +1656,23 @@ export default {
       }
       await this.refresh();
       if (!saved && this.settingsOpen) this.draft = settingsFrom(this.state.config);
+    },
+    async enableWifi() {
+      if (this.busy || !this.can.configure) return;
+      this.busy = true;
+      this.error = '';
+      try {
+        await this.call('set_config', {
+          config: Object.assign(settingsFrom(this.state.config), { upstreamWifi: true }),
+          expected_revision: this.state.revision,
+        });
+        this.notice = 'Upstream Wi-Fi monitoring is on. The first samples arrive within seconds.';
+      } catch (e) {
+        this.error = this.describe(e, 'Settings could not be saved.');
+      } finally {
+        this.busy = false;
+      }
+      await this.refresh();
     },
     reloadPage() {
       fetch('/views/gl-sdk4-ui-wayline.common.js', { cache: 'reload' }).finally(() =>

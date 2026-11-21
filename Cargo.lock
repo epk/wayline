@@ -744,6 +744,7 @@ dependencies = [
  "serde_json",
  "socket2",
  "wayline-protocol",
+ "wayline-support",
 ]
 
 [[package]]
