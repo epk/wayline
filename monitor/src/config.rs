@@ -17,7 +17,13 @@ fn valid_name(value: &str, max: usize) -> bool {
 
 fn valid_path_id(value: &str) -> bool {
     match value.split_once(':') {
-        Some((kind, name)) => valid_name(kind, 64) && valid_name(name, 64 - kind.len() - 1),
+        Some((kind, name)) => {
+            valid_name(kind, 64)
+                && 64_usize
+                    .checked_sub(kind.len())
+                    .and_then(|rest| rest.checked_sub(1))
+                    .is_some_and(|max| valid_name(name, max))
+        }
         None => valid_name(value, 64),
     }
 }
@@ -100,4 +106,37 @@ pub fn read(path: &Path) -> Result<Config, Box<dyn Error>> {
         }
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read, valid_path_id};
+    use std::error::Error;
+
+    #[test]
+    fn path_ids_limit_the_whole_id_to_64_bytes() {
+        let kind = "k".repeat(64);
+        assert!(!valid_path_id(&format!("{kind}:x")));
+        assert!(!valid_path_id(&format!("{kind}:")));
+        assert!(!valid_path_id(&format!("{}:x", "k".repeat(63))));
+        assert!(valid_path_id(&format!("{}:x", "k".repeat(62))));
+        assert!(!valid_path_id(&format!("{}:xy", "k".repeat(62))));
+        assert!(valid_path_id("uplink:wan"));
+        assert!(valid_path_id(&"k".repeat(64)));
+    }
+
+    #[test]
+    fn a_64_byte_kind_is_rejected_at_load() -> Result<(), Box<dyn Error>> {
+        let path =
+            std::env::temp_dir().join(format!("waylined-config-{}.json", std::process::id()));
+        let id = format!("{}:wan", "k".repeat(64));
+        let text = format!(
+            r#"{{"target":"1.1.1.1","tunnels":[],"telemetry":{{"interval_ms":5000,"interfaces":[{{"id":"{id}","name":"WAN","device":"eth1","kind":"uplink"}}]}}}}"#
+        );
+        std::fs::write(&path, text)?;
+        let result = read(&path);
+        std::fs::remove_file(&path)?;
+        assert!(result.is_err());
+        Ok(())
+    }
 }

@@ -255,11 +255,13 @@ impl<'tunnel> Probe<'tunnel> {
 
     fn reset_path(&mut self, generation: u32) {
         self.socket = None;
-        self.pending.clear();
+        for pending in std::mem::take(&mut self.pending) {
+            if let Some(bucket) = self.open.iter_mut().find(|open| open.at == pending.bucket) {
+                bucket.lost = bucket.lost.saturating_add(1);
+            }
+        }
         self.generation = generation;
         self.history.clear();
-        self.open.clear();
-        self.closed.clear();
         self.unmatched = 0;
         self.last_success = None;
         self.previous_rtt = None;
@@ -317,6 +319,10 @@ impl<'tunnel> Probe<'tunnel> {
 
     pub fn skip_slot(&mut self, now: Instant) {
         self.advance_slot(now);
+        self.count_lost();
+    }
+
+    fn count_lost(&mut self) {
         self.sent = self.sent.saturating_add(1);
         let bucket = self.open_bucket(bucket_start(unix_millis()));
         bucket.sent = bucket.sent.saturating_add(1);
@@ -338,6 +344,7 @@ impl<'tunnel> Probe<'tunnel> {
         let Some(index) = ifindex(interface) else {
             self.reset_path(0);
             self.state = State::InterfaceUnavailable;
+            self.count_lost();
             return;
         };
         if index != self.generation {
@@ -346,6 +353,7 @@ impl<'tunnel> Probe<'tunnel> {
         if !is_up(interface) {
             self.reset_path(index);
             self.state = State::InterfaceDown;
+            self.count_lost();
             return;
         }
         let route_sequence = u32::try_from(sequence & u64::from(u32::MAX)).unwrap_or_default();
@@ -355,17 +363,26 @@ impl<'tunnel> Probe<'tunnel> {
             self.tunnel.mark,
             route_sequence,
         ) {
-            Err(_) => self.fail(State::RouteQueryFailed),
-            Ok(None) => self.fail(State::RouteUnavailable),
-            Ok(Some(route)) if route != self.generation => self.fail(State::RouteMismatch),
+            Err(_) => self.fail_slot(State::RouteQueryFailed),
+            Ok(None) => self.fail_slot(State::RouteUnavailable),
+            Ok(Some(route)) if route != self.generation => self.fail_slot(State::RouteMismatch),
             Ok(Some(_)) => self.send_echo(sequence, nonce),
         }
     }
 
+    fn fail_slot(&mut self, state: State) {
+        self.fail(state);
+        self.count_lost();
+    }
+
     fn send_echo(&mut self, sequence: u64, nonce: &[u8; 16]) {
+        let Some(packet) = echo_request(sequence, nonce).filter(|_| !self.saturated()) else {
+            self.count_lost();
+            return;
+        };
         if self.socket.is_none() {
             let Ok(socket) = open_socket(self.tunnel, self.target, self.generation) else {
-                self.state = State::SocketSetupFailed;
+                self.fail_slot(State::SocketSetupFailed);
                 return;
             };
             self.socket = Some(socket);
@@ -373,9 +390,6 @@ impl<'tunnel> Probe<'tunnel> {
         let Some(socket) = &self.socket else {
             return;
         };
-        if self.pending.len() >= MAX_PENDING {
-            return;
-        }
         if self.pending.is_empty() {
             let mut stale = [0_u8; 256];
             for _ in 0..16 {
@@ -384,9 +398,6 @@ impl<'tunnel> Probe<'tunnel> {
                 }
             }
         }
-        let Some(packet) = echo_request(sequence, nonce) else {
-            return;
-        };
         let sent_at = Instant::now();
         let bucket = bucket_start(unix_millis());
         if matches!(socket.send(&packet), Ok(PACKET_SIZE)) {
@@ -402,7 +413,7 @@ impl<'tunnel> Probe<'tunnel> {
             self.unmatched = UNMATCHED_LIMIT;
             self.state = State::Probing;
         } else {
-            self.fail(State::SendFailed);
+            self.fail_slot(State::SendFailed);
         }
     }
 
@@ -545,4 +556,86 @@ fn open_socket(tunnel: &Tunnel, target: Ipv4Addr, index: u32) -> io::Result<Sock
     socket.set_nonblocking(true)?;
     socket.connect(&SockAddr::from(SocketAddrV4::new(target, 0)))?;
     Ok(socket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PACKET_SIZE, Pending, Probe};
+    use crate::route::RouteLookup;
+    use std::io;
+    use std::net::Ipv4Addr;
+    use std::time::{Duration, Instant};
+    use wayline_protocol::{BUCKET_SECONDS, State, Tunnel};
+
+    fn tunnel(interface: &str) -> Tunnel {
+        Tunnel {
+            id: "home".into(),
+            name: "Home".into(),
+            interface: interface.into(),
+            source: Ipv4Addr::new(10, 0, 0, 2),
+            mark: 0,
+            target: None,
+            path_id: String::new(),
+        }
+    }
+
+    fn probe(tunnel: &Tunnel) -> Probe<'_> {
+        Probe::new(
+            tunnel,
+            Ipv4Addr::new(1, 1, 1, 1),
+            Instant::now(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+    }
+
+    #[test]
+    fn reset_keeps_buckets_and_charges_pending_probes_as_lost() {
+        let tunnel = tunnel("wgclient1");
+        let mut probe = probe(&tunnel);
+        let first = probe.open_bucket(1_000);
+        first.sent = 4;
+        first.lost = 4;
+        probe.close_buckets((1_000 + BUCKET_SECONDS) * 1000 + 1000);
+        let second = probe.open_bucket(1_015);
+        second.sent = 2;
+        second.lost = 1;
+        let now = Instant::now();
+        probe.pending.push(Pending {
+            started: now,
+            deadline: now + Duration::from_secs(1),
+            bucket: 1_015,
+            packet: [0; PACKET_SIZE],
+        });
+        probe.reset_path(7);
+        assert!(probe.pending.is_empty());
+        assert_eq!(probe.generation, 7);
+        assert_eq!(probe.closed.len(), 1);
+        assert_eq!(probe.closed[0].lost, 4);
+        probe.close_buckets((1_015 + BUCKET_SECONDS) * 1000 + 1000);
+        let series = probe.series(now, Some(0));
+        assert_eq!(series.buckets.len(), 2);
+        assert_eq!(series.buckets[1].sent, 2);
+        assert_eq!(series.buckets[1].lost, 2);
+    }
+
+    #[test]
+    fn a_missing_interface_counts_each_slot_as_lost() -> io::Result<()> {
+        let routes = RouteLookup::try_new()?;
+        let tunnel = tunnel("wlabsent9");
+        let mut probe = probe(&tunnel);
+        let start = Instant::now();
+        for slot in 0..3 {
+            probe.query_route(start + Duration::from_secs(slot), &routes, slot, &[7; 16]);
+        }
+        assert!(probe.state == State::InterfaceUnavailable);
+        assert!(probe.socket.is_none());
+        probe.expire(start, u64::MAX / 2);
+        let series = probe.series(start, Some(0));
+        let sent: u16 = series.buckets.iter().map(|bucket| bucket.sent).sum();
+        let lost: u16 = series.buckets.iter().map(|bucket| bucket.lost).sum();
+        assert_eq!((sent, lost), (3, 3));
+        assert!(series.history.iter().all(|sample| sample.us.is_none()));
+        Ok(())
+    }
 }
