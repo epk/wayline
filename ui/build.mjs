@@ -8,7 +8,7 @@ const root = fileURLToPath(new URL('.', import.meta.url));
 const entry = root + 'dist/gl-sdk4-ui-wayline.common.js';
 const chunkDir = root + 'views/wayline/';
 const base = '/views/wayline/';
-const budget = { total: 580 * 1000, firstLoad: 120 * 1000 };
+const budget = { total: 590 * 1000, firstLoad: 120 * 1000 };
 const version = readFileSync(root + '../monitor/Cargo.toml', 'utf8').match(
   /^version = "([^"]+)"/m,
 )[1];

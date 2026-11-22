@@ -135,7 +135,11 @@ function StoragePanel(props: { storage: Storage }) {
       )}
       <div className="wl-store-grid">
         {kinds.map((kind) => (
-          <section key={kind} className="wl-group" aria-label={kindNames[kind] || kind}>
+          <section
+            key={kind}
+            className="wl-group wl-group-stack"
+            aria-label={kindNames[kind] || kind}
+          >
             <h4>
               {kindNames[kind] || kind} <span className="wl-muted wl-code">kind={kind}</span>
             </h4>
@@ -162,7 +166,11 @@ function StoragePanel(props: { storage: Storage }) {
           </section>
         ))}
         {st.records.map((r) => (
-          <section key={r.kind} className="wl-group" aria-label={kindNames[r.kind] || r.kind}>
+          <section
+            key={r.kind}
+            className="wl-group wl-group-stack"
+            aria-label={kindNames[r.kind] || r.kind}
+          >
             <h4>
               {kindNames[r.kind] || r.kind} <span className="wl-muted wl-code">kind={r.kind}</span>
             </h4>

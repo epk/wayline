@@ -18,7 +18,7 @@ import {
 import { column, mapColumn, some, times } from '../series.ts';
 import { busy, can, enableSetting, range, state, wifiData } from '../store.ts';
 import type { Column, Rate, WifiKey } from '../types.ts';
-import { Badge, Explain, Facts, Panel, scaleNote, type Tone } from '../ui.tsx';
+import { Badge, Explain, Panel, scaleNote, Tip, type Tone } from '../ui.tsx';
 
 const rateDetail = (rate: Rate): string => {
   if (!rate || !rate.mode) return '';
@@ -42,21 +42,37 @@ const level = (kind: keyof typeof wifiLevel, value: number | null | undefined) =
     ''
   );
 
-function Group(props: { title: string; rows: [string, ReactNode, ReactNode?][] }) {
+function Tile(props: {
+  label: string;
+  tip: string;
+  value: string;
+  rating?: ReactNode;
+  sub: string;
+}) {
+  return (
+    <div className="wl-tile" role="listitem">
+      <span className="wl-tile-label">
+        <Tip text={props.tip}>{props.label}</Tip>
+      </span>
+      <span className="wl-tile-value">
+        <span className="wl-num">{props.value}</span>
+        {props.rating}
+      </span>
+      <span className="wl-tile-sub">{props.sub}</span>
+    </div>
+  );
+}
+
+function Group(props: { title: string; rows: [string, string, ReactNode?][] }) {
   return (
     <section className="wl-group" aria-label={props.title}>
       <h4>{props.title}</h4>
       <dl>
-        {props.rows.map(([label, value, sub]) => (
+        {props.rows.map(([label, value, rating]) => (
           <div key={label}>
             <dt>{label}</dt>
-            <dd>
-              <span className="wl-num">
-                {value}
-                {typeof sub === 'object' && sub}
-              </span>
-              {typeof sub === 'string' && sub !== '' && <small>{sub}</small>}
-            </dd>
+            <dd className="wl-num">{value}</dd>
+            <dd className="wl-group-rating">{rating}</dd>
           </div>
         ))}
       </dl>
@@ -161,63 +177,70 @@ export function WifiView() {
         )}
         {l && (
           <>
-            <p className="wl-link-line">
-              <strong>{l.ssid || 'Hidden network'}</strong>
-              {[
-                finite(l.frequency) ? band(l.frequency) : '',
-                l.channel ? 'channel ' + l.channel : '',
-                finite(l.connected_seconds) ? 'up ' + span(l.connected_seconds) : 'connected',
-              ]
-                .filter(Boolean)
-                .map((part) => (
-                  <span key={part}>{part}</span>
-                ))}
-            </p>
-            <Facts
-              label="Current link"
-              items={[
-                {
-                  label: 'Signal',
-                  value: dbm(l.signal),
-                  sub: (
-                    <>
-                      {level('signal', l.signal)} signal to noise {finite(snr) ? snr + ' dB' : dash}{' '}
-                      · noise {dbm(l.noise)}
-                    </>
-                  ),
-                },
-                {
-                  label: 'Link rate',
-                  value: (
-                    <>
-                      {kbit(l.tx.kbps)}
-                      <span className="wl-muted wl-fact-small"> up</span>
-                    </>
-                  ),
-                  sub: kbit(l.rx.kbps) + ' down',
-                  title:
-                    'Transmit: ' +
-                    (rateDetail(l.tx) || 'unknown') +
-                    '. Receive: ' +
-                    (rateDetail(l.rx) || 'unknown') +
-                    '.',
-                },
-                {
-                  label: 'Channel busy',
-                  value: percent(busyPct),
-                  sub: level('busy', busyPct),
-                },
-                {
-                  label: 'Latency over this link',
-                  value: uplink && finite(uplink.median) ? uplink.median.toFixed(2) + ' ms' : dash,
-                  sub: !w.uplink
-                    ? 'The repeater is not an IPv4 uplink right now.'
+            <div className="wl-now-head">
+              <h3 className="wl-now-name">{l.ssid || 'Hidden network'}</h3>
+              <Badge tone="good">
+                {finite(l.connected_seconds)
+                  ? 'Connected · up ' + span(l.connected_seconds)
+                  : 'Connected'}
+              </Badge>
+              <ul className="wl-chips-plain" aria-label="Channel">
+                {[
+                  finite(l.frequency) ? band(l.frequency) : '',
+                  l.channel ? 'Channel ' + l.channel : '',
+                  l.width ? l.width + ' MHz wide' : '',
+                ]
+                  .filter(Boolean)
+                  .map((part) => (
+                    <li key={part}>{part}</li>
+                  ))}
+              </ul>
+            </div>
+            <div className="wl-tiles" role="list" aria-label="Current link">
+              <Tile
+                label="Signal"
+                tip="Received signal strength. Closer to 0 is stronger: −67 dBm or better is good, below −75 dBm is poor."
+                value={dbm(l.signal)}
+                rating={level('signal', l.signal)}
+                sub={
+                  finite(snr)
+                    ? snr + ' dB above noise (' + dbm(l.noise) + ')'
+                    : 'noise ' + dbm(l.noise)
+                }
+              />
+              <Tile
+                label="Link rate"
+                tip="The radio rate negotiated with the access point, not the actual throughput."
+                value={
+                  finite(l.tx.kbps) && finite(l.rx.kbps)
+                    ? Math.round(l.tx.kbps / 1000) +
+                      ' / ' +
+                      Math.round(l.rx.kbps / 1000) +
+                      ' Mbit/s'
+                    : kbit(l.tx.kbps)
+                }
+                sub="sending / receiving"
+              />
+              <Tile
+                label="Channel busy"
+                tip="Share of airtime the radio found the channel in use, by this router and others."
+                value={percent(busyPct)}
+                rating={level('busy', busyPct)}
+                sub={l.channel ? 'on channel ' + l.channel : ''}
+              />
+              <Tile
+                label="Latency"
+                tip="Ping latency to the primary destination through this Wi-Fi link, without the VPN."
+                value={uplink && finite(uplink.median) ? uplink.median.toFixed(2) + ' ms' : dash}
+                sub={
+                  !w.uplink
+                    ? 'not an uplink right now'
                     : !uplink || !finite(uplink.median)
-                      ? 'Turn on Direct internet in Settings to measure it.'
-                      : (uplink.active ? 'Active uplink ' : 'Standby uplink ') + uplink.interface,
-                },
-              ]}
-            />
+                      ? 'turn on Direct internet to measure'
+                      : 'via ' + uplink.interface + (uplink.active ? ', the active uplink' : '')
+                }
+              />
+            </div>
             <dl className="wl-spec" aria-label="Link details">
               {(
                 [
@@ -261,7 +284,8 @@ export function WifiView() {
               <Group
                 title="Connection"
                 rows={[
-                  ['Connected', percent(sum.uptime), sum.samples + ' samples'],
+                  ['Connected', percent(sum.uptime)],
+                  ['Samples', String(sum.samples)],
                   ['Drops', String(sum.disconnects ?? 0)],
                   ['Roams', String(sum.roams ?? 0)],
                 ]}
@@ -270,7 +294,8 @@ export function WifiView() {
                 title="Signal"
                 rows={[
                   ['Average', dbm(sum.signal), level('signal', sum.signal)],
-                  ['Range', dbm(sum.signalMin) + ' to ' + dbm(sum.signalMax)],
+                  ['Weakest', dbm(sum.signalMin)],
+                  ['Strongest', dbm(sum.signalMax)],
                   [
                     'Signal to noise',
                     finite(sum.snr) ? sum.snr.toFixed(0) + ' dB' : dash,
@@ -279,19 +304,25 @@ export function WifiView() {
                 ]}
               />
               <Group
-                title="Throughput and airtime"
+                title="Link rate when sending"
                 rows={[
-                  ['Average tx rate', mbit(sum.txRate), 'min ' + mbit(sum.txRateMin)],
+                  ['Average', mbit(sum.txRate)],
+                  ['Lowest', mbit(sum.txRateMin)],
                   ['Retries', percent(sum.retries), level('retries', sum.retries)],
                   ['Failures', percent(sum.failures)],
+                ]}
+              />
+              <Group
+                title="Airtime and data"
+                rows={[
+                  ['Channel busy', percent(sum.busy), level('busy', sum.busy)],
+                  ['This router', percent(own)],
                   [
-                    'Channel busy',
-                    percent(sum.busy),
-                    finite(sum.busy) && finite(own)
-                      ? 'own ' + percent(own) + ' · others ' + percent(Math.max(0, sum.busy - own))
-                      : level('busy', sum.busy),
+                    'Other devices',
+                    finite(sum.busy) && finite(own) ? percent(Math.max(0, sum.busy - own)) : dash,
                   ],
-                  ['Data', bytes(sum.rxBytes) + ' down', bytes(sum.txBytes) + ' up'],
+                  ['Downloaded', bytes(sum.rxBytes)],
+                  ['Uploaded', bytes(sum.txBytes)],
                 ]}
               />
             </div>

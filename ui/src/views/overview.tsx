@@ -46,6 +46,7 @@ import {
 import {
   Badge,
   CALL_QUALITY,
+  Explain,
   Facts,
   Mos,
   MosExplain,
@@ -537,12 +538,14 @@ export function OverviewView() {
         <WifiCard item={by('wifi')} />
         <RouterCard item={by('router')} />
       </div>
-      <p className="wl-muted wl-small">
-        Health states are heuristics: Down means an ongoing incident (every probe lost for at least
-        15 s) or a disconnected link; Degraded means loss ≥ 1 %, call quality below 3.6, a Wi-Fi
-        metric in its poor band, or router CPU, memory or tracked connections ≥ {routerLimits.cpu} %
-        or temperature ≥ {routerLimits.temperature} °C.
-      </p>
+      <Explain summary="How health states are decided">
+        <p>
+          Health states are heuristics: Down means an ongoing incident (every probe lost for at
+          least 15 s) or a disconnected link; Degraded means loss ≥ 1 %, call quality below 3.6, a
+          Wi-Fi metric in its poor band, or router CPU, memory or tracked connections ≥{' '}
+          {routerLimits.cpu} % or temperature ≥ {routerLimits.temperature} °C.
+        </p>
+      </Explain>
       <div className="wl-split">
         <section className="wl-panel" aria-labelledby="wl-ov-incidents">
           <header className="wl-panel-head">

@@ -114,6 +114,17 @@ export function MosExplain(props: { inputs?: string }) {
   );
 }
 
+// A tooltip that works on hover, keyboard focus and tap, unlike title, which
+// touch screens never show and some browsers delay or hide.
+export function Tip(props: { text: string; children: ReactNode }) {
+  return (
+    <button type="button" className="wl-tip" data-tip={props.text}>
+      {props.children}
+      <span className="wl-sr">. {props.text}</span>
+    </button>
+  );
+}
+
 export function Facts(props: {
   items: { label: string; value: ReactNode; sub?: ReactNode; title?: string }[];
   label?: string;
@@ -121,8 +132,8 @@ export function Facts(props: {
   return (
     <dl className="wl-facts" aria-label={props.label}>
       {props.items.map((item) => (
-        <div key={item.label} title={item.title}>
-          <dt>{item.label}</dt>
+        <div key={item.label}>
+          <dt>{item.title ? <Tip text={item.title}>{item.label}</Tip> : item.label}</dt>
           <dd>
             <span className="wl-num wl-fact">{item.value}</span>
             {item.sub !== undefined && item.sub !== '' && <small>{item.sub}</small>}
@@ -138,6 +149,7 @@ export function Panel(props: {
   sub?: ReactNode;
   actions?: ReactNode;
   children: ReactNode;
+  foot?: ReactNode;
   id?: string;
   class?: string;
 }) {
@@ -151,6 +163,7 @@ export function Panel(props: {
         {props.actions}
       </header>
       {props.children}
+      {props.foot && <footer className="wl-panel-foot">{props.foot}</footer>}
     </section>
   );
 }

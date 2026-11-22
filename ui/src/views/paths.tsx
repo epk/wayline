@@ -55,6 +55,7 @@ import type { Column, Tunnel, Uplink } from '../types.ts';
 import {
   Badge,
   CALL_QUALITY,
+  Tip,
   Mos,
   MosExplain,
   Panel,
@@ -132,9 +133,12 @@ function StopDialog() {
 
 const tone = (t: Tunnel) => (!t.enabled ? 'off' : t.connected ? 'ok' : 'down');
 
+const PERCENTILE_NOTE =
+  'Estimated from 16 latency bins, so it can be off by up to one bin: under 1 ms below 3 ms, under 5 ms below 20 ms, 50 ms between 100 and 150 ms.';
+
 function LineKey(props: {
   highlighted: string;
-  items: { label: string; style: 'solid' | 'band' | 'dashed' | 'dotted' }[];
+  items: { label: string; style: 'solid' | 'band' | 'dashed' | 'dotted'; title?: string }[];
 }) {
   return (
     <div className="wl-line-key">
@@ -158,14 +162,18 @@ function LineKey(props: {
                 />
               )}
             </svg>
-            {item.label}
+            {item.title ? <Tip text={item.title}>{item.label}</Tip> : item.label}
           </li>
         ))}
       </ul>
-      <p className="wl-muted">
-        {props.highlighted
-          ? 'The range and slow-reply lines are drawn for ' + props.highlighted + '.'
-          : 'Press a path name to draw its range and slow-reply lines.'}
+      <p className="wl-muted wl-key-for">
+        {props.highlighted ? (
+          <>
+            Range lines: <strong>{props.highlighted}</strong>
+          </>
+        ) : (
+          'Press a path name to draw its range'
+        )}
       </p>
     </div>
   );
@@ -218,25 +226,18 @@ function TunnelTable() {
   const primary = primarySelected.value;
   const liveTitle = 'Live jitter, loss and call quality are measured to the primary destination.';
   const metric = (label: string, value: ReactNode, sub?: ReactNode, title?: string) => (
-    <div title={title}>
-      <dt>{label}</dt>
+    <div>
+      <dt>{title ? <Tip text={title}>{label}</Tip> : label}</dt>
       <dd>
         <span className="wl-metric-value">{value}</span>
         {sub !== undefined && sub !== '' && sub !== null && <small>{sub}</small>}
       </dd>
     </div>
   );
-  const lossValue = (loss: Loss, unit: string) =>
-    primary && loss.sent ? (
-      <>
-        <span className="wl-num">{percent(loss.pct)}</span>
-        <small className="wl-num">
-          {loss.lost}/{loss.sent} {unit}
-        </small>
-      </>
-    ) : (
-      dash
-    );
+  const lossValue = (loss: Loss) =>
+    primary && loss.sent ? <span className="wl-num">{percent(loss.pct)}</span> : dash;
+  const lossSub = (loss: Loss, unit: string) =>
+    primary && loss.sent ? loss.lost + ' of ' + loss.sent + ' ' + unit : undefined;
   return (
     <div
       className="wl-exits"
@@ -382,8 +383,8 @@ function TunnelTable() {
                 )}
                 {metric(
                   'Loss',
-                  lossValue(loss, 'probes'),
-                  undefined,
+                  lossValue(loss),
+                  lossSub(loss, 'probes lost'),
                   primary ? loss.lost + ' of ' + loss.sent + ' probes lost' : liveTitle,
                 )}
                 {metric(
@@ -452,8 +453,8 @@ function TunnelTable() {
                 {metric('Jitter', <span className="wl-num">{primary ? ms(jitter) : dash}</span>)}
                 {metric(
                   'Loss',
-                  lossValue(loss, loss.source === 'range' ? 'in range' : 'probes'),
-                  undefined,
+                  lossValue(loss),
+                  lossSub(loss, loss.source === 'range' ? 'lost in range' : 'probes lost'),
                   loss.source === 'range' ? 'Loss over the selected range from history' : undefined,
                 )}
                 {metric(
@@ -672,9 +673,16 @@ function History() {
     <Panel
       id="wl-latency-title"
       title={'Latency to ' + target}
-      sub={
-        scaleNote('medians') +
-        '. Gaps mean no measurement. Drag across a chart to zoom, double-click to reset.'
+      sub={scaleNote('medians') + '. Gaps mean no measurement.'}
+      foot={
+        <ul className="wl-tips" aria-label="Chart controls">
+          <li>Click a series to show only it</li>
+          <li>
+            <kbd>Ctrl</kbd> or <kbd>⌘</kbd>-click to add more
+          </li>
+          <li>Drag to zoom</li>
+          <li>Double-click to reset</li>
+        </ul>
       }
     >
       {built.rows.length > 0 && (
@@ -692,7 +700,17 @@ function History() {
                   </Button>
                 </th>
                 {columns.map((c) => (
-                  <th key={c.key} scope="col" className="wl-n" aria-sort={ariaSort(c.key)}>
+                  <th
+                    key={c.key}
+                    scope="col"
+                    className="wl-n"
+                    aria-sort={ariaSort(c.key)}
+                    data-tip={
+                      c.key === 'mos'
+                        ? 'Call quality for the range, from its average latency and jitter and its loss.'
+                        : undefined
+                    }
+                  >
                     <Button className="wl-sort" onClick={() => sortBy(c.key)}>
                       <span className="wl-sr">Sort by </span>
                       {c.label}
@@ -770,25 +788,12 @@ function History() {
           </table>
         </div>
       )}
-      <p className="wl-muted wl-hint">
-        Press a series name to show only that line. Ctrl- or Cmd-click adds more. Call quality uses
-        the range mean latency and jitter and the range loss.
-      </p>
       <div className="wl-chart-area">
         {note && (
           <div className="wl-chart-note" role="status">
             {note}
           </div>
         )}
-        <LineKey
-          highlighted={band ? subjectName(band) : ''}
-          items={[
-            { label: 'Median', style: 'solid' },
-            { label: 'Fastest to slowest reply', style: 'band' },
-            { label: 'Slowest 5 % of replies', style: 'dashed' },
-            { label: 'Slowest 1 % of replies', style: 'dotted' },
-          ]}
-        />
         <Chart
           title="Latency (ms)"
           detail={scaleNote('medians')}
@@ -816,17 +821,19 @@ function History() {
             if (cursor.value !== i) cursor.value = i;
           }}
         >
-          <p
-            className="wl-muted wl-small"
-            title="Percentiles from a histogram; error within one bin"
-          >
-            Percentiles from a 16-bin round-trip-time histogram; error within one bin (under 1 ms
-            below 3 ms, under 5 ms below 20 ms, 50 ms between 100 and 150 ms).
-          </p>
+          <LineKey
+            highlighted={band ? subjectName(band) : ''}
+            items={[
+              { label: 'Median', style: 'solid' },
+              { label: 'Fastest to slowest reply', style: 'band' },
+              { label: 'Slowest 5 % of replies', style: 'dashed', title: PERCENTILE_NOTE },
+              { label: 'Slowest 1 % of replies', style: 'dotted', title: PERCENTILE_NOTE },
+            ]}
+          />
         </Chart>
         <Chart
           title="Jitter (ms)"
-          detail={scaleNote('buckets') + ' · average change between consecutive replies'}
+          detail={scaleNote('buckets')}
           label={'Jitter to ' + target + ' through each path'}
           x={x}
           ys={built.jitter.ys}
@@ -841,7 +848,7 @@ function History() {
         />
         <Chart
           title="Packet loss (%)"
-          detail={scaleNote('buckets') + ' · lost / sent probes'}
+          detail={scaleNote('buckets')}
           label={'Packet loss to ' + target + ' through each path'}
           x={x}
           ys={built.loss.ys}
@@ -893,67 +900,80 @@ export function PathsView() {
   const probe = s.probe || {};
   return (
     <>
-      {!can.value.select && selectReason.value && (
-        <p className="wl-muted wl-hint">{selectReason.value}</p>
-      )}
-      {auto.enabled && (
-        <div className="wl-panel wl-info">
-          <strong>Automatic exit switching is on.</strong>
-          {auto.needsAttention ? (
-            <p role="alert">
-              Automatic switching stopped after an uncertain request. Check the native VPN state.
-              Disable automatic switching. Save Settings. Enable it again.
-            </p>
-          ) : auto.paused ? (
+      <Panel
+        id="wl-exits-title"
+        title="Exits and uplinks"
+        sub={
+          <span title={s.scope || undefined}>
+            Ping to {selectedTarget.value} every {probe.interval || s.config.interval} s
+            {finite(probe.timeout) ? ', timeout ' + probe.timeout / 1000 + ' s' : ''}. Loss and
+            jitter cover the recent window.
+          </span>
+        }
+        actions={
+          destinations.value.length > 1 ? (
+            <SegmentedControl
+              className="wl-seg"
+              aria-label="Destination"
+              value={selectedTarget.value}
+              onValueChange={(next) => {
+                if (next) chooseTarget(next);
+              }}
+            >
+              <SegmentedControlIndicator className="wl-seg-indicator" />
+              {destinations.value.map((d) => (
+                <SegmentedControlItem key={d} value={d}>
+                  {d}
+                </SegmentedControlItem>
+              ))}
+            </SegmentedControl>
+          ) : undefined
+        }
+        foot={
+          <>
+            {!can.value.select && selectReason.value && <p>{selectReason.value}</p>}
+            {s.config.directWan && s.uplinks.length > 0 && !wanAvailable.value && (
+              <p role="note">
+                Direct WAN is unavailable. {s.wan.reason || 'The router did not give a reason.'}
+              </p>
+            )}
             <p>
-              Automatic switching is paused because the current exit is outside the allowed pool.
+              Changing the exit affects new connections. Stopping a tunnel may send traffic over
+              WAN.
             </p>
-          ) : null}
-          {auto.last ? (
-            <span>
-              {' '}
-              Last switch <When at={auto.last.at} />: from {tunnelName(auto.last.from)} to{' '}
-              {tunnelName(auto.last.to)}. {auto.last.reason}
+          </>
+        }
+      >
+        {auto.enabled && (
+          <div className="wl-auto-line" role="status">
+            <Badge tone={auto.needsAttention ? 'poor' : auto.paused ? 'fair' : 'good'}>
+              {auto.needsAttention
+                ? 'Automatic switching stopped'
+                : auto.paused
+                  ? 'Automatic switching paused'
+                  : 'Automatic switching on'}
+            </Badge>
+            <span className="wl-muted">
+              {auto.needsAttention
+                ? 'It stopped after an uncertain request. Check the native VPN state, then turn automatic switching off and on again in Settings.'
+                : auto.paused
+                  ? 'The current exit is outside the allowed pool.'
+                  : null}
+              {auto.last ? (
+                <>
+                  {' '}
+                  Last switch <When at={auto.last.at} />: {tunnelName(auto.last.from)} to{' '}
+                  {tunnelName(auto.last.to)}. {auto.last.reason}
+                </>
+              ) : (
+                ' No switch yet.'
+              )}
             </span>
-          ) : (
-            <span className="wl-muted"> No switch yet.</span>
-          )}
-        </div>
-      )}
-      <div className="wl-table-head">
-        {destinations.value.length > 1 && (
-          <SegmentedControl
-            className="wl-seg"
-            aria-label="Destination"
-            value={selectedTarget.value}
-            onValueChange={(next) => {
-              if (next) chooseTarget(next);
-            }}
-          >
-            <SegmentedControlIndicator className="wl-seg-indicator" />
-            {destinations.value.map((d) => (
-              <SegmentedControlItem key={d} value={d}>
-                {d}
-              </SegmentedControlItem>
-            ))}
-          </SegmentedControl>
+          </div>
         )}
-        <p className="wl-muted" title={s.scope || undefined}>
-          Ping to {selectedTarget.value} every {probe.interval || s.config.interval} s
-          {finite(probe.timeout) ? ', timeout ' + probe.timeout + ' ms' : ''}. Loss and jitter use
-          the recent window.
-        </p>
-      </div>
-      <TunnelTable />
+        <TunnelTable />
+      </Panel>
       <StopDialog />
-      {s.config.directWan && s.uplinks.length > 0 && !wanAvailable.value && (
-        <p className="wl-muted wl-note" role="note">
-          Direct WAN is unavailable. {s.wan.reason || 'The router did not give a reason.'}
-        </p>
-      )}
-      <p className="wl-muted wl-note">
-        Changing the exit affects new connections. Stopping a tunnel may send traffic over WAN.
-      </p>
       <History />
     </>
   );
