@@ -266,7 +266,7 @@ function InternetCard(props: { item: Health }) {
   const p = internet.value;
   const u = activeUplink.value;
   return (
-    <Card item={props.item} title="Internet (direct WAN)">
+    <Card item={props.item} title="Direct internet">
       {!p ? (
         <Enable
           text="Measure the active uplink without the VPN: latency, jitter, loss and call quality to each destination."
@@ -281,17 +281,18 @@ function InternetCard(props: { item: Health }) {
       ) : (
         <>
           <p className="wl-card-sub wl-muted">
-            {u ? (u.interface || u.id) + (u.device ? ' · ' + u.device : '') : 'WAN'}
+            {u ? (u.interface || u.id) + (u.device ? ' · ' + u.device : '') : 'Internet uplink'}
             {p.down ? ' · down since ' : ''}
             {p.down && <When at={p.down.start} />}
           </p>
           {!wanAvailable.value && (
             <p className="wl-note">
-              Direct WAN is unavailable. {s.wan.reason || 'The router did not give a reason.'}
+              The direct internet connection is unavailable.{' '}
+              {s.wan.reason || 'The router did not give a reason.'}
             </p>
           )}
           <PathFacts p={p} target={primary.value} />
-          <StripFor id="wan" name={u?.interface || 'WAN'} />
+          <StripFor id="wan" name={u?.interface || 'Direct internet'} />
           <MosExplain inputs="Inputs: live median latency and jitter of the active uplink, and its recent loss (or the selected range when the router does not report a recent probe count)." />
         </>
       )}
@@ -475,7 +476,7 @@ function RouterCard(props: { item: Health }) {
     >
       {!s.config.telemetry ? (
         <Enable
-          text="Router and interface telemetry: CPU, memory, temperature, tracked connections, per-interface throughput, WireGuard handshakes."
+          text="Router and interface telemetry: processor, memory, temperature, tracked connections, per-interface throughput, WireGuard handshakes."
           label="Record router telemetry"
           onClick={() =>
             void enableSetting(
@@ -489,7 +490,7 @@ function RouterCard(props: { item: Health }) {
       ) : (
         <Facts
           items={[
-            { label: 'CPU', value: percent(sys.cpu), sub: over(sys.cpu, routerLimits.cpu) },
+            { label: 'Processor', value: percent(sys.cpu), sub: over(sys.cpu, routerLimits.cpu) },
             {
               label: 'Load 1 / 5 / 15',
               value: sys.load ? sys.load.map((v) => v.toFixed(2)).join(' ') : dash,
@@ -508,7 +509,8 @@ function RouterCard(props: { item: Health }) {
             },
             {
               label: 'Tracked connections',
-              title: 'Connections the router firewall is tracking (conntrack), against its limit.',
+              title:
+                'Connections the router firewall is tracking (its connection table), against its limit.',
               value: finite(sys.conntrack) ? String(sys.conntrack) : dash,
               sub:
                 over(ct, routerLimits.conntrack) ||

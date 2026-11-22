@@ -98,7 +98,7 @@ export function RouterView() {
         {sys ? (
           <Facts
             items={[
-              { label: 'CPU', value: percent(sys.cpu), sub: 'non-idle jiffies' },
+              { label: 'Processor', value: percent(sys.cpu), sub: 'busy time' },
               {
                 label: 'Load 1 / 5 / 15 min',
                 value: sys.load ? sys.load.map((v) => v.toFixed(2)).join(' ') : dash,
@@ -119,7 +119,7 @@ export function RouterView() {
               {
                 label: 'Tracked connections',
                 title:
-                  'Connections the router firewall is tracking (conntrack), against its limit.',
+                  'Connections the router firewall is tracking (its connection table), against its limit.',
                 value: finite(sys.conntrack) ? String(sys.conntrack) : dash,
                 sub: finite(sys.conntrackMax) ? 'max ' + sys.conntrackMax : '',
               },
@@ -147,8 +147,8 @@ export function RouterView() {
       {built && (
         <div className="wl-panel wl-charts">
           <Chart
-            title="CPU (%)"
-            label="CPU utilisation, bucket mean and maximum"
+            title="Processor (%)"
+            label="Processor use, bucket mean and maximum"
             x={built.x}
             ys={built.cpu}
             lines={[

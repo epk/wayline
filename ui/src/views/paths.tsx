@@ -82,7 +82,7 @@ export const seriesColor = (id: string): string => {
 };
 
 export const seriesName = (line: { id: string; name: string }): string => {
-  if (line.id === 'wan') return 'Direct WAN (no VPN)';
+  if (line.id === 'wan') return 'Direct internet (no VPN)';
   if (isUplink(line.id)) return line.id.slice(uplinkPrefix.length) + ' uplink';
   return line.name;
 };
@@ -111,7 +111,7 @@ function StopDialog() {
       alert
     >
       <h2>Stop {name}?</h2>
-      <p>Traffic may use WAN. GL.iNet traffic policy applies while the tunnel is stopped.</p>
+      <p>Traffic may bypass the VPN. GL.iNet traffic policy applies while the tunnel is stopped.</p>
       <div className="wl-actions">
         <Button className="wl-button" onClick={() => (pendingStop.value = '')}>
           Keep running
@@ -219,8 +219,8 @@ function TunnelTable() {
     !u.active
       ? u.interface || u.id
       : u.interface
-        ? 'Direct WAN (' + u.interface + ')'
-        : 'Direct WAN';
+        ? 'Direct internet (' + u.interface + ')'
+        : 'Direct internet';
   const unmeasurable = (u: Uplink) =>
     u.state === 'route_mismatch' || u.state === 'route_unavailable';
   const primary = primarySelected.value;
@@ -701,6 +701,33 @@ function History() {
           role="region"
           aria-label="Per-series statistics"
         >
+          <div className="wl-sort-by">
+            <label>
+              Sort by{' '}
+              <select
+                value={sort.key}
+                onChange={(e) => {
+                  const key = e.target.value as SortKey;
+                  setSort({ key, dir: key === 'name' ? 1 : -1 });
+                }}
+              >
+                <option value="name">Series</option>
+                {columns.map((c) => (
+                  <option key={c.key} value={c.key}>
+                    {c.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <select
+              aria-label="Order"
+              value={sort.dir}
+              onChange={(e) => setSort({ key: sort.key, dir: Number(e.target.value) })}
+            >
+              <option value={-1}>{sort.key === 'name' ? 'Z to A' : 'Highest first'}</option>
+              <option value={1}>{sort.key === 'name' ? 'A to Z' : 'Lowest first'}</option>
+            </select>
+          </div>
           <table className="wl-table wl-series">
             <caption className="wl-sr">
               Per-series statistics for the selected range, in milliseconds
@@ -714,21 +741,17 @@ function History() {
                   </Button>
                 </th>
                 {columns.map((c) => (
-                  <th
-                    key={c.key}
-                    scope="col"
-                    className="wl-n"
-                    aria-sort={ariaSort(c.key)}
-                    data-tip={
-                      c.key === 'mos'
-                        ? 'Call quality for the range, from its average latency and jitter and its loss.'
-                        : undefined
-                    }
-                  >
+                  <th key={c.key} scope="col" className="wl-n" aria-sort={ariaSort(c.key)}>
                     <Button className="wl-sort" onClick={() => sortBy(c.key)}>
                       <span className="wl-sr">Sort by </span>
                       {c.label}
                     </Button>
+                    {c.key === 'mos' && (
+                      <Tip text="Call quality for the range, from its average latency and jitter and its loss.">
+                        <span aria-hidden="true">?</span>
+                        <span className="wl-sr">About call quality</span>
+                      </Tip>
+                    )}
                   </th>
                 ))}
               </tr>
@@ -828,7 +851,7 @@ function History() {
             if (!l) return '';
             const p = (name: string, col: Column) =>
               finite(col[at]) ? ' · ' + name + ' ' + (col[at] as number).toFixed(1) : '';
-            return p('p50', l.p50) + p('p95', l.p95) + p('p99', l.p99);
+            return p('typical', l.p50) + p('slow', l.p95) + p('slowest', l.p99);
           }}
           x={x}
           ys={built.ys}
@@ -959,12 +982,13 @@ export function PathsView() {
             {!can.value.select && selectReason.value && <p>{selectReason.value}</p>}
             {s.config.directWan && s.uplinks.length > 0 && !wanAvailable.value && (
               <p role="note">
-                Direct WAN is unavailable. {s.wan.reason || 'The router did not give a reason.'}
+                The direct internet connection is unavailable.{' '}
+                {s.wan.reason || 'The router did not give a reason.'}
               </p>
             )}
             <p>
-              Changing the exit affects new connections. Stopping a tunnel may send traffic over
-              WAN.
+              Changing the exit affects new connections. Stopping a tunnel may send traffic outside
+              the VPN.
             </p>
           </>
         }

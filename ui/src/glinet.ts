@@ -30,6 +30,20 @@ const modules = new Map<string, Promise<Module>>();
 
 const importUrl = (url: string): Promise<Module> => import(url);
 
+// Cache a pending load, but forget it if it fails, so the next attempt
+// downloads again instead of replaying one transient network error.
+function cached<T>(map: Map<string, Promise<T>>, file: string, start: () => Promise<T>) {
+  let entry = map.get(file);
+  if (!entry) {
+    entry = start();
+    map.set(file, entry);
+    entry.catch(() => {
+      if (map.get(file) === entry) map.delete(file);
+    });
+  }
+  return entry;
+}
+
 const describe = (e: unknown): string =>
   e && typeof e === 'object' && 'message' in e ? String(e.message) : String(e);
 
@@ -85,27 +99,16 @@ async function unpack(file: string): Promise<string> {
   return URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
 }
 
-function blobUrl(file: string): Promise<string> {
-  let url = urls.get(file);
-  if (!url) {
-    url = unpack(file);
-    urls.set(file, url);
-  }
-  return url;
-}
+const blobUrl = (file: string): Promise<string> => cached(urls, file, () => unpack(file));
 
-function load(file: string): Promise<Module> {
-  let module = modules.get(file);
-  if (!module) {
-    module = plain
+const load = (file: string): Promise<Module> =>
+  cached(modules, file, () =>
+    plain
       ? importUrl(manifest.base + file).catch((error: unknown) => {
           throw new StaleFiles(manifest.base + file + ': ' + describe(error));
         })
-      : blobUrl(file).then(importUrl);
-    modules.set(file, module);
-  }
-  return module;
-}
+      : blobUrl(file).then(importUrl),
+  );
 
 async function loadCore(): Promise<Core> {
   if (!plain && !(await blobsWork())) {

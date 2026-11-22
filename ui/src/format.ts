@@ -14,11 +14,6 @@ export const ms = (value: Num | undefined): string =>
 export const percent = (value: Num | undefined): string =>
   finite(value) ? (value < 10 ? value.toFixed(1) : String(Math.round(value))) + ' %' : dash;
 
-export const lossShort = (lost: number, samples: number): string => {
-  const pct = (lost / samples) * 100;
-  return pct < 1 ? '<1 %' : Math.round(pct) + ' %';
-};
-
 export const ago = (at: number, now = Date.now()): string => {
   const s = Math.max(0, Math.round((now - at) / 1000));
   if (s < 60) return 'just now';

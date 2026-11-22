@@ -15,9 +15,9 @@ export function TelemetryOff(props: { title: string }) {
     <Panel id="wl-telemetry-off" title={props.title} sub="Router telemetry is off.">
       <div className="wl-cta">
         <p>
-          Router and interface telemetry — CPU, memory, temperature, tracked connections,
-          per-interface throughput, WireGuard handshakes. Sampled every 5 seconds and kept with the
-          same tiers as latency.
+          Router and interface telemetry — processor, memory, temperature, tracked connections,
+          per-interface throughput, WireGuard handshakes. Sampled every 5 seconds and kept as long
+          as latency.
         </p>
         <Button
           className="wl-button wl-primary"
@@ -100,7 +100,7 @@ export function TrafficView() {
         sub={
           'Rates over the last ' +
           (t.interval || 5) +
-          '-second sample from /sys/class/net counters.' +
+          '-second sample.' +
           (finite(age) ? ' Sample age ' + (age / 1000).toFixed(1) + ' s.' : '')
         }
       >
@@ -115,18 +115,11 @@ export function TrafficView() {
               <thead>
                 <tr>
                   <th scope="col">Interface</th>
-                  <th scope="col">Kind</th>
                   <th scope="col" className="wl-n">
-                    Receive rate
+                    Receive
                   </th>
                   <th scope="col" className="wl-n">
-                    Send rate
-                  </th>
-                  <th scope="col" className="wl-n">
-                    Received
-                  </th>
-                  <th scope="col" className="wl-n">
-                    Sent
+                    Send
                   </th>
                   <th scope="col" className="wl-n">
                     Errors
@@ -147,22 +140,22 @@ export function TrafficView() {
                     <tr key={i.id}>
                       <th scope="row">
                         {i.name}
-                        {i.device && i.device !== i.name && (
-                          <small className="wl-block wl-muted">{i.device}</small>
-                        )}
+                        <small className="wl-block wl-muted">
+                          {i.device && i.device !== i.name ? i.device + ', ' : ''}
+                          {i.kind}
+                        </small>
                       </th>
-                      <td data-label="Kind">{i.kind}</td>
-                      <td className="wl-n wl-num" data-label="Receive rate">
+                      <td className="wl-n wl-num" data-label="Receive">
                         {bits(i.rxBps)}
+                        {finite(i.rxBytes) && (
+                          <small className="wl-block wl-muted">{bytes(i.rxBytes)} in total</small>
+                        )}
                       </td>
-                      <td className="wl-n wl-num" data-label="Send rate">
+                      <td className="wl-n wl-num" data-label="Send">
                         {bits(i.txBps)}
-                      </td>
-                      <td className="wl-n wl-num" data-label="Received">
-                        {bytes(i.rxBytes)}
-                      </td>
-                      <td className="wl-n wl-num" data-label="Sent">
-                        {bytes(i.txBytes)}
+                        {finite(i.txBytes) && (
+                          <small className="wl-block wl-muted">{bytes(i.txBytes)} in total</small>
+                        )}
                       </td>
                       <td className="wl-n wl-num" data-label="Errors">
                         {finite(i.errors) ? i.errors : dash}
