@@ -686,7 +686,12 @@ function History() {
       }
     >
       {built.rows.length > 0 && (
-        <div className="wl-scroll">
+        <div
+          className="wl-scroll wl-stack"
+          tabIndex={0}
+          role="region"
+          aria-label="Per-series statistics"
+        >
           <table className="wl-table wl-series">
             <caption className="wl-sr">
               Per-series statistics for the selected range, in milliseconds
@@ -763,21 +768,32 @@ function History() {
                     </Toggle>
                     {active(row) && <Tag>Active exit</Tag>}
                   </th>
-                  <td className="wl-n wl-num">{fixed(row.stats.last)}</td>
-                  <td className="wl-n wl-num">{fixed(row.stats.mean)}</td>
-                  <td className="wl-n wl-num">{fixed(row.stats.min)}</td>
-                  <td className="wl-n wl-num">{fixed(row.stats.max)}</td>
-                  <td className="wl-n wl-num">{fixed(row.stats.jitter)}</td>
+                  <td className="wl-n wl-num" data-label="Last">
+                    {fixed(row.stats.last)}
+                  </td>
+                  <td className="wl-n wl-num" data-label="Mean">
+                    {fixed(row.stats.mean)}
+                  </td>
+                  <td className="wl-n wl-num" data-label="Min">
+                    {fixed(row.stats.min)}
+                  </td>
+                  <td className="wl-n wl-num" data-label="Max">
+                    {fixed(row.stats.max)}
+                  </td>
+                  <td className="wl-n wl-num" data-label="Jitter">
+                    {fixed(row.stats.jitter)}
+                  </td>
                   <td
                     className="wl-n wl-num"
+                    data-label="Loss"
                     title={row.stats.lost + ' of ' + row.stats.sent + ' probes lost to ' + target}
                   >
                     {percent(row.stats.loss)}
                   </td>
-                  <td className="wl-n wl-num">
+                  <td className="wl-n wl-num" data-label="Call quality">
                     {row.stats.score ? row.stats.score.mos.toFixed(2) : dash}
                   </td>
-                  <td className="wl-n wl-num">
+                  <td className="wl-n wl-num" data-label="At cursor">
                     {at >= 0 && finite(row.line.median[at])
                       ? (row.line.median[at] as number).toFixed(2)
                       : dash}

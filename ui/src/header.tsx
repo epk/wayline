@@ -69,7 +69,7 @@ export function Header() {
         ))}
       </ul>
       <div className="wl-controls">
-        <div className="wl-seg" role="group" aria-label="Move through history">
+        <div className="wl-seg wl-nav" role="group" aria-label="Move through history">
           <Button
             aria-label="Earlier"
             disabled={offset.value + range.value >= maxMinutes.value}
@@ -85,7 +85,7 @@ export function Header() {
           </Button>
         </div>
         <SegmentedControl
-          className="wl-seg"
+          className="wl-seg wl-range"
           aria-label="History range"
           value={preset}
           onValueChange={(next) => {

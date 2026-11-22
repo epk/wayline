@@ -105,7 +105,12 @@ export function TrafficView() {
         }
       >
         {t.interfaces.length ? (
-          <div className="wl-scroll" tabIndex={0} role="region" aria-label="Live interface table">
+          <div
+            className="wl-scroll wl-stack"
+            tabIndex={0}
+            role="region"
+            aria-label="Live interface table"
+          >
             <table className="wl-table">
               <thead>
                 <tr>
@@ -146,14 +151,26 @@ export function TrafficView() {
                           <small className="wl-block wl-muted">{i.device}</small>
                         )}
                       </th>
-                      <td>{i.kind}</td>
-                      <td className="wl-n wl-num">{bits(i.rxBps)}</td>
-                      <td className="wl-n wl-num">{bits(i.txBps)}</td>
-                      <td className="wl-n wl-num">{bytes(i.rxBytes)}</td>
-                      <td className="wl-n wl-num">{bytes(i.txBytes)}</td>
-                      <td className="wl-n wl-num">{finite(i.errors) ? i.errors : dash}</td>
-                      <td className="wl-n wl-num">{finite(i.drops) ? i.drops : dash}</td>
-                      <td className="wl-n">
+                      <td data-label="Kind">{i.kind}</td>
+                      <td className="wl-n wl-num" data-label="Rx rate">
+                        {bits(i.rxBps)}
+                      </td>
+                      <td className="wl-n wl-num" data-label="Tx rate">
+                        {bits(i.txBps)}
+                      </td>
+                      <td className="wl-n wl-num" data-label="Rx total">
+                        {bytes(i.rxBytes)}
+                      </td>
+                      <td className="wl-n wl-num" data-label="Tx total">
+                        {bytes(i.txBytes)}
+                      </td>
+                      <td className="wl-n wl-num" data-label="Errors">
+                        {finite(i.errors) ? i.errors : dash}
+                      </td>
+                      <td className="wl-n wl-num" data-label="Drops">
+                        {finite(i.drops) ? i.drops : dash}
+                      </td>
+                      <td className="wl-n" data-label="Handshake age">
                         {finite(i.handshakeAge) ? (
                           <>
                             <span className="wl-num">{span(i.handshakeAge)}</span>
@@ -174,7 +191,9 @@ export function TrafficView() {
                           dash
                         )}
                       </td>
-                      <td className="wl-num">{i.endpoint || dash}</td>
+                      <td className="wl-num wl-endpoint" data-label="Endpoint">
+                        {i.endpoint || dash}
+                      </td>
                     </tr>
                   );
                 })}

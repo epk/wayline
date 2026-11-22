@@ -234,7 +234,12 @@ function Dashboard() {
     probe.current
       ?.closest('.wl')
       ?.querySelector('.wl-tabs [data-selected]')
-      ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      // container: 'nearest' scrolls only the tab row, not the admin page.
+      ?.scrollIntoView({
+        block: 'nearest',
+        inline: 'nearest',
+        container: 'nearest',
+      } as ScrollIntoViewOptions);
   }, [current, shown]);
   useEffect(() => {
     const detect = () => {

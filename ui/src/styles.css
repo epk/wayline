@@ -54,6 +54,10 @@
   --ui-font-size: 13px;
   --ui-font-sans: var(--wl-font);
   --ui-font-mono: var(--wl-mono);
+  /* Smallest control size: 24px for a mouse, 44px for a finger (raised below). */
+  --wl-target: 24px;
+  /* Panel side padding; panel footers and edge-to-edge lists bleed by this much. */
+  --wl-pad: 16px;
   color: var(--wl-text);
   font: 14px/1.5 var(--wl-font);
   width: 100%;
@@ -153,6 +157,9 @@
   line-height: 1.25;
   margin: 0 0 4px;
   overflow-wrap: anywhere;
+}
+.wl :where(h1, h2, h3) {
+  text-wrap: balance;
 }
 .wl :where(h2) {
   font-size: 16px;
@@ -283,7 +290,7 @@
   border: 1px solid var(--wl-border);
   border-radius: 7px;
   margin: 12px 0;
-  padding: 14px 16px;
+  padding: 14px var(--wl-pad);
   min-width: 0;
 }
 .wl-panel-head {
@@ -328,6 +335,7 @@
   justify-content: flex-end;
 }
 .wl-chip {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -383,10 +391,14 @@
   position: relative;
   display: inline-flex;
   flex-wrap: wrap;
+  /* The border colour shows through the gap as separators, also between
+     wrapped rows, and growing items fill every row. */
+  gap: 1px;
   border: 1px solid var(--wl-control-border);
   border-radius: 5px;
-  background: var(--wl-card);
+  background: var(--wl-border);
   max-width: 100%;
+  overflow: hidden;
 }
 .wl-seg > [data-slot] {
   position: relative;
@@ -397,17 +409,22 @@
   padding: 3px 10px;
   border: 0;
   border-radius: 0;
-  background: none;
+  background: var(--wl-card);
   color: var(--wl-text);
   font-size: 13px;
-  flex: none;
+  flex: 1 0 auto;
   white-space: nowrap;
   display: inline-flex;
   align-items: center;
   justify-content: center;
 }
-.wl-seg > [data-slot]:not(:last-child, [data-slot='segmented-control-indicator']) {
-  border-inline-end: 1px solid var(--wl-border);
+.wl-seg > [data-slot]:disabled {
+  /* Opacity would let the separator colour show through as a grey fill. */
+  opacity: 1;
+  color: color-mix(in srgb, var(--wl-text) 35%, var(--wl-card));
+}
+.wl-seg > [data-slot]:focus-visible {
+  outline-offset: -3px;
 }
 .wl-seg [data-slot='segmented-control-indicator'] {
   display: none;
@@ -449,11 +466,16 @@
   gap: 2px;
   border-bottom: 1px solid var(--wl-border);
   margin: 8px 0 4px;
+  /* One row that scrolls sideways on a phone, never wrapped rows. */
   overflow-x: auto;
   scrollbar-width: thin;
+  scroll-padding-inline: var(--wl-fade);
+  --wl-fade: 2.5rem;
 }
 .wl-tabs [data-slot='tabs-tab'] {
+  flex: none;
   height: auto;
+  min-height: var(--wl-target);
   border: 0;
   background: none;
   padding: 8px 12px;
@@ -598,6 +620,7 @@
   margin: 12px 0;
 }
 .wl-card {
+  container: card / inline-size;
   background: var(--wl-card);
   border: 1px solid var(--wl-border);
   border-top: 3px solid var(--wl-border);
@@ -1006,8 +1029,8 @@ th[aria-sort='descending'] .wl-sort::after {
   border-radius: 5px;
   padding: 5px 8px;
   font-size: 12px;
-  min-width: 160px;
-  max-width: 300px;
+  min-width: min(160px, 100%);
+  max-width: min(300px, 100%);
   box-shadow: 0 2px 8px color-mix(in srgb, var(--wl-shade) 18%, transparent);
 }
 .wl-tip-time {
@@ -1165,11 +1188,17 @@ th[aria-sort='descending'] .wl-sort::after {
   padding: 12px 16px;
   border-bottom: 1px solid var(--wl-border);
 }
+.wl-drawer-head > * {
+  min-width: 0;
+}
 .wl-drawer-head p {
   margin: 0;
   font-size: 12px;
+  /* The revision is one long hash; break it rather than clip it. */
+  overflow-wrap: anywhere;
 }
 .wl-drawer-foot {
+  padding-bottom: max(12px, env(safe-area-inset-bottom, 0px));
   border-bottom: 0;
   border-top: 1px solid var(--wl-border);
   justify-content: flex-end;
@@ -1318,8 +1347,11 @@ th[aria-sort='descending'] .wl-sort::after {
   .wl-controls > .wl-button {
     margin-left: 0;
   }
+  .wl {
+    --wl-pad: 12px;
+  }
   .wl-panel {
-    padding: 12px;
+    padding-block: 12px;
   }
   .wl-timeline li {
     grid-template-columns: minmax(0, 1fr);
@@ -1338,11 +1370,20 @@ th[aria-sort='descending'] .wl-sort::after {
   }
 }
 @media (pointer: coarse) {
-  .wl-seg > [data-slot],
-  .wl-tabs [data-slot='tabs-tab'],
-  .wl-button {
-    min-height: 40px;
+  .wl {
+    --wl-target: 44px;
   }
+}
+.wl-seg > [data-slot] {
+  min-height: max(30px, var(--wl-target));
+}
+.wl-button {
+  min-height: max(34px, var(--wl-target));
+}
+.wl-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--wl-target);
 }
 @media (prefers-reduced-motion: reduce) {
   .wl-tabs-indicator {
@@ -1444,7 +1485,7 @@ th[aria-sort='descending'] .wl-sort::after {
 }
 .wl-spec {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 180px), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 130px), 1fr));
   gap: 8px 16px;
   margin: 14px 0 4px;
   padding: 10px 14px;
@@ -1689,8 +1730,8 @@ th[aria-sort='descending'] .wl-sort::after {
   color: var(--wl-muted);
 }
 .wl-panel-foot {
-  margin: 12px -16px -14px;
-  padding: 10px 16px;
+  margin: 12px calc(-1 * var(--wl-pad)) -14px;
+  padding: 10px var(--wl-pad);
   border-top: 1px solid var(--wl-border);
   border-radius: 0 0 7px 7px;
   background: var(--wl-sunk);
@@ -1712,7 +1753,7 @@ th[aria-sort='descending'] .wl-sort::after {
   font-size: 13px;
 }
 .wl-panel .wl-pathlist {
-  margin: 0 -16px;
+  margin: 0 calc(-1 * var(--wl-pad));
   border-left: 0;
   border-right: 0;
   border-radius: 0;
@@ -1874,4 +1915,192 @@ th[aria-sort='descending'] .wl-sort::after {
 }
 .wl-exits + .wl-panel-foot {
   margin-top: 0;
+}
+
+/* Responsive pass. Layout follows the page's own width (the wl container) or a
+   card's width, not the viewport; only the input device uses a media query. */
+
+/* Header on a phone: history arrows and Settings share a row, and the range
+   picker gets a full-width row of equal buttons. */
+@container wl (max-width: 560px) {
+  .wl-controls > .wl-settings {
+    order: 1;
+    margin-left: auto;
+  }
+  .wl-controls > .wl-range {
+    order: 2;
+    flex: 1 1 100%;
+  }
+}
+
+/* Tabs: hide the scrollbar and fade whichever edge has more tabs past it. The
+   fades follow the row's own scroll position. Browsers without scroll-driven
+   animations keep the thin scrollbar as the hint. */
+@property --wl-fade-start {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 0px;
+}
+@property --wl-fade-end {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 0px;
+}
+@supports (animation-timeline: scroll()) {
+  .wl-tabs {
+    scrollbar-width: none;
+    mask:
+      linear-gradient(#000, #000) no-clip subtract,
+      linear-gradient(to right, #000, transparent) 0 0 / var(--wl-fade-start) 100% no-repeat no-clip,
+      linear-gradient(to right, transparent, #000) 100% 0 / var(--wl-fade-end) 100% no-repeat
+        no-clip;
+    animation:
+      wl-fade-start linear both,
+      wl-fade-end linear both;
+    /* Some engines read the shorthand's missing duration as 0s, which pins
+       both fades on; auto spans the scroll range. */
+    animation-duration: auto;
+    animation-timeline: scroll(self inline);
+    animation-range:
+      0 var(--wl-fade),
+      calc(100% - var(--wl-fade)) 100%;
+  }
+  .wl-tabs::-webkit-scrollbar {
+    display: none;
+  }
+}
+@keyframes wl-fade-start {
+  to {
+    --wl-fade-start: var(--wl-fade);
+  }
+}
+@keyframes wl-fade-end {
+  from {
+    --wl-fade-end: var(--wl-fade);
+  }
+}
+
+/* Explained labels: anchor the explanation to its label and let the browser
+   flip it to whichever side has room, so it never runs off a phone screen.
+   Fixed positioning also escapes scrolling tables. Without anchor positioning
+   the explanation stays above the label, as before. */
+@supports (anchor-scope: --a) and (position-area: block-start) {
+  .wl-tip,
+  .wl th[data-tip] {
+    anchor-name: --wl-tip;
+    anchor-scope: --wl-tip;
+  }
+  .wl-tip::after,
+  .wl th[data-tip]::after {
+    position: fixed;
+    position-anchor: --wl-tip;
+    inset: auto;
+    margin: 6px 0;
+    max-width: min(280px, calc(100vw - 24px));
+    position-area: block-start span-inline-end;
+    position-try-fallbacks:
+      block-start span-inline-start,
+      block-end span-inline-end,
+      block-end span-inline-start,
+      block-start span-all;
+  }
+  .wl th[data-tip]::after {
+    position-area: block-start span-inline-start;
+  }
+}
+/* Fingers need more than the 18px line box: widen the tap area invisibly. */
+@media (pointer: coarse) {
+  .wl-tip::before {
+    content: '';
+    position: absolute;
+    inset: -13px -4px;
+  }
+  .wl-chips {
+    row-gap: 8px;
+  }
+  .wl-chip {
+    min-height: 36px;
+  }
+  .wl-chip::before {
+    content: '';
+    position: absolute;
+    inset: -4px 0;
+  }
+  .wl-explain summary {
+    padding-block: 12px;
+  }
+  .wl-footnote a {
+    display: inline-block;
+    padding-block: 12px;
+  }
+}
+
+/* Facts in an overview card: two columns when narrow; when wide, one row of
+   four, or rows of three when there are three or six, so no row has one
+   orphan. */
+.wl-card .wl-facts {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+@container card (min-width: 420px) {
+  .wl-card .wl-facts {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .wl-card .wl-facts:has(> :nth-child(3):last-child, > :nth-child(6):last-child) {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* Wide tables: tighter cells on a tablet; on a phone each row becomes a card
+   with its column names as labels, instead of a table that scrolls sideways. */
+.wl-stack {
+  container: table / inline-size;
+}
+@container table (max-width: 760px) {
+  .wl-stack .wl-table :is(th, td) {
+    padding-inline: 6px;
+  }
+}
+@container table (max-width: 540px) {
+  .wl-stack .wl-table,
+  .wl-stack .wl-table tbody,
+  .wl-stack .wl-table tr,
+  .wl-stack .wl-table th,
+  .wl-stack .wl-table td {
+    display: block;
+  }
+  .wl-stack .wl-table thead {
+    display: none;
+  }
+  .wl-stack .wl-table tr {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(64px, 1fr));
+    gap: 4px 10px;
+    padding: 10px 2px;
+    border-bottom: 1px solid var(--wl-border);
+  }
+  .wl-stack .wl-table tbody tr:last-child {
+    border-bottom: 0;
+  }
+  .wl-stack .wl-table tr > * {
+    padding: 0;
+    border: 0;
+    text-align: left;
+  }
+  .wl-stack .wl-table tbody th {
+    grid-column: 1 / -1;
+    position: static;
+    background: none;
+    white-space: normal;
+  }
+  .wl-stack .wl-table td::before {
+    content: attr(data-label);
+    display: block;
+    white-space: normal;
+    font-size: 12px;
+    color: var(--wl-muted);
+  }
+  .wl-stack .wl-table .wl-endpoint {
+    grid-column: 1 / -1;
+    overflow-wrap: anywhere;
+  }
 }
