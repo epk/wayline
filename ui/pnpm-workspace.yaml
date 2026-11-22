@@ -1,6 +1,3 @@
-overrides:
-  'vue-loader@15.11.1>@vue/component-compiler-utils': '-'
-patchedDependencies:
-  '@vue/compiler-sfc@2.7.16': patches/@vue__compiler-sfc@2.7.16.patch
-  vue-loader@15.11.1: patches/vue-loader@15.11.1.patch
-  vue@2.7.16: patches/vue@2.7.16.patch
+minimumReleaseAgeExclude:
+  - '@ui-sdk/core@0.1.0-beta.14'
+  - '@ui-sdk/react@0.1.0-beta.14'

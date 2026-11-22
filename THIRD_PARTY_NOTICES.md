@@ -1,9 +1,8 @@
 # Third-party notices
 
 Wayline uses the Rust crates in `Cargo.lock`.
-The native UI includes runtime helpers from `vue-style-loader` and `css-loader`.
-The native UI draws its latency graph with uPlot (MIT).
-`wayline-ctl` statically links SQLite (public domain) through `rusqlite` and `libsqlite3-sys`.
+The native UI bundles React and React DOM (MIT), the `scheduler` package (MIT), UI SDK (`@ui-sdk/core` and `@ui-sdk/react`, Apache-2.0), uPlot (MIT) and fzstd (MIT). Flechette (`@uwdata/flechette`, BSD-3-Clause) is used only by the preview and tests, not shipped.
+`wayline-ctl` statically links Apache Arrow and Apache Parquet for Rust (Apache-2.0) and the Zstandard library (BSD-3-Clause) through the `zstd` crates.
 The router supplies Vue, Lua, and the OpenWrt services.
 Wayline does not redistribute GL.iNet firmware or factory UI bundles.
 

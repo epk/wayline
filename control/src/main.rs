@@ -3,16 +3,24 @@
 mod api;
 mod auto;
 mod changes;
+mod clock;
+mod columnar;
+mod dimensions;
 mod doctor;
 mod egress;
+mod encoding;
 mod history;
+mod identity;
+mod journal;
 mod native;
 mod resolve;
 mod router;
 mod runtime;
 mod service;
 mod settings;
+mod telemetry;
 mod update;
+mod wifi;
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -51,7 +59,10 @@ fn run() -> Result<Value> {
     );
     match method.as_str() {
         "get_state" => reply(api::state()?),
-        "get_history" => reply(api::history(&parse(&raw)?)?),
+        "get_history" => encoding::reply(&raw, &api::history(&parse(&raw)?)?),
+        "get_wifi_history" => encoding::reply(&raw, &api::wifi_history(&parse(&raw)?)?),
+        "get_telemetry_history" => encoding::reply(&raw, &api::telemetry_history(&parse(&raw)?)?),
+        "get_diagnostics" => reply(api::checkup()?),
         "purge_history" => api::purge_history(&parse(&raw)?),
         "set_config" => api::set_config(parse(&raw)?),
         "select_tunnel" => api::select(&parse(&raw)?),
@@ -79,7 +90,8 @@ Commands for people:
   egress           Show the public egress IP through each tunnel and the WAN uplink.
 
 The admin page, the scheduler and the service manager use the remaining
-operations, which print JSON: get_state, get_history, purge_history, set_config,
+operations, which print JSON: get_state, get_history, get_wifi_history,
+get_telemetry_history, get_diagnostics, purge_history, set_config,
 select_tunnel, set_tunnel_enabled, check_update, install_update,
 tick, boot, start, stop, restart, reload, running, enabled, install, remove.";
 

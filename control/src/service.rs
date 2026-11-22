@@ -3,7 +3,7 @@ use crate::router::{self, Inventory};
 use crate::runtime;
 use crate::runtime::{DAEMON, MONITOR_CONFIG, RUNTIME, STATUS_SOCKET};
 use crate::settings::Settings;
-use crate::{auto, changes, egress, history, native, update};
+use crate::{auto, changes, dimensions, egress, history, native, update};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::fs;
@@ -12,7 +12,7 @@ use std::path::Path;
 
 fn flush() {
     if let Ok(config) = Settings::read()
-        && config.enabled
+        && config.monitoring()
     {
         let _ = history::collect(&config);
     }
@@ -60,7 +60,7 @@ pub fn reconcile() -> Result<()> {
 
 fn reconcile_inner() -> Result<()> {
     let config = Settings::read()?;
-    let inventory = (config.enabled && native::supported())
+    let inventory = (config.monitoring() && native::supported())
         .then(router::inventory)
         .transpose()?;
     apply(&config, inventory.as_ref())
@@ -76,7 +76,9 @@ pub fn restart() -> Result<()> {
 fn apply(config: &Settings, inventory: Option<&Inventory>) -> Result<()> {
     let desired = inventory
         .map(|inventory| router::monitor(config, inventory, &Resolved::read()))
-        .filter(|desired| !desired.tunnels.is_empty());
+        .filter(|desired| {
+            !desired.tunnels.is_empty() || desired.wifi.is_some() || desired.telemetry.is_some()
+        });
     let Some(desired) = desired else {
         halt();
         return Ok(());
@@ -101,6 +103,25 @@ fn apply(config: &Settings, inventory: Option<&Inventory>) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn troubled(config: &Settings) -> bool {
+    let parts = runtime::current();
+    let lossy = parts.series.iter().any(|series| {
+        series
+            .buckets
+            .last()
+            .is_some_and(|bucket| bucket.sent > 0 && bucket.lost == bucket.sent)
+    });
+    let disconnected = config.upstream_wifi
+        && parts.wifi.as_ref().is_some_and(|wifi| {
+            matches!(
+                wifi.state,
+                wayline_protocol::WifiState::Disconnected
+                    | wayline_protocol::WifiState::NoClientInterface
+            )
+        });
+    lossy || disconnected
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -148,13 +169,13 @@ pub fn tick() -> Result<()> {
 
 fn routine() -> Result<()> {
     let config = Settings::read()?;
-    let (inventory, failure) = match config.enabled.then(router::inventory) {
+    let (inventory, failure) = match config.monitoring().then(router::inventory) {
         Some(Ok(inventory)) => (Some(inventory), None),
         Some(Err(error)) => (None, Some(error)),
         None => (None, None),
     };
     let monitored = inventory.as_ref().filter(|_| native::supported());
-    if let Some(inventory) = monitored {
+    if let Some(inventory) = monitored.filter(|_| config.enabled) {
         let hosts = router::hosts(&config, inventory);
         let mut resolved = Resolved::read();
         if resolved.stale(&hosts) {
@@ -180,6 +201,10 @@ fn routine() -> Result<()> {
     let recorded = inventory
         .as_ref()
         .map_or(Ok(()), |inventory| changes::record(&config, inventory));
+    let described = inventory
+        .as_ref()
+        .filter(|_| config.monitoring())
+        .map_or(Ok(()), |inventory| dimensions::record(&config, inventory));
     refreshed?;
     let collected = format!("{RUNTIME}/last-collect");
     let last = fs::read_to_string(&collected)
@@ -187,11 +212,17 @@ fn routine() -> Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let now = runtime::now();
-    if config.enabled && (now.saturating_sub(last) >= 300 || now < last) {
+    let interval = if config.monitoring() && troubled(&config) {
+        60
+    } else {
+        300
+    };
+    if config.monitoring() && (now.saturating_sub(last) >= interval || now < last) {
         let result = history::collect(&config);
         wayline_support::atomic(Path::new(&collected), now.to_string().as_bytes())?;
         result?;
     }
     let _ = auto::step(&config);
-    failure.map_or(recorded, Err)
+    let outcome = recorded.and(described);
+    failure.map_or(outcome, Err)
 }

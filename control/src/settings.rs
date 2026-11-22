@@ -35,6 +35,8 @@ pub struct Settings {
     #[serde(deserialize_with = "tunnel_list")]
     pub auto_tunnels: Vec<String>,
     pub endpoint_diagnostics: bool,
+    pub upstream_wifi: bool,
+    pub telemetry: bool,
 }
 
 fn tunnel_list<'de, D: serde::Deserializer<'de>>(
@@ -64,6 +66,8 @@ impl Default for Settings {
             auto_exit: false,
             auto_tunnels: Vec::new(),
             endpoint_diagnostics: false,
+            upstream_wifi: false,
+            telemetry: false,
         }
     }
 }
@@ -149,6 +153,10 @@ impl Settings {
         };
         value.validate()?;
         Ok(value)
+    }
+
+    pub const fn monitoring(&self) -> bool {
+        self.enabled || self.upstream_wifi || self.telemetry
     }
 
     pub fn primary(&self) -> &Target {

@@ -21,3 +21,5 @@ __pycache__/
 /.claude/
 /.agents/
 /.hallmark/
+/ui/preview/dist/
+/ui/views/

@@ -199,6 +199,7 @@ pub fn build(version: &str) -> Result<()> {
         views.join("gl-sdk4-ui-wayline.common.js.gz"),
         gzip.finish()?,
     )?;
+    install_chunks(Path::new("ui/views/wayline"), &views.join("wayline"))?;
     let metadata = root.join("usr/share/wayline");
     fs::create_dir_all(&metadata)?;
     fs::write(metadata.join("version"), format!("{version}\n"))?;
@@ -365,13 +366,60 @@ fn licenses(version: &str) -> Result<()> {
             &["LICENSE", "COPYING", "NOTICE"],
         )?;
     }
-    for name in ["vue-style-loader", "css-loader", "uplot"] {
-        copy_licenses(
-            &Path::new("ui/node_modules").join(name),
-            &output.join(name),
-            &["LICENSE"],
-        )?;
+    for name in UI_PACKAGES {
+        let direct = Path::new("ui/node_modules").join(name);
+        let source = if direct.exists() {
+            direct
+        } else {
+            Path::new("ui/node_modules/.pnpm/node_modules").join(name)
+        };
+        copy_licenses(&source, &output.join(name), &["LICENSE"])?;
+        ensure!(
+            fs::read_dir(output.join(name))?.next().is_some(),
+            "No license file found for {name}."
+        );
     }
+    Ok(())
+}
+
+const UI_PACKAGES: [&str; 7] = [
+    "react",
+    "react-dom",
+    "scheduler",
+    "@ui-sdk/core",
+    "@ui-sdk/react",
+    "fzstd",
+    "uplot",
+];
+
+fn install_chunks(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    let mut core = false;
+    for item in
+        fs::read_dir(source).context("Build the page first: ui/views/wayline is missing.")?
+    {
+        let path = item?.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Invalid page chunk name.")?
+            .to_owned();
+        if Path::new(&name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("zst"))
+        {
+            core |= name.starts_with("core-");
+            fs::copy(&path, destination.join(&name))?;
+        } else if Path::new(&name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("js"))
+        {
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::best());
+            gzip.write_all(&fs::read(&path)?)?;
+            fs::write(destination.join(format!("{name}.gz")), gzip.finish()?)?;
+        }
+    }
+    ensure!(core, "The page build has no core chunk.");
     Ok(())
 }
 
@@ -426,7 +474,28 @@ pub fn release(version: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apk_version, artifact};
+    use super::{apk_version, artifact, install_chunks};
+    use std::fs;
+
+    #[test]
+    fn page_chunks_install_as_zstd_and_gzip_fallback() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("build");
+        fs::create_dir(&source)?;
+        fs::write(source.join("core-abc.js"), b"export const a = 1;")?;
+        fs::write(source.join("core-abc.js.zst"), b"zstd")?;
+        fs::write(source.join("size-report.json"), b"{}")?;
+        let destination = directory.path().join("www/views/wayline");
+        install_chunks(&source, &destination)?;
+        let mut names: Vec<String> = fs::read_dir(&destination)?
+            .map(|item| Ok(item?.file_name().to_string_lossy().into_owned()))
+            .collect::<anyhow::Result<_>>()?;
+        names.sort();
+        assert_eq!(names, ["core-abc.js.gz", "core-abc.js.zst"]);
+        fs::remove_file(source.join("core-abc.js.zst"))?;
+        assert!(install_chunks(&source, &directory.path().join("other")).is_err());
+        Ok(())
+    }
 
     #[test]
     fn apk_versions_keep_release_order() -> anyhow::Result<()> {

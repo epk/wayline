@@ -3,6 +3,9 @@ local rpc = require('oui.rpc')
 local methods = {
     'get_state',
     'get_history',
+    'get_wifi_history',
+    'get_telemetry_history',
+    'get_diagnostics',
     'purge_history',
     'set_config',
     'select_tunnel',

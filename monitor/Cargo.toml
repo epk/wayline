@@ -1,6 +1,6 @@
 [package]
 name = "waylined"
-version = "0.1.0-alpha.24"
+version = "0.1.0-alpha.25"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
@@ -10,11 +10,12 @@ autobenches = false
 [[bin]]
 name = "waylined"
 path = "src/main.rs"
-test = false
+test = true
 bench = false
 
 [dependencies]
 wayline-protocol.workspace = true
+wayline-support.workspace = true
 rustix = { workspace = true, features = ["process", "event"] }
 serde_json.workspace = true
 socket2.workspace = true

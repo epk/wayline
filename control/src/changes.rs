@@ -1,8 +1,10 @@
 use crate::egress::Cache;
 use crate::history;
+use crate::journal::{self, Cell, Field, Record, Type, millis};
 use crate::router::{Inventory, PathInfo};
 use crate::runtime;
 use crate::settings::Settings;
+use crate::wifi;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -10,11 +12,12 @@ use std::iter;
 use std::path::Path;
 
 pub const RECENT: usize = 50;
-const MAX_EVENTS: usize = 100;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub at: u64,
+    #[serde(default)]
+    pub seq: u64,
     pub subject: String,
     pub kind: String,
     pub text: String,
@@ -27,9 +30,64 @@ pub struct Fact<'subject> {
     fields: BTreeMap<&'static str, String>,
 }
 
-pub fn read(config: &Settings) -> Vec<Event> {
-    let mut events: Vec<Event> =
-        runtime::load(history::database(config).with_file_name("events.json"));
+impl Record for Event {
+    const KIND: &'static str = "event";
+    const DESCRIPTION: &'static str = "Changes Wayline noticed: endpoints, profiles, addresses, uplinks, exit IPs and upstream Wi-Fi";
+    const FIELDS: &'static [Field] = &[
+        Field {
+            name: "ts",
+            kind: Type::Time,
+            description: "UTC time the change was noticed",
+        },
+        Field {
+            name: "seq",
+            kind: Type::Integer,
+            description: "Increasing event number, kept across purges",
+        },
+        Field {
+            name: "subject",
+            kind: Type::Text,
+            description: "Tunnel key, wan, uplink id, wifi or history",
+        },
+        Field {
+            name: "kind",
+            kind: Type::Text,
+            description: "What changed: server, profile, interface, address, uplink, egress, network, access_point, channel, clock or history",
+        },
+        Field {
+            name: "text",
+            kind: Type::Text,
+            description: "Sentence shown on the page",
+        },
+    ];
+
+    fn at(&self) -> u64 {
+        self.at
+    }
+
+    fn cells(&self) -> Vec<Cell> {
+        vec![
+            millis(self.at),
+            Cell::Number(i64::try_from(self.seq).ok()),
+            Cell::Text(self.subject.clone()),
+            Cell::Text(self.kind.clone()),
+            Cell::Text(self.text.clone()),
+        ]
+    }
+
+    fn from_cells(cells: Vec<Cell>) -> Option<Self> {
+        let mut cells = cells.into_iter();
+        Some(Self {
+            at: cells.next()?.millis()?,
+            seq: cells.next()?.millis().unwrap_or(0),
+            subject: cells.next()?.text()?,
+            kind: cells.next()?.text()?,
+            text: cells.next()?.text()?,
+        })
+    }
+}
+
+fn reworded(mut events: Vec<Event>) -> Vec<Event> {
     for event in &mut events {
         if event.kind == "server" {
             event.text =
@@ -38,7 +96,22 @@ pub fn read(config: &Settings) -> Vec<Event> {
                     .replacen("Server address changed", "VPN server endpoint changed", 1);
         }
     }
+    events.sort_by_key(|event| (event.at, event.seq));
     events
+}
+
+pub fn read(config: &Settings, range: (u64, u64)) -> Vec<Event> {
+    let found = journal::read::<Event>(&history::root(config), range).unwrap_or_default();
+    reworded(
+        found
+            .into_iter()
+            .filter(|event| (range.0..=range.1).contains(&event.at))
+            .collect(),
+    )
+}
+
+pub fn recent(config: &Settings, count: usize) -> Vec<Event> {
+    reworded(journal::newest::<Event>(&history::root(config), count).unwrap_or_default())
 }
 
 fn fact<'a, const N: usize>(
@@ -116,6 +189,8 @@ fn describe(label: &str, field: &str, before: &str, after: &str) -> String {
         "server" => format!("{label} endpoint changed from {before} to {after}."),
         "egress" => format!("{label} public exit IP changed from {before} to {after}."),
         "address" => format!("{label} address changed from {before} to {after}."),
+        "network" => format!("{label} network changed from {before} to {after}."),
+        "access_point" => format!("{label} access point changed from {before} to {after}."),
         _ => format!("{label} {field} changed from {before} to {after}."),
     }
 }
@@ -130,15 +205,24 @@ pub fn diff(at: u64, stored: &mut BTreeMap<String, String>, facts: &[Fact]) -> (
             Some(previous) => {
                 let before: BTreeMap<String, String> =
                     serde_json::from_str(previous).unwrap_or_default();
-                events.extend(fact.fields.iter().filter_map(|(field, after)| {
-                    let old = before.get(*field).filter(|old| *old != after)?;
-                    Some(Event {
-                        at,
-                        subject: fact.subject.into(),
-                        kind: (*field).into(),
-                        text: describe(fact.label, field, old, after),
+                let mut found: Vec<Event> = fact
+                    .fields
+                    .iter()
+                    .filter_map(|(field, after)| {
+                        let old = before.get(*field).filter(|old| *old != after)?;
+                        Some(Event {
+                            at,
+                            seq: 0,
+                            subject: fact.subject.into(),
+                            kind: (*field).into(),
+                            text: describe(fact.label, field, old, after),
+                        })
                     })
-                }));
+                    .collect();
+                if found.iter().any(|event| event.kind == "network") {
+                    found.retain(|event| event.kind == "network");
+                }
+                events.extend(found);
                 *previous = encoded;
                 changed = true;
             }
@@ -152,12 +236,12 @@ pub fn diff(at: u64, stored: &mut BTreeMap<String, String>, facts: &[Fact]) -> (
 }
 
 pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
-    runtime::locked("history", || record_inner(config, inventory))
+    runtime::writing("history", || record_inner(config, inventory))
 }
 
 fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
-    let database = history::database(config);
-    let facts_path = database.with_file_name("facts.json");
+    let root = history::root(config);
+    let facts_path = root.join("facts.json");
     runtime::directory(facts_path.parent().context("Invalid history directory.")?)?;
     let mut stored: BTreeMap<String, String> = runtime::load(&facts_path);
     let cache = Cache::view(config, inventory);
@@ -177,23 +261,68 @@ fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
             [("egress", ip.clone())],
         ))
     }));
+    if config.upstream_wifi
+        && let Some(status) = runtime::current().wifi
+        && let Some(link) = status.link
+    {
+        let network = if link.ssid.is_empty() {
+            "a hidden network".to_owned()
+        } else {
+            link.ssid.clone()
+        };
+        current.push(fact(
+            "wifi:upstream".into(),
+            wifi::SUBJECT,
+            "Upstream Wi-Fi",
+            [
+                ("network", network),
+                ("access_point", link.bssid.clone()),
+                ("channel", wifi::channel(&link)),
+            ],
+        ));
+    }
     let (added, changed) = diff(runtime::now() * 1000, &mut stored, &current);
     if changed {
         runtime::store(&facts_path, &stored)?;
     }
     if !added.is_empty() {
-        append(&database, added)?;
+        append(&root, added)?;
     }
     Ok(())
 }
 
-pub fn append(database: &Path, added: impl IntoIterator<Item = Event>) -> Result<()> {
-    let path = database.with_file_name("events.json");
-    let mut events: Vec<Event> = runtime::load(&path);
-    events.extend(added);
-    let excess = events.len().saturating_sub(MAX_EVENTS);
-    events.drain(..excess);
-    runtime::store(&path, &events)
+#[cfg(not(test))]
+fn sequence_path(_: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/wayline/sequence.json")
+}
+
+#[cfg(test)]
+fn sequence_path(root: &Path) -> std::path::PathBuf {
+    root.join("sequence.json")
+}
+
+pub fn append(root: &Path, added: impl IntoIterator<Item = Event>) -> Result<()> {
+    let counter = sequence_path(root);
+    let stored = journal::newest::<Event>(root, 1)?;
+    let last: u64 =
+        runtime::load::<u64>(&counter).max(stored.iter().map(|event| event.seq).max().unwrap_or(0));
+    let mut next = last;
+    let events: Vec<Event> = added
+        .into_iter()
+        .map(|mut event| {
+            next += 1;
+            event.seq = next;
+            event
+        })
+        .collect();
+    if events.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = counter.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    runtime::store(&counter, &next)?;
+    journal::append(root, events)
 }
 
 #[cfg(test)]
@@ -243,6 +372,70 @@ mod tests {
         ensure!(events.len() == 1 && events[0].kind == "egress");
         ensure!(
             events[0].text == "Tunnel A public exit IP changed from 203.0.113.1 to 203.0.113.2."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wifi_network_changes_report_one_event() -> Result<()> {
+        let link = |network: &str, access_point: &str, channel: &str| {
+            vec![fact(
+                "wifi:upstream".into(),
+                "wifi",
+                "Upstream Wi-Fi",
+                [
+                    ("network", network.into()),
+                    ("access_point", access_point.into()),
+                    ("channel", channel.into()),
+                ],
+            )]
+        };
+        let mut stored = BTreeMap::new();
+        diff(
+            1,
+            &mut stored,
+            &link("Hotel", "aa:aa:aa:aa:aa:01", "36 · 5 GHz · 80 MHz"),
+        );
+        let (events, _) = diff(
+            2,
+            &mut stored,
+            &link("Hotel", "aa:aa:aa:aa:aa:02", "36 · 5 GHz · 80 MHz"),
+        );
+        ensure!(events.len() == 1 && events[0].kind == "access_point");
+        ensure!(
+            events[0].text
+                == "Upstream Wi-Fi access point changed from aa:aa:aa:aa:aa:01 to aa:aa:aa:aa:aa:02."
+        );
+        let (events, _) = diff(
+            3,
+            &mut stored,
+            &link("Cafe", "bb:bb:bb:bb:bb:01", "6 · 2.4 GHz · 20 MHz"),
+        );
+        ensure!(
+            events.len() == 1
+                && events[0].text == "Upstream Wi-Fi network changed from Hotel to Cafe."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn appended_events_get_increasing_sequence_numbers() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let at = crate::runtime::now() * 1_000;
+        let event = |text: &str| super::Event {
+            at,
+            seq: 0,
+            subject: "a".into(),
+            kind: "k".into(),
+            text: text.into(),
+        };
+        super::append(directory.path(), [event("one"), event("two")])?;
+        std::fs::remove_dir_all(directory.path().join("kind=event"))?;
+        super::append(directory.path(), [event("three")])?;
+        let events: Vec<super::Event> = crate::journal::all(directory.path())?;
+        ensure!(
+            events.len() == 1 && events[0].seq == 3,
+            "Sequence restarted after a purge."
         );
         Ok(())
     }
