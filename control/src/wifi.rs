@@ -393,9 +393,9 @@ fn query_inner(config: &Settings, query: &Query) -> Result<Response> {
     for period in first..=last {
         columns.push(&point(periods.get(&period), step));
     }
-    let events = changes::read(config)
+    let events = changes::read(config, (query.start, query.end))
         .into_iter()
-        .filter(|event| event.subject == SUBJECT && (query.start..=query.end).contains(&event.at))
+        .filter(|event| event.subject == SUBJECT)
         .collect();
     Ok(Response {
         start: first * step * 1_000,

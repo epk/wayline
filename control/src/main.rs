@@ -11,6 +11,7 @@ mod egress;
 mod encoding;
 mod history;
 mod identity;
+mod journal;
 mod native;
 mod resolve;
 mod router;

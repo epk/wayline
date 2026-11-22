@@ -860,8 +860,10 @@ mod tests {
             row == vec![Some(7), None, None, None],
             "Older file read as {row:?}"
         );
-        let events = root.join("events.json");
-        ensure!(!events.exists(), "A readable file was treated as damaged.");
+        ensure!(
+            !root.join("kind=event").exists(),
+            "A readable file was treated as damaged."
+        );
         store(root, 7, &TEST, &[entry("a", at + 15, 3)], now)?;
         let back = series(root, &NARROW, 15, (at / 15, at / 15 + 1), &[])?;
         ensure!(back.get("a").map_or(0, std::collections::BTreeMap::len) == 2);
@@ -881,8 +883,8 @@ mod tests {
         let read = series(root, &TEST, 15, (at / 15, at / 15), &[])?;
         ensure!(read.is_empty(), "A damaged chunk was read.");
         ensure!(dir.join(format!("{name}.parquet.broken")).exists());
-        let events = fs::read_to_string(root.join("events.json"))?;
-        ensure!(events.contains("damaged"));
+        let events: Vec<crate::changes::Event> = crate::journal::all(root)?;
+        ensure!(events.iter().any(|event| event.text.contains("damaged")));
         store(root, 7, &TEST, &[entry("a", at, 3)], now)?;
         ensure!(!series(root, &TEST, 15, (at / 15, at / 15), &[])?.is_empty());
         Ok(())

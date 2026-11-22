@@ -1,5 +1,6 @@
 use crate::egress::Cache;
 use crate::history;
+use crate::journal::{self, Cell, Field, Record, Type, millis};
 use crate::router::{Inventory, PathInfo};
 use crate::runtime;
 use crate::settings::Settings;
@@ -11,9 +12,8 @@ use std::iter;
 use std::path::Path;
 
 pub const RECENT: usize = 50;
-const MAX_EVENTS: usize = 100;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub at: u64,
     #[serde(default)]
@@ -30,8 +30,64 @@ pub struct Fact<'subject> {
     fields: BTreeMap<&'static str, String>,
 }
 
-pub fn read(config: &Settings) -> Vec<Event> {
-    let mut events: Vec<Event> = runtime::load(history::root(config).join("events.json"));
+impl Record for Event {
+    const KIND: &'static str = "event";
+    const DESCRIPTION: &'static str = "Changes Wayline noticed: endpoints, profiles, addresses, uplinks, exit IPs and upstream Wi-Fi";
+    const FIELDS: &'static [Field] = &[
+        Field {
+            name: "ts",
+            kind: Type::Time,
+            description: "UTC time the change was noticed",
+        },
+        Field {
+            name: "seq",
+            kind: Type::Integer,
+            description: "Increasing event number, kept across purges",
+        },
+        Field {
+            name: "subject",
+            kind: Type::Text,
+            description: "Tunnel key, wan, uplink id, wifi or history",
+        },
+        Field {
+            name: "kind",
+            kind: Type::Text,
+            description: "What changed: server, profile, interface, address, uplink, egress, network, access_point, channel, clock or history",
+        },
+        Field {
+            name: "text",
+            kind: Type::Text,
+            description: "Sentence shown on the page",
+        },
+    ];
+
+    fn at(&self) -> u64 {
+        self.at
+    }
+
+    fn cells(&self) -> Vec<Cell> {
+        vec![
+            millis(self.at),
+            Cell::Number(i64::try_from(self.seq).ok()),
+            Cell::Text(self.subject.clone()),
+            Cell::Text(self.kind.clone()),
+            Cell::Text(self.text.clone()),
+        ]
+    }
+
+    fn from_cells(cells: Vec<Cell>) -> Option<Self> {
+        let mut cells = cells.into_iter();
+        Some(Self {
+            at: cells.next()?.millis()?,
+            seq: cells.next()?.millis().unwrap_or(0),
+            subject: cells.next()?.text()?,
+            kind: cells.next()?.text()?,
+            text: cells.next()?.text()?,
+        })
+    }
+}
+
+fn reworded(mut events: Vec<Event>) -> Vec<Event> {
     for event in &mut events {
         if event.kind == "server" {
             event.text =
@@ -40,7 +96,22 @@ pub fn read(config: &Settings) -> Vec<Event> {
                     .replacen("Server address changed", "VPN server endpoint changed", 1);
         }
     }
+    events.sort_by_key(|event| (event.at, event.seq));
     events
+}
+
+pub fn read(config: &Settings, range: (u64, u64)) -> Vec<Event> {
+    let found = journal::read::<Event>(&history::root(config), range).unwrap_or_default();
+    reworded(
+        found
+            .into_iter()
+            .filter(|event| (range.0..=range.1).contains(&event.at))
+            .collect(),
+    )
+}
+
+pub fn recent(config: &Settings, count: usize) -> Vec<Event> {
+    reworded(journal::newest::<Event>(&history::root(config), count).unwrap_or_default())
 }
 
 fn fact<'a, const N: usize>(
@@ -231,27 +302,27 @@ fn sequence_path(root: &Path) -> std::path::PathBuf {
 }
 
 pub fn append(root: &Path, added: impl IntoIterator<Item = Event>) -> Result<()> {
-    let path = root.join("events.json");
-    let mut events: Vec<Event> = runtime::load(&path);
     let counter = sequence_path(root);
+    let stored = journal::newest::<Event>(root, 1)?;
     let last: u64 =
-        runtime::load::<u64>(&counter).max(events.iter().map(|event| event.seq).max().unwrap_or(0));
+        runtime::load::<u64>(&counter).max(stored.iter().map(|event| event.seq).max().unwrap_or(0));
     let mut next = last;
-    events.extend(added.into_iter().map(|mut event| {
-        next += 1;
-        event.seq = next;
-        event
-    }));
-    if next == last {
+    let events: Vec<Event> = added
+        .into_iter()
+        .map(|mut event| {
+            next += 1;
+            event.seq = next;
+            event
+        })
+        .collect();
+    if events.is_empty() {
         return Ok(());
     }
     if let Some(parent) = counter.parent() {
         std::fs::create_dir_all(parent)?;
     }
     runtime::store(&counter, &next)?;
-    let excess = events.len().saturating_sub(MAX_EVENTS);
-    events.drain(..excess);
-    runtime::store(&path, &events)
+    journal::append(root, events)
 }
 
 #[cfg(test)]
@@ -350,17 +421,18 @@ mod tests {
     #[test]
     fn appended_events_get_increasing_sequence_numbers() -> Result<()> {
         let directory = tempfile::tempdir()?;
+        let at = crate::runtime::now() * 1_000;
         let event = |text: &str| super::Event {
-            at: 1,
+            at,
             seq: 0,
             subject: "a".into(),
             kind: "k".into(),
             text: text.into(),
         };
         super::append(directory.path(), [event("one"), event("two")])?;
-        std::fs::remove_file(directory.path().join("events.json"))?;
+        std::fs::remove_dir_all(directory.path().join("kind=event"))?;
         super::append(directory.path(), [event("three")])?;
-        let events: Vec<super::Event> = crate::runtime::load(directory.path().join("events.json"));
+        let events: Vec<super::Event> = crate::journal::all(directory.path())?;
         ensure!(
             events.len() == 1 && events[0].seq == 3,
             "Sequence restarted after a purge."

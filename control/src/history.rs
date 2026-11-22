@@ -1,5 +1,6 @@
 use crate::changes::{self, Event};
 use crate::columnar::{self, Entry};
+use crate::journal::{self, Cell, Field, Record, Type, millis};
 use crate::router;
 use crate::router::Inventory;
 use crate::runtime;
@@ -847,6 +848,7 @@ fn collect_inner(config: &Settings) -> Result<()> {
         return Ok(());
     }
     let days = config.history_days;
+    let migrated = migrate(&root);
     let flushed = flush_pending(&root, days, now, snapshot.clock.as_ref());
     let prefixes = persist(
         &root,
@@ -857,7 +859,32 @@ fn collect_inner(config: &Settings) -> Result<()> {
         snapshot.telemetry.as_ref(),
     )?;
     publish(&known_cache(), &prefixes)?;
-    flushed
+    flushed.and(migrated)
+}
+
+fn migrate(root: &Path) -> Result<()> {
+    let events = root.join("events.json");
+    if events.exists() {
+        let old: Vec<Event> = runtime::load(&events);
+        let known = journal::all::<Event>(root)?;
+        journal::append(
+            root,
+            old.into_iter()
+                .filter(|event| !known.contains(event))
+                .collect(),
+        )?;
+        remove(&events)?;
+    }
+    let incidents = incidents_path(root);
+    if incidents.exists() {
+        let old: Vec<Logged> = runtime::load(&incidents);
+        journal::update::<Logged>(root, |stored| merge_incidents(stored, old))?;
+        remove(&incidents)?;
+    }
+    for name in LEGACY {
+        remove(&root.join(name))?;
+    }
+    Ok(())
 }
 
 fn persist(
@@ -889,11 +916,14 @@ fn persist(
     });
     let logged = record_incidents(root, ring, buckets);
     let prefixes = store(root, days, now, ring)?;
-    wifi.and(system).and(links).and(logged)?;
+    let kept = longest(days);
+    let expired = journal::expire::<Event>(root, kept, now)
+        .and_then(|()| journal::expire::<Logged>(root, kept, now));
+    wifi.and(system).and(links).and(logged).and(expired)?;
     Ok(prefixes)
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Logged {
     pub series: String,
     pub kind: String,
@@ -901,7 +931,55 @@ pub struct Logged {
     pub end: Option<u64>,
 }
 
-const MAX_INCIDENTS: usize = 200;
+impl Record for Logged {
+    const KIND: &'static str = "incident";
+    const DESCRIPTION: &'static str = "Outages found at 15-second resolution: runs of buckets where every probe was lost, or where upstream Wi-Fi was disconnected";
+    const FIELDS: &'static [Field] = &[
+        Field {
+            name: "ts",
+            kind: Type::Time,
+            description: "UTC start of the first affected bucket",
+        },
+        Field {
+            name: "end",
+            kind: Type::OptionalTime,
+            description: "UTC end of the last affected bucket; null while ongoing",
+        },
+        Field {
+            name: "series",
+            kind: Type::Text,
+            description: "Latency series key, or wifi",
+        },
+        Field {
+            name: "kind",
+            kind: Type::Text,
+            description: "loss or wifi",
+        },
+    ];
+
+    fn at(&self) -> u64 {
+        self.start
+    }
+
+    fn cells(&self) -> Vec<Cell> {
+        vec![
+            millis(self.start),
+            Cell::Number(self.end.and_then(|end| i64::try_from(end).ok())),
+            Cell::Text(self.series.clone()),
+            Cell::Text(self.kind.clone()),
+        ]
+    }
+
+    fn from_cells(cells: Vec<Cell>) -> Option<Self> {
+        let mut cells = cells.into_iter();
+        Some(Self {
+            start: cells.next()?.millis()?,
+            end: cells.next()?.millis(),
+            series: cells.next()?.text()?,
+            kind: cells.next()?.text()?,
+        })
+    }
+}
 
 pub fn ring_incidents(ring: &[Series], wifi: &[WifiBucket], now: u64) -> Vec<Logged> {
     let mut found = Vec::new();
@@ -970,43 +1048,60 @@ pub fn merge_incidents(stored: &mut Vec<Logged>, fresh: Vec<Logged>) {
         }
     }
     stored.sort_by_key(|incident| incident.start);
-    let excess = stored.len().saturating_sub(MAX_INCIDENTS);
-    stored.drain(..excess);
 }
 
 fn incidents_path(root: &Path) -> PathBuf {
     root.join("incidents.json")
 }
 
-fn record_incidents(path: &Path, ring: &[Series], wifi: &[WifiBucket]) -> Result<()> {
-    let file = incidents_path(path);
-    let mut stored: Vec<Logged> = runtime::load(&file);
-    let before = stored.clone();
-    merge_incidents(
-        &mut stored,
-        ring_incidents(ring, wifi, runtime::now() * 1_000),
-    );
-    if stored != before {
-        runtime::store(&file, &stored)?;
+fn record_incidents(root: &Path, ring: &[Series], wifi: &[WifiBucket]) -> Result<()> {
+    let fresh = ring_incidents(ring, wifi, runtime::now() * 1_000);
+    if fresh.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    journal::update::<Logged>(root, |stored| merge_incidents(stored, fresh))
 }
 
-pub fn logged_incidents(config: &Settings, ring: &[Series], wifi: &[WifiBucket]) -> Vec<Logged> {
-    let mut stored: Vec<Logged> = runtime::load(incidents_path(&root(config)));
+fn overlapping(logged: &Logged, (start, end): (u64, u64)) -> bool {
+    logged.start <= end && logged.end.is_none_or(|stop| stop >= start)
+}
+
+pub fn logged_incidents(
+    config: &Settings,
+    ring: &[Series],
+    wifi: &[WifiBucket],
+    range: (u64, u64),
+) -> Vec<Logged> {
+    let mut stored: Vec<Logged> = journal::read(&root(config), range).unwrap_or_default();
     merge_incidents(
         &mut stored,
         ring_incidents(ring, wifi, runtime::now() * 1_000),
     );
+    stored.retain(|logged| overlapping(logged, range));
     stored
 }
 
 pub fn report(config: &Settings) -> Report {
     let root = root(config);
+    let mut lines = columnar::report(&root);
+    lines.push(journal::report::<Event>(&root));
+    lines.push(journal::report::<Logged>(&root));
+    let legacy: Vec<&str> = LEGACY
+        .iter()
+        .chain(&["events.json", "incidents.json"])
+        .filter(|name| root.join(name).exists())
+        .copied()
+        .collect();
+    if !legacy.is_empty() {
+        lines.push(format!(
+            "history legacy files awaiting removal: {}",
+            legacy.join(", ")
+        ));
+    }
     Report {
         bytes: columnar::bytes(&root),
         cap: columnar::cap(&root),
-        lines: columnar::report(&root),
+        lines,
     }
 }
 
@@ -1087,6 +1182,62 @@ fn lines(
         .collect())
 }
 
+type Identities = BTreeMap<String, (String, String)>;
+
+fn stored_outages(
+    root: &Path,
+    ring: &[Series],
+    subjects: &[Subject],
+    range: (u64, u64),
+) -> Result<(Identities, Vec<Logged>)> {
+    let identities = subjects
+        .iter()
+        .filter(|subject| !subject.id.starts_with("endpoint:"))
+        .map(|subject| {
+            (
+                subject.identity.clone(),
+                (subject.id.clone(), subject.name.clone()),
+            )
+        })
+        .collect();
+    let logged = journal::read::<Logged>(root, range)?
+        .into_iter()
+        .chain(ring_incidents(ring, &[], runtime::now() * 1_000))
+        .filter(|logged| logged.kind == "loss" && overlapping(logged, range))
+        .collect();
+    Ok((identities, logged))
+}
+
+fn add_logged(
+    incidents: &mut Vec<Incident>,
+    identities: &Identities,
+    logged: Vec<Logged>,
+    detail: &str,
+) {
+    let mut merged: Vec<Logged> = Vec::new();
+    merge_incidents(&mut merged, logged);
+    for logged in merged {
+        let Some((id, name)) = identities.get(&logged.series) else {
+            continue;
+        };
+        let covered = incidents.iter().any(|known| {
+            known.subject == *id
+                && known.start <= logged.end.unwrap_or(u64::MAX)
+                && known.end.is_none_or(|end| end >= logged.start)
+        });
+        if !covered {
+            incidents.push(Incident {
+                subject: id.clone(),
+                name: name.clone(),
+                kind: "loss".into(),
+                start: logged.start,
+                end: logged.end,
+                detail: detail.into(),
+            });
+        }
+    }
+}
+
 pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {
     runtime::reading("history", || query_inner(config, inventory, query))
 }
@@ -1149,7 +1300,10 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
             identity: router::series_id(wan.prefix(), target),
         });
     }
-    let tracks = lines(&root(config), step, query, &fresh_ring()?, subjects)?;
+    let ring = fresh_ring()?;
+    let (identities, logged) =
+        stored_outages(&root(config), &ring, &subjects, (query.start, query.end))?;
+    let tracks = lines(&root(config), step, query, &ring, subjects)?;
     let start = query.start / 1_000 / step * step * 1_000;
     let detail = format!("Every probe to {target} was lost");
     let now = runtime::now() * 1_000;
@@ -1171,12 +1325,10 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
             )
         })
         .collect();
+    add_logged(&mut incidents, &identities, logged, &detail);
     incidents.sort_by_key(|incident| std::cmp::Reverse(incident.start));
     let count = usize::try_from(query.end / 1_000 / step - query.start / 1_000 / step + 1)?;
-    let events = changes::read(config)
-        .into_iter()
-        .filter(|event| (query.start..=query.end).contains(&event.at))
-        .collect();
+    let events = changes::read(config, (query.start, query.end));
     Ok(Response {
         start,
         step,
@@ -1189,7 +1341,10 @@ fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{DAY, HOUR, LATENCY, Line, Query, Subject, collect_at, lines, outages, resolution};
+    use super::{
+        DAY, HOUR, LATENCY, Line, Logged, Query, Subject, collect_at, lines, migrate, outages,
+        resolution,
+    };
     use crate::columnar;
     use crate::runtime;
     use anyhow::{Result, ensure};
@@ -1237,6 +1392,55 @@ mod tests {
             },
             uptime_ms: 0,
         }
+    }
+
+    #[test]
+    fn json_logs_move_into_parquet_and_legacy_files_go() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let now = runtime::now() * 1_000;
+        let event = |seq: u64, text: &str| crate::changes::Event {
+            at: now - seq * 1_000,
+            seq,
+            subject: "a".into(),
+            kind: "server".into(),
+            text: text.into(),
+        };
+        runtime::store(
+            root.join("events.json"),
+            &vec![event(2, "two"), event(1, "one")],
+        )?;
+        let incident = Logged {
+            series: "t:a".into(),
+            kind: "loss".into(),
+            start: now - 60_000,
+            end: Some(now - 30_000),
+        };
+        runtime::store(root.join("incidents.json"), &vec![incident.clone()])?;
+        std::fs::write(root.join("latency.sqlite"), b"old")?;
+        std::fs::write(root.join("latency.sqlite-journal"), b"old")?;
+        crate::changes::append(root, [event(0, "three")])?;
+        migrate(root)?;
+        for name in [
+            "events.json",
+            "incidents.json",
+            "latency.sqlite",
+            "latency.sqlite-journal",
+        ] {
+            ensure!(!root.join(name).exists(), "{name} was left behind.");
+        }
+        let events: Vec<crate::changes::Event> = crate::journal::all(root)?;
+        ensure!(
+            events.len() == 3,
+            "Expected 3 events, found {}.",
+            events.len()
+        );
+        let logged: Vec<Logged> = crate::journal::all(root)?;
+        ensure!(logged == vec![incident], "Incidents did not migrate.");
+        migrate(root)?;
+        let again: Vec<crate::changes::Event> = crate::journal::all(root)?;
+        ensure!(again.len() == 3, "A second run duplicated events.");
+        Ok(())
     }
 
     #[test]

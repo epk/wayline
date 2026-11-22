@@ -494,21 +494,21 @@ fn incidents(
             .collect();
     let buckets = wifi.map(|wifi| wifi.buckets.as_slice()).unwrap_or_default();
     let since = (runtime::now() * 1_000).saturating_sub(INCIDENT_WINDOW);
-    let mut found: Vec<history::Incident> = history::logged_incidents(config, snapshot, buckets)
-        .into_iter()
-        .filter(|logged| logged.end.is_none_or(|end| end >= since))
-        .filter_map(|logged| {
-            let (subject, name, detail) = names.get(&logged.series)?.clone();
-            Some(history::Incident {
-                subject,
-                name,
-                kind: logged.kind,
-                start: logged.start,
-                end: logged.end,
-                detail,
+    let mut found: Vec<history::Incident> =
+        history::logged_incidents(config, snapshot, buckets, (since, runtime::now() * 1_000))
+            .into_iter()
+            .filter_map(|logged| {
+                let (subject, name, detail) = names.get(&logged.series)?.clone();
+                Some(history::Incident {
+                    subject,
+                    name,
+                    kind: logged.kind,
+                    start: logged.start,
+                    end: logged.end,
+                    detail,
+                })
             })
-        })
-        .collect();
+            .collect();
     found.sort_by_key(|incident| std::cmp::Reverse(incident.start));
     found.truncate(50);
     found
@@ -605,10 +605,9 @@ pub fn state() -> Result<State> {
             tunnel.preferred && tunnel.enabled && config.auto_tunnels.contains(&tunnel.monitor_id)
         });
     let auto_record = auto::Record::read();
-    let events = changes::read(&config)
+    let events = changes::recent(&config, changes::RECENT)
         .into_iter()
         .rev()
-        .take(changes::RECENT)
         .collect();
     let state = State {
         version: runtime::version(),

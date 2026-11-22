@@ -34,8 +34,16 @@ Parquet at rest, Arrow in motion.
     kind=latency/step=15/20261121T180000Z.parquet
     kind=latency/step=60/20261121T180000Z.parquet
     kind=wifi/...  kind=system/...  kind=interface/...
+    kind=event/20261121.parquet
+    kind=incident/20261121.parquet
     dimensions.parquet
   ```
+
+  `kind=event` and `kind=incident` hold individual records, one file per UTC
+  day, and are not rolled up. Events have `ts`, `seq`, `subject`, `kind` and
+  `text`; incidents have `ts` (start), `end` (null while ongoing), `series`
+  and `kind`. Both are kept as long as the longest metric tier, so every view
+  covers the same range.
 
   Each chunk is named by its UTC start. Columns: `series` (UTF-8, dictionary
   encoded), `ts` (TIMESTAMP, milliseconds, UTC: the bucket start) and the
@@ -178,8 +186,10 @@ later, or never on a captive network.
   trouble window reaches disk before a reboot can take it.
 - **Incident**: a run of consecutive 15-second buckets in which every probe was
   lost. It ends with the first bucket that has a reply; a gap without probes
-  also ends it. The incident log (`incidents.json`, last 200) is written at
-  15-second resolution every 5 minutes, so it outlives the 15-second tier.
+  also ends it. The incident log (`kind=incident`) is written at 15-second
+  resolution on every collection and kept as long as the rest of history, so
+  it outlives the 15-second tier. History views add logged incidents that
+  their coarser buckets no longer show.
   Upstream Wi-Fi incidents are runs of buckets in which the repeater was never
   associated. History views derive incidents at the resolution they show.
   Uptime for a range is `1 − (fully lost buckets / buckets with probes)`.

@@ -114,7 +114,7 @@ fn history(warnings: &mut usize, settings: &Result<Settings>) {
     println!("probe interval: {} s", config.interval);
     let report = history::report(config);
     println!(
-        "history storage: {} bytes of {} bytes cap (Arrow IPC chunks, zstd)",
+        "history storage: {} bytes of {} bytes cap (Parquet chunks, zstd)",
         report.bytes, report.cap
     );
     for line in &report.lines {
@@ -239,7 +239,7 @@ fn telemetry_status(
 
 fn recent_changes(settings: &Result<Settings>) {
     if let Ok(config) = settings {
-        for event in changes::read(config).iter().rev().take(5) {
+        for event in changes::recent(config, 5).iter().rev() {
             println!("recent change ({}): {}", event.subject, event.text);
         }
     }
