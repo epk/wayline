@@ -153,6 +153,7 @@ const screens: Record<ViewId, ComponentType> = {
   traffic: chunk('traffic', 'TrafficView'),
   router: chunk('router', 'RouterView'),
   events: chunk('events', 'EventsView'),
+  health: chunk('health', 'HealthView'),
 };
 
 const Settings = chunk('settings', 'SettingsDrawer');

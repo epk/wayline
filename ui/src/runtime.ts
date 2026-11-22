@@ -1,7 +1,23 @@
-export type ChunkName = 'paths' | 'wifi' | 'traffic' | 'router' | 'events' | 'settings' | 'agent';
+export type ChunkName =
+  | 'paths'
+  | 'wifi'
+  | 'traffic'
+  | 'router'
+  | 'events'
+  | 'health'
+  | 'settings'
+  | 'agent';
 export type Loader = (name: ChunkName) => Promise<Record<string, unknown>>;
 
-export const chunkNames: ChunkName[] = ['paths', 'wifi', 'traffic', 'router', 'events', 'settings'];
+export const chunkNames: ChunkName[] = [
+  'paths',
+  'wifi',
+  'traffic',
+  'router',
+  'events',
+  'health',
+  'settings',
+];
 
 export const startAgentBridge = (host: Element): (() => void) => {
   if (!('modelContext' in document)) return () => undefined;

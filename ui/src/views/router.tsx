@@ -117,7 +117,9 @@ export function RouterView() {
                 sub: 'hottest thermal zone',
               },
               {
-                label: 'Conntrack',
+                label: 'Tracked connections',
+                title:
+                  'Connections the router firewall is tracking (conntrack), against its limit.',
                 value: finite(sys.conntrack) ? String(sys.conntrack) : dash,
                 sub: finite(sys.conntrackMax) ? 'max ' + sys.conntrackMax : '',
               },
@@ -205,7 +207,7 @@ export function RouterView() {
             ]}
           />
           <Chart
-            title="Conntrack entries"
+            title="Tracked connections"
             label="Connection tracking entries"
             x={built.x}
             ys={built.conntrack}

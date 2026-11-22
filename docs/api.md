@@ -10,7 +10,7 @@ The page talks to `wayline-ctl` through the GL.iNet RPC bridge in
 `wayline`. Writes use the versioned object `wayline_<version with dots as underscores>`.
 Every call is `$rpcRequest('call', ['sid', object, method, params])`.
 
-Reads: `get_state`, `get_history`, `get_wifi_history`, `get_telemetry_history`.
+Reads: `get_state`, `get_history`, `get_wifi_history`, `get_telemetry_history`, `get_diagnostics`.
 Writes: `set_config`, `select_tunnel`, `set_tunnel_enabled`, `purge_history`,
 `check_update`, `install_update` (unchanged from v1).
 
@@ -195,3 +195,22 @@ JSON document:
 
 `cpu`, `cpuMax`, `memUsed` are percent. `load` is the 1-minute load average.
 `temperature` is degrees Celsius. Rates are average and peak bits per second.
+
+## get_diagnostics
+
+Called on the per-release object (`wayline_<version>`), like the writes:
+GL.iNet's web server keeps each RPC script it has loaded, so a read added after
+the first release would be missing from the cached `wayline` object until the
+web server restarts. No parameters. Returns the same checks as `wayline-ctl doctor` plus the history
+store's inventory, for the page's Health tab.
+
+- `healthy`, `warnings`: the doctor result.
+- `checks[]`: `{status, label, detail}` with `status` one of `ok`, `warn`,
+  `fail` or `info`, in doctor order.
+- `storage`: `root`, `inMemory`, `days`, `bytes`, `cap`, `tiers[]`
+  (`kind`, `step`, `files`, `bytes`, `first`, `last` in ms), `kept[]`
+  (`step`, `keptSeconds`), `records[]` for `event` and `incident`
+  (`files`, `rows`, `bytes`, `first`, `last`), `dimensions` (bytes),
+  `legacy[]`, `pending` (staged files awaiting a synced clock) and
+  `lastCollect` (ms).
+- `generated`: router time in ms.

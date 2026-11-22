@@ -60,7 +60,7 @@ export const storage = {
   },
 };
 
-export type ViewId = 'overview' | 'paths' | 'wifi' | 'traffic' | 'router' | 'events';
+export type ViewId = 'overview' | 'paths' | 'wifi' | 'traffic' | 'router' | 'events' | 'health';
 export const views: { id: ViewId; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'paths', label: 'Paths' },
@@ -68,6 +68,7 @@ export const views: { id: ViewId; label: string }[] = [
   { id: 'traffic', label: 'Traffic' },
   { id: 'router', label: 'Router' },
   { id: 'events', label: 'Events' },
+  { id: 'health', label: 'Health' },
 ];
 const viewKey = 'wayline.view';
 const targetKey = 'wayline.target';
@@ -311,6 +312,13 @@ const read = (): DataSource => {
   if (!source)
     throw Error('The router page API is missing. Reload the page or update the firmware.');
   return source;
+};
+
+export const readDiagnostics = (): Promise<unknown> => {
+  const current = read();
+  if (typeof current.getDiagnostics !== 'function')
+    return Promise.reject(Error('Health details are not available from this data source.'));
+  return current.getDiagnostics();
 };
 
 export function refresh(): Promise<boolean> {

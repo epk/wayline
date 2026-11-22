@@ -15,9 +15,9 @@ export function TelemetryOff(props: { title: string }) {
     <Panel id="wl-telemetry-off" title={props.title} sub="Router telemetry is off.">
       <div className="wl-cta">
         <p>
-          Router and interface telemetry — CPU, memory, temperature, conntrack, per-interface
-          throughput, WireGuard handshakes. Sampled every 5 seconds and kept with the same tiers as
-          latency.
+          Router and interface telemetry — CPU, memory, temperature, tracked connections,
+          per-interface throughput, WireGuard handshakes. Sampled every 5 seconds and kept with the
+          same tiers as latency.
         </p>
         <Button
           className="wl-button wl-primary"

@@ -7,7 +7,7 @@ import {
 } from '@ui-sdk/react/segmented-control';
 import { Switch, SwitchThumb } from '@ui-sdk/react/switch';
 import { Toggle } from '@ui-sdk/react/toggle';
-import { useMemo, useState } from 'react';
+import { useMemo, useState, type ReactNode } from 'react';
 import { Chart, type Band, type Line, type Marker } from '../chart.tsx';
 import { changeFor, IncidentList, rangeIncidents, subjectName, tunnelName } from '../common.tsx';
 import {
@@ -18,8 +18,9 @@ import {
   tunnelLoss,
   uplinkLoss,
   uplinkPrefix,
+  type Loss,
 } from '../derived.ts';
-import { dash, finite, fixed, lossShort, ms, percent, place } from '../format.ts';
+import { dash, finite, fixed, ms, percent, place } from '../format.ts';
 import { score } from '../mos.ts';
 import { some, summarize, type LatencyLine, type Stats } from '../series.ts';
 import {
@@ -53,6 +54,7 @@ import {
 import type { Column, Tunnel, Uplink } from '../types.ts';
 import {
   Badge,
+  CALL_QUALITY,
   Mos,
   MosExplain,
   Panel,
@@ -130,6 +132,45 @@ function StopDialog() {
 
 const tone = (t: Tunnel) => (!t.enabled ? 'off' : t.connected ? 'ok' : 'down');
 
+function LineKey(props: {
+  highlighted: string;
+  items: { label: string; style: 'solid' | 'band' | 'dashed' | 'dotted' }[];
+}) {
+  return (
+    <div className="wl-line-key">
+      <ul aria-label="How to read the latency chart">
+        {props.items.map((item) => (
+          <li key={item.label}>
+            <svg viewBox="0 0 28 12" width="28" height="12" aria-hidden="true">
+              {item.style === 'band' ? (
+                <rect x="0" y="2" width="28" height="8" rx="2" className="wl-key-band" />
+              ) : (
+                <line
+                  x1="1"
+                  y1="6"
+                  x2="27"
+                  y2="6"
+                  className="wl-key-line"
+                  strokeWidth={item.style === 'solid' ? 2 : 1.5}
+                  strokeDasharray={
+                    item.style === 'dashed' ? '5 3' : item.style === 'dotted' ? '1.5 3' : undefined
+                  }
+                />
+              )}
+            </svg>
+            {item.label}
+          </li>
+        ))}
+      </ul>
+      <p className="wl-muted">
+        {props.highlighted
+          ? 'The range and slow-reply lines are drawn for ' + props.highlighted + '.'
+          : 'Press a path name to draw its range and slow-reply lines.'}
+      </p>
+    </div>
+  );
+}
+
 function TunnelTable() {
   const s = state.value;
   const endpoints = s.config.endpointDiagnostics ? s.endpoints : [];
@@ -142,12 +183,6 @@ function TunnelTable() {
   const activeMedian = active && finite(active.median) ? active.median : null;
   const comparable = s.tunnels.filter((t) => t.connected && finite(t.median)).length >= 2;
   const note = (t: Tunnel) => {
-    if (t.samples && t.lost > 0)
-      return {
-        text: lossShort(t.lost, t.samples) + ' loss',
-        cls: 'wl-note-loss',
-        title: t.lost + ' of ' + t.samples + ' samples lost',
-      };
     if (comparable && !t.preferred && activeMedian !== null && finite(t.median)) {
       const diff = activeMedian - t.median;
       if (Math.abs(diff) <= 3)
@@ -181,57 +216,58 @@ function TunnelTable() {
   const unmeasurable = (u: Uplink) =>
     u.state === 'route_mismatch' || u.state === 'route_unavailable';
   const primary = primarySelected.value;
-  const liveTitle = 'Live jitter, loss and MOS are measured to the primary destination.';
+  const liveTitle = 'Live jitter, loss and call quality are measured to the primary destination.';
+  const metric = (label: string, value: ReactNode, sub?: ReactNode, title?: string) => (
+    <div title={title}>
+      <dt>{label}</dt>
+      <dd>
+        <span className="wl-metric-value">{value}</span>
+        {sub !== undefined && sub !== '' && sub !== null && <small>{sub}</small>}
+      </dd>
+    </div>
+  );
+  const lossValue = (loss: Loss, unit: string) =>
+    primary && loss.sent ? (
+      <>
+        <span className="wl-num">{percent(loss.pct)}</span>
+        <small className="wl-num">
+          {loss.lost}/{loss.sent} {unit}
+        </small>
+      </>
+    ) : (
+      dash
+    );
   return (
     <div
-      className="wl-scroll wl-table-wrap"
-      tabIndex={0}
+      className="wl-exits"
       role="region"
       aria-label="Exit tunnels table"
       aria-busy={!ready.value && !readError.value ? 'true' : 'false'}
     >
-      <table className="wl-table wl-exits">
-        <thead>
-          <tr>
-            <th scope="col">Path</th>
-            <th scope="col" className="wl-n">
-              Latency
-            </th>
-            <th scope="col" className="wl-n">
-              Jitter
-            </th>
-            <th scope="col" className="wl-n">
-              Loss
-            </th>
-            <th scope="col">MOS</th>
-            {showServer && <th scope="col">To server</th>}
-            <th scope="col">
-              <span className="wl-sr">Actions</span>
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {s.tunnels.map((t) => {
-            const n = primary ? note(t) : null;
-            const id = egressFor(t.id);
-            const exitIp = id && id.ip && !id.error ? id : null;
-            const isExit = exitTunnel.value?.id === t.id;
-            const change = changeFor(t.id);
-            const loss = tunnelLoss(t);
-            const jitter = finite(t.jitter) ? t.jitter : null;
-            const server = endpoints.find((e) => e.tunnel === t.id) || null;
-            const serverDiag =
-              server && server.address ? (s.diagnostics[server.address] || {}).wan : null;
-            const extra = rowNote(t);
-            return (
-              <tr
-                key={t.id}
-                className={
-                  (selectedTunnel.value === t.id ? 'wl-selected ' : '') +
-                  (t.preferred ? 'wl-active' : '')
-                }
-              >
-                <th scope="row" className="wl-path">
+      <ul className="wl-pathlist">
+        {s.tunnels.map((t) => {
+          const n = primary ? note(t) : null;
+          const id = egressFor(t.id);
+          const exitIp = id && id.ip && !id.error ? id : null;
+          const isExit = exitTunnel.value?.id === t.id;
+          const change = changeFor(t.id);
+          const loss = tunnelLoss(t);
+          const jitter = finite(t.jitter) ? t.jitter : null;
+          const server = endpoints.find((e) => e.tunnel === t.id) || null;
+          const serverDiag =
+            server && server.address ? (s.diagnostics[server.address] || {}).wan : null;
+          const extra = rowNote(t);
+          return (
+            <li
+              key={t.id}
+              className={
+                'wl-pathcard ' +
+                (selectedTunnel.value === t.id ? 'wl-selected ' : '') +
+                (t.preferred ? 'wl-active' : '')
+              }
+            >
+              <div className="wl-pathcard-head">
+                <div className="wl-pathcard-title">
                   <div className="wl-name-line">
                     <Badge tone={tone(t)}>
                       <span className="wl-sr">{t.stateLabel}</span>
@@ -254,154 +290,152 @@ function TunnelTable() {
                         exitIp.ip +
                         (place(exitIp.location) ? ', ' + place(exitIp.location) : '')
                       : t.stateLabel}
+                    {extra && ' · ' + extra}
                   </div>
-                  {extra && <div className="wl-muted wl-status">{extra}</div>}
-                </th>
-                <td className="wl-n">
-                  {primary ? (
+                </div>
+                <div className="wl-actions">
+                  {!t.preferred && t.enabled && (
+                    <Button
+                      className="wl-button"
+                      focusableWhenDisabled
+                      aria-label={'Use ' + t.name + ' as exit'}
+                      title={
+                        !can.value.select
+                          ? selectReason.value
+                          : !selectable(t)
+                            ? t.selectReason || t.reason
+                            : undefined
+                      }
+                      disabled={busy.value || !selectable(t) || !can.value.select}
+                      data-agent-confirm={
+                        'Makes ' +
+                        t.name +
+                        ' the VPN exit for new connections, replacing ' +
+                        (exitTunnel.value ? exitTunnel.value.name : 'the direct WAN exit')
+                      }
+                      onClick={() => void selectExit(t)}
+                    >
+                      {busyTunnel.value === t.id && busyAction.value === 'select'
+                        ? 'Applying…'
+                        : 'Use as exit'}
+                    </Button>
+                  )}
+                  {busyTunnel.value === t.id && busyAction.value === 'toggle' ? (
+                    <span className="wl-muted" role="status">
+                      {t.enabled ? 'Stopping…' : 'Starting…'}
+                    </span>
+                  ) : (
+                    <label
+                      className="wl-switch"
+                      title={
+                        !t.controllable
+                          ? 'Native tunnel control is unavailable.'
+                          : !can.value.control
+                            ? controlReason.value
+                            : undefined
+                      }
+                    >
+                      <Switch
+                        aria-label={'Run ' + t.name}
+                        checked={t.enabled}
+                        disabled={busy.value || !t.controllable || !can.value.control}
+                        data-agent-confirm={
+                          t.enabled
+                            ? undefined
+                            : 'Starts the VPN tunnel ' + t.name + ' on the router'
+                        }
+                        onCheckedChange={(on, details) => {
+                          details.cancel();
+                          if (on !== t.enabled) askToggle(t);
+                        }}
+                      >
+                        <SwitchThumb />
+                      </Switch>
+                      <span aria-hidden="true">{t.enabled ? 'Running' : 'Stopped'}</span>
+                    </label>
+                  )}
+                </div>
+              </div>
+              <dl className="wl-metrics">
+                {metric(
+                  'Latency',
+                  primary ? (
                     <>
                       <span className="wl-num wl-big">{fixed(t.median)}</span>
-                      {finite(t.median) && <small> ms</small>}
-                      {n && (
-                        <span className={'wl-latency-note ' + n.cls} title={n.title || undefined}>
-                          {n.text}
-                        </span>
-                      )}
+                      {finite(t.median) && <small className="wl-unit"> ms</small>}
                     </>
                   ) : diag(t.id) !== null ? (
                     <>
                       <span className="wl-num wl-big">{fixed(diag(t.id))}</span>
-                      <small> ms</small>
+                      <small className="wl-unit"> ms</small>
                     </>
                   ) : (
                     <span className="wl-muted">No data yet</span>
-                  )}
-                </td>
-                <td className="wl-n wl-num" title={primary ? undefined : liveTitle}>
-                  {primary ? ms(jitter) : dash}
-                </td>
-                <td
-                  className="wl-n"
-                  title={primary ? loss.lost + ' of ' + loss.sent + ' samples lost' : liveTitle}
-                >
-                  {primary && loss.sent ? (
-                    <>
-                      <span className="wl-num">{percent(loss.pct)}</span>
-                      <small className="wl-block wl-num">
-                        {loss.lost}/{loss.sent} probes
-                      </small>
-                    </>
-                  ) : (
-                    dash
-                  )}
-                </td>
-                <td>
-                  {primary ? (
-                    <Mos score={score(t.median, jitter, loss.pct)} />
+                  ),
+                  n ? <span className={n.cls}>{n.text}</span> : undefined,
+                )}
+                {metric(
+                  'Jitter',
+                  <span className="wl-num">{primary ? ms(jitter) : dash}</span>,
+                  undefined,
+                  primary ? undefined : liveTitle,
+                )}
+                {metric(
+                  'Loss',
+                  lossValue(loss, 'probes'),
+                  undefined,
+                  primary ? loss.lost + ' of ' + loss.sent + ' probes lost' : liveTitle,
+                )}
+                {metric(
+                  'Call quality',
+                  primary ? (
+                    <Mos compact score={score(t.median, jitter, loss.pct)} />
                   ) : (
                     <span title={liveTitle}>{dash}</span>
-                  )}
-                </td>
-                {showServer && (
-                  <td
-                    title={server && !server.address && server.reason ? server.reason : undefined}
-                  >
-                    {server && server.address ? (
-                      <>
-                        <span className="wl-num">{finite(serverDiag) ? ms(serverDiag) : dash}</span>
-                        <small className="wl-block">Server {server.address}</small>
-                      </>
+                  ),
+                  undefined,
+                  CALL_QUALITY,
+                )}
+                {showServer &&
+                  metric(
+                    'To server',
+                    server && server.address ? (
+                      <span className="wl-num">{finite(serverDiag) ? ms(serverDiag) : dash}</span>
                     ) : (
                       <span className="wl-muted">No endpoint</span>
-                    )}
-                  </td>
-                )}
-                <td className="wl-action">
-                  <div className="wl-actions">
-                    {!t.preferred && t.enabled && (
-                      <Button
-                        className="wl-button"
-                        focusableWhenDisabled
-                        aria-label={'Use ' + t.name + ' as exit'}
-                        title={
-                          !can.value.select
-                            ? selectReason.value
-                            : !selectable(t)
-                              ? t.selectReason || t.reason
-                              : undefined
-                        }
-                        disabled={busy.value || !selectable(t) || !can.value.select}
-                        data-agent-confirm={
-                          'Makes ' +
-                          t.name +
-                          ' the VPN exit for new connections, replacing ' +
-                          (exitTunnel.value ? exitTunnel.value.name : 'the direct WAN exit')
-                        }
-                        onClick={() => void selectExit(t)}
-                      >
-                        {busyTunnel.value === t.id && busyAction.value === 'select'
-                          ? 'Applying…'
-                          : 'Use as exit'}
-                      </Button>
-                    )}
-                    {busyTunnel.value === t.id && busyAction.value === 'toggle' ? (
-                      <span className="wl-muted" role="status">
-                        {t.enabled ? 'Stopping…' : 'Starting…'}
-                      </span>
-                    ) : (
-                      <label
-                        className="wl-switch"
-                        title={
-                          !t.controllable
-                            ? 'Native tunnel control is unavailable.'
-                            : !can.value.control
-                              ? controlReason.value
-                              : undefined
-                        }
-                      >
-                        <Switch
-                          aria-label={'Run ' + t.name}
-                          checked={t.enabled}
-                          disabled={busy.value || !t.controllable || !can.value.control}
-                          data-agent-confirm={
-                            t.enabled
-                              ? undefined
-                              : 'Starts the VPN tunnel ' + t.name + ' on the router'
-                          }
-                          onCheckedChange={(on, details) => {
-                            details.cancel();
-                            if (on !== t.enabled) askToggle(t);
-                          }}
-                        >
-                          <SwitchThumb />
-                        </Switch>
-                        <span aria-hidden="true">{t.enabled ? 'Running' : 'Stopped'}</span>
-                      </label>
-                    )}
-                  </div>
-                </td>
-              </tr>
-            );
-          })}
-          {uplinks.map((u) => {
-            const change = changeFor(u.id);
-            const value = diag(u.active ? 'wan' : u.id);
-            const loss = uplinkLoss(u);
-            const jitter = finite(u.jitter) ? u.jitter : null;
-            return (
-              <tr key={u.id} className="wl-uplink-row">
-                <th scope="row" className="wl-path">
+                    ),
+                    server && server.address ? server.address : undefined,
+                    server && !server.address && server.reason
+                      ? server.reason
+                      : 'Latency to the VPN server over the WAN, outside the tunnel.',
+                  )}
+              </dl>
+            </li>
+          );
+        })}
+        {uplinks.map((u) => {
+          const change = changeFor(u.id);
+          const value = diag(u.active ? 'wan' : u.id);
+          const loss = uplinkLoss(u);
+          const jitter = finite(u.jitter) ? u.jitter : null;
+          return (
+            <li key={u.id} className="wl-pathcard wl-uplink-row">
+              <div className="wl-pathcard-head">
+                <div className="wl-pathcard-title">
                   <div className="wl-name-line">
                     <span className="wl-name wl-wan-name">{uplinkName(u)}</span>
                     {u.active && <Tag>Active uplink</Tag>}
                     {change && <Tag title={change.text}>Changed</Tag>}
                   </div>
-                  {!u.active && u.address && (
-                    <div className="wl-muted wl-status">Address {u.address}</div>
-                  )}
-                </th>
-                <td className="wl-n">
-                  {!u.active && unmeasurable(u) ? (
+                  <div className="wl-muted wl-status">
+                    {!u.active && u.address ? 'Address ' + u.address : 'Without VPN'}
+                  </div>
+                </div>
+              </div>
+              <dl className="wl-metrics">
+                {metric(
+                  'Latency',
+                  !u.active && unmeasurable(u) ? (
                     <span title="The router sends this traffic through the active uplink.">
                       Not measurable
                     </span>
@@ -409,40 +443,31 @@ function TunnelTable() {
                     <>
                       <span className="wl-sr">Without VPN: </span>
                       <span className="wl-num wl-big">{fixed(value)}</span>
-                      <small> ms</small>
+                      <small className="wl-unit"> ms</small>
                     </>
                   ) : (
                     <span className="wl-muted">No data yet</span>
-                  )}
-                </td>
-                <td className="wl-n wl-num">{primary ? ms(jitter) : dash}</td>
-                <td
-                  className="wl-n"
-                  title={
-                    loss.source === 'range'
-                      ? 'Loss over the selected range from history'
-                      : undefined
-                  }
-                >
-                  {primary && loss.sent ? (
-                    <>
-                      <span className="wl-num">{percent(loss.pct)}</span>
-                      <small className="wl-block wl-num">
-                        {loss.lost}/{loss.sent} {loss.source === 'range' ? 'in range' : 'probes'}
-                      </small>
-                    </>
-                  ) : (
-                    dash
-                  )}
-                </td>
-                <td>{primary ? <Mos score={score(value, jitter, loss.pct)} /> : dash}</td>
-                {showServer && <td />}
-                <td />
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+                  ),
+                )}
+                {metric('Jitter', <span className="wl-num">{primary ? ms(jitter) : dash}</span>)}
+                {metric(
+                  'Loss',
+                  lossValue(loss, loss.source === 'range' ? 'in range' : 'probes'),
+                  undefined,
+                  loss.source === 'range' ? 'Loss over the selected range from history' : undefined,
+                )}
+                {metric(
+                  'Call quality',
+                  primary ? <Mos compact score={score(value, jitter, loss.pct)} /> : dash,
+                  undefined,
+                  CALL_QUALITY,
+                )}
+                {showServer && <div aria-hidden="true" />}
+              </dl>
+            </li>
+          );
+        })}
+      </ul>
       {!s.tunnels.length && (
         <div className="wl-empty" role="status">
           {!ready.value
@@ -465,7 +490,7 @@ const columns = [
   { key: 'max', label: 'Max' },
   { key: 'jitter', label: 'Jitter' },
   { key: 'loss', label: 'Loss' },
-  { key: 'mos', label: 'MOS' },
+  { key: 'mos', label: 'Call quality' },
   { key: 'cursor', label: 'At cursor' },
 ] as const;
 type SortKey = 'name' | (typeof columns)[number]['key'];
@@ -528,11 +553,23 @@ function History() {
         owners.push(owner);
         bandOwner.push(owner);
         bands.push({ upper: index + 2, lower: index + 1, color, alpha: 0.15 });
-        latency.push({ label: name + ' p95', color, width: 1, dash: [5, 3], quiet: true });
+        latency.push({
+          label: name + ' 95th percentile',
+          color,
+          width: 1,
+          dash: [5, 3],
+          quiet: true,
+        });
         ys.push(l.p95);
         owners.push(owner);
         bandOwner.push(owner);
-        latency.push({ label: name + ' p99', color, width: 1, dash: [1, 3], quiet: true });
+        latency.push({
+          label: name + ' 99th percentile',
+          color,
+          width: 1,
+          dash: [1, 3],
+          quiet: true,
+        });
         ys.push(l.p99);
         owners.push(owner);
         bandOwner.push(owner);
@@ -734,8 +771,8 @@ function History() {
         </div>
       )}
       <p className="wl-muted wl-hint">
-        Press a series name to show only that line. Ctrl- or Cmd-click adds more. MOS uses the range
-        mean latency and jitter and the range loss.
+        Press a series name to show only that line. Ctrl- or Cmd-click adds more. Call quality uses
+        the range mean latency and jitter and the range loss.
       </p>
       <div className="wl-chart-area">
         {note && (
@@ -743,9 +780,18 @@ function History() {
             {note}
           </div>
         )}
+        <LineKey
+          highlighted={band ? subjectName(band) : ''}
+          items={[
+            { label: 'Median', style: 'solid' },
+            { label: 'Fastest to slowest reply', style: 'band' },
+            { label: 'Slowest 5 % of replies', style: 'dashed' },
+            { label: 'Slowest 1 % of replies', style: 'dotted' },
+          ]}
+        />
         <Chart
-          title="Median latency (ms) with min–max band, p95 and p99"
-          detail={scaleNote('medians') + ' · p95 dashed, p99 dotted for the highlighted path'}
+          title="Latency (ms)"
+          detail={scaleNote('medians')}
           label={'Latency to ' + target + ' through each path'}
           extra={(i, at) => {
             const l = built.lineAt[i];
@@ -774,13 +820,13 @@ function History() {
             className="wl-muted wl-small"
             title="Percentiles from a histogram; error within one bin"
           >
-            Percentiles from a 16-bin RTT histogram; error within one bin (under 1 ms below 3 ms,
-            under 5 ms below 20 ms, 50 ms between 100 and 150 ms).
+            Percentiles from a 16-bin round-trip-time histogram; error within one bin (under 1 ms
+            below 3 ms, under 5 ms below 20 ms, 50 ms between 100 and 150 ms).
           </p>
         </Chart>
         <Chart
           title="Jitter (ms)"
-          detail={scaleNote('buckets') + ' · mean |RTTᵢ − RTTᵢ₋₁|'}
+          detail={scaleNote('buckets') + ' · average change between consecutive replies'}
           label={'Jitter to ' + target + ' through each path'}
           x={x}
           ys={built.jitter.ys}
@@ -893,7 +939,7 @@ export function PathsView() {
           </SegmentedControl>
         )}
         <p className="wl-muted" title={s.scope || undefined}>
-          ICMP echo to {selectedTarget.value} every {probe.interval || s.config.interval} s
+          Ping to {selectedTarget.value} every {probe.interval || s.config.interval} s
           {finite(probe.timeout) ? ', timeout ' + probe.timeout + ' ms' : ''}. Loss and jitter use
           the recent window.
         </p>

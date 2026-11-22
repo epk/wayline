@@ -55,7 +55,10 @@ export function When(props: { at: number }) {
   );
 }
 
-export function Mos(props: { score: Score | null; missing?: string }) {
+export const CALL_QUALITY =
+  'Estimated voice-call quality from latency, jitter and loss, on a 1 (bad) to 5 (excellent) scale. Known as MOS (mean opinion score).';
+
+export function Mos(props: { score: Score | null; missing?: string; compact?: boolean }) {
   if (!props.score)
     return (
       <span className="wl-muted" title={props.missing || 'Needs latency, jitter and loss.'}>
@@ -63,8 +66,20 @@ export function Mos(props: { score: Score | null; missing?: string }) {
       </span>
     );
   const s = props.score;
+  if (props.compact)
+    return (
+      <Badge
+        tone={s.band}
+        title={'Call quality ' + s.mos.toFixed(2) + ' out of 5. ' + CALL_QUALITY}
+      >
+        <span className="wl-num">{s.mos.toFixed(2)}</span> {bandLabel[s.band]}
+      </Badge>
+    );
   return (
-    <span className="wl-mos" title={'R = ' + s.r.toFixed(1) + ', EL = ' + s.el.toFixed(1) + ' ms'}>
+    <span
+      className="wl-mos"
+      title={'Call quality ' + s.mos.toFixed(2) + ' out of 5. ' + CALL_QUALITY}
+    >
       <span className="wl-num">{s.mos.toFixed(2)}</span>{' '}
       <Badge tone={s.band}>{bandLabel[s.band]}</Badge>
     </span>
@@ -84,8 +99,9 @@ export function MosExplain(props: { inputs?: string }) {
   return (
     <Explain>
       <p>
-        Voice quality estimate: a simplified ITU-T G.107 E-model. It models voice calls, not general
-        browsing. {props.inputs}
+        Call quality is the mean opinion score (MOS): an estimate of how a voice call would sound,
+        from 1 (bad) to 5 (excellent). It uses a simplified ITU-T G.107 E-model and models voice
+        calls, not general browsing. {props.inputs}
       </p>
       <pre>{formula}</pre>
       <p>Bands: 4.3 and above excellent, 4.0–4.3 good, 3.6–4.0 fair, below 3.6 poor.</p>

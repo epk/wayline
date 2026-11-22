@@ -4,6 +4,7 @@ use crate::runtime::{MONITOR_CONFIG, SETTINGS, STATUS_SOCKET};
 use crate::settings::Settings;
 use crate::{changes, history, router, update, wifi};
 use anyhow::Result;
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -17,14 +18,59 @@ const FILES: [&str; 6] = [
     "/usr/sbin/waylined",
 ];
 
-fn show(ok: bool, label: &str, detail: &str) -> bool {
-    println!("[{}] {label}: {detail}", if ok { " ok " } else { "FAIL" });
-    ok
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Ok,
+    Warn,
+    Fail,
+    Info,
 }
 
-fn warn(warnings: &mut usize, label: &str, detail: &str) {
-    *warnings += 1;
-    println!("[WARN] {label}: {detail}");
+#[derive(Serialize)]
+pub struct Check {
+    pub status: Status,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Default)]
+pub struct Report {
+    pub checks: Vec<Check>,
+}
+
+impl Report {
+    fn push(&mut self, status: Status, label: &str, detail: &str) {
+        self.checks.push(Check {
+            status,
+            label: label.to_owned(),
+            detail: detail.to_owned(),
+        });
+    }
+
+    fn show(&mut self, ok: bool, label: &str, detail: &str) -> bool {
+        self.push(if ok { Status::Ok } else { Status::Fail }, label, detail);
+        ok
+    }
+
+    fn warn(&mut self, label: &str, detail: &str) {
+        self.push(Status::Warn, label, detail);
+    }
+
+    fn info(&mut self, label: &str, detail: impl AsRef<str>) {
+        self.push(Status::Info, label, detail.as_ref());
+    }
+
+    pub fn healthy(&self) -> bool {
+        self.checks.iter().all(|check| check.status != Status::Fail)
+    }
+
+    pub fn warnings(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|check| check.status == Status::Warn)
+            .count()
+    }
 }
 
 fn chunks(path: &str) -> usize {
@@ -36,23 +82,21 @@ fn chunks(path: &str) -> usize {
     })
 }
 
-fn installed() -> bool {
-    let mut ok = true;
+fn installed(report: &mut Report) {
     for path in FILES {
-        ok &= show(Path::new(path).exists(), path, &size(path));
+        report.show(Path::new(path).exists(), path, &size(path));
     }
     let chunks = chunks("/www/views/wayline");
-    ok &= show(
+    report.show(
         chunks > 0,
         "/www/views/wayline",
         &format!("{chunks} page chunks"),
     );
-    ok &= show(
+    report.show(
         Path::new("/etc/rc.d/S95wayline").exists(),
         "startup entry",
         "/etc/rc.d/S95wayline",
     );
-    ok
 }
 
 fn size(path: &str) -> String {
@@ -60,7 +104,7 @@ fn size(path: &str) -> String {
 }
 
 fn topology(
-    warnings: &mut usize,
+    report: &mut Report,
     settings: &Result<Settings>,
     inventory: &Result<router::Inventory>,
 ) {
@@ -69,20 +113,20 @@ fn topology(
     };
     match &value.wan {
         Some(wan) => {
-            show(
+            report.show(
                 true,
                 "WAN path",
                 &format!("{} on {}", wan.name, wan.interface),
             );
         }
-        None => warn(warnings, "WAN path", &value.wan_reason),
+        None => report.warn("WAN path", &value.wan_reason),
     }
     for uplink in &value.uplinks {
         let active = value
             .wan
             .as_ref()
             .is_some_and(|wan| wan.name == uplink.name);
-        show(
+        report.show(
             true,
             "uplink",
             &format!(
@@ -98,8 +142,7 @@ fn topology(
         && router::endpoints_enabled(config)
     {
         for path in router::monitored(config, value).filter(|path| path.endpoint.is_none()) {
-            warn(
-                warnings,
+            report.warn(
                 &format!("VPN endpoint {}", path.name),
                 &path.endpoint_reason,
             );
@@ -107,22 +150,25 @@ fn topology(
     }
 }
 
-fn history(warnings: &mut usize, settings: &Result<Settings>) {
+fn history(report: &mut Report, settings: &Result<Settings>) {
     let Ok(config) = settings else {
         return;
     };
-    println!("probe interval: {} s", config.interval);
-    let report = history::report(config);
-    println!(
-        "history storage: {} bytes of {} bytes cap (Parquet chunks, zstd)",
-        report.bytes, report.cap
+    report.info("probe interval", format!("{} s", config.interval));
+    let stored = history::report(config);
+    report.info(
+        "history storage",
+        format!(
+            "{} bytes of {} bytes cap (Parquet chunks, zstd)",
+            stored.bytes, stored.cap
+        ),
     );
-    for line in &report.lines {
-        println!("{line}");
+    for line in &stored.lines {
+        let (label, detail) = line.split_once(": ").unwrap_or((line, ""));
+        report.info(label, detail);
     }
-    if report.bytes * 5 > report.cap * 4 {
-        warn(
-            warnings,
+    if stored.bytes * 5 > stored.cap * 4 {
+        report.warn(
             "history storage",
             "Above 80% of its cap. The oldest chunks are removed when it fills.",
         );
@@ -130,7 +176,7 @@ fn history(warnings: &mut usize, settings: &Result<Settings>) {
 }
 
 fn wifi_status(
-    warnings: &mut usize,
+    report: &mut Report,
     settings: &Result<Settings>,
     status: Option<&wayline_protocol::WifiStatus>,
 ) {
@@ -138,69 +184,74 @@ fn wifi_status(
         return;
     };
     if !config.upstream_wifi {
-        println!("upstream Wi-Fi monitoring: off by setting");
+        report.info("upstream Wi-Fi monitoring", "off by setting");
         return;
     }
     let Some(status) = status else {
-        warn(
-            warnings,
-            "upstream Wi-Fi",
-            "The monitor reports no Wi-Fi status.",
-        );
+        report.warn("upstream Wi-Fi", "The monitor reports no Wi-Fi status.");
         return;
     };
     let state = serde_json::to_value(status.state).unwrap_or_default();
-    println!(
-        "upstream Wi-Fi: {} on {} (candidates: {}), sample age {} ms, {} live bucket(s)",
-        state.as_str().unwrap_or("unknown"),
-        status.interface.as_deref().unwrap_or("none"),
-        status.candidates.join(", "),
-        status
-            .sample_age_ms
-            .map_or_else(|| "unknown".into(), |age| age.to_string()),
-        status.buckets.len()
+    report.info(
+        "upstream Wi-Fi",
+        format!(
+            "{} on {} (candidates: {}), sample age {} ms, {} live bucket(s)",
+            state.as_str().unwrap_or("unknown"),
+            status.interface.as_deref().unwrap_or("none"),
+            status.candidates.join(", "),
+            status
+                .sample_age_ms
+                .map_or_else(|| "unknown".into(), |age| age.to_string()),
+            status.buckets.len()
+        ),
     );
     if let Some(link) = &status.link {
-        println!(
-            "upstream Wi-Fi link: channel {}, signal {} dBm, noise {} dBm, tx {} kbit/s ({}), rx {} kbit/s",
-            wifi::channel(link),
-            link.signal
-                .map_or_else(|| "?".into(), |value| value.to_string()),
-            link.noise
-                .map_or_else(|| "?".into(), |value| value.to_string()),
-            link.tx
-                .kbps
-                .map_or_else(|| "?".into(), |value| value.to_string()),
-            link.tx.mode.as_deref().unwrap_or("?"),
-            link.rx
-                .kbps
-                .map_or_else(|| "?".into(), |value| value.to_string()),
+        report.info(
+            "upstream Wi-Fi link",
+            format!(
+                "channel {}, signal {} dBm, noise {} dBm, tx {} kbit/s ({}), rx {} kbit/s",
+                wifi::channel(link),
+                link.signal
+                    .map_or_else(|| "?".into(), |value| value.to_string()),
+                link.noise
+                    .map_or_else(|| "?".into(), |value| value.to_string()),
+                link.tx
+                    .kbps
+                    .map_or_else(|| "?".into(), |value| value.to_string()),
+                link.tx.mode.as_deref().unwrap_or("?"),
+                link.rx
+                    .kbps
+                    .map_or_else(|| "?".into(), |value| value.to_string()),
+            ),
         );
     }
 }
 
-fn monitor_details(warnings: &mut usize, settings: &Result<Settings>) {
+fn monitor_details(report: &mut Report, settings: &Result<Settings>) {
     let parts = runtime::current();
-    println!("measurement series: {}", parts.series.len());
-    wifi_status(warnings, settings, parts.wifi.as_ref());
-    telemetry_status(settings, parts.telemetry.as_ref());
+    report.info("measurement series", parts.series.len().to_string());
+    wifi_status(report, settings, parts.wifi.as_ref());
+    telemetry_status(report, settings, parts.telemetry.as_ref());
 }
 
 fn telemetry_status(
+    report: &mut Report,
     settings: &Result<Settings>,
     status: Option<&wayline_protocol::TelemetryStatus>,
 ) {
     if !settings.as_ref().is_ok_and(|config| config.telemetry) {
-        println!("router telemetry: off by setting");
+        report.info("router telemetry", "off by setting");
         return;
     }
     let Some(status) = status else {
-        println!("router telemetry: no status from the monitor");
+        report.info("router telemetry", "no status from the monitor");
         return;
     };
     if let Some(system) = status.system {
-        println!(
-            "router telemetry: cpu {} permille, load {:?} centi, memory {} of {} bytes available, temperature {} millidegrees, conntrack {}/{}",
+        report.info(
+            "router telemetry",
+            format!(
+            "cpu {} permille, load {:?} centi, memory {} of {} bytes available, temperature {} millidegrees, conntrack {}/{}",
             system
                 .cpu_permille
                 .map_or_else(|| "?".into(), |value| value.to_string()),
@@ -216,56 +267,59 @@ fn telemetry_status(
             system
                 .conntrack_max
                 .map_or_else(|| "?".into(), |value| value.to_string()),
+            ),
         );
     }
     for link in &status.links {
-        println!(
-            "interface {} ({}, {}): present {}, rx {} bit/s, tx {} bit/s, errors {}, drops {}, handshake age {}",
-            link.id,
-            link.device,
-            link.kind,
-            link.present,
-            link.rx_bps
-                .map_or_else(|| "?".into(), |value| value.to_string()),
-            link.tx_bps
-                .map_or_else(|| "?".into(), |value| value.to_string()),
-            link.errors,
-            link.drops,
-            link.handshake_age
-                .map_or_else(|| "none".into(), |value| format!("{value} s")),
+        report.info(
+            &format!("interface {} ({}, {})", link.id, link.device, link.kind),
+            format!(
+                "present {}, rx {} bit/s, tx {} bit/s, errors {}, drops {}, handshake age {}",
+                link.present,
+                link.rx_bps
+                    .map_or_else(|| "?".into(), |value| value.to_string()),
+                link.tx_bps
+                    .map_or_else(|| "?".into(), |value| value.to_string()),
+                link.errors,
+                link.drops,
+                link.handshake_age
+                    .map_or_else(|| "none".into(), |value| format!("{value} s")),
+            ),
         );
     }
 }
 
-fn recent_changes(settings: &Result<Settings>) {
+fn recent_changes(report: &mut Report, settings: &Result<Settings>) {
     if let Ok(config) = settings {
         for event in changes::recent(config, 5).iter().rev() {
-            println!("recent change ({}): {}", event.subject, event.text);
+            report.info(&format!("recent change ({})", event.subject), &event.text);
         }
     }
 }
 
-pub fn run() -> bool {
-    let mut healthy = true;
-    let mut warnings = 0;
-    println!("Wayline doctor. Send this output when you report a problem.");
-    println!("package version: {}", runtime::version());
+pub fn collect() -> Report {
+    let mut report = Report::default();
+    report.info("package version", runtime::version());
     let compat = native::compat();
-    println!("firmware: {}", compat.firmware);
+    report.info("firmware", &compat.firmware);
     let level = match compat.level {
         Level::Full if compat.verified => "full (tested module)",
         Level::Full => "full (module newer than tested)",
         Level::Monitoring => "monitoring only",
         Level::Unsupported => "unsupported",
     };
-    healthy &= show(
+    report.show(
         compat.level != Level::Unsupported,
         "firmware support",
-        &format!("{level}. {}", compat.message),
+        &if compat.message.is_empty() {
+            level.to_owned()
+        } else {
+            format!("{level}. {}", compat.message)
+        },
     );
-    healthy &= installed();
+    installed(&mut report);
     let settings = Settings::read();
-    healthy &= show(
+    report.show(
         settings.is_ok(),
         SETTINGS,
         &settings.as_ref().map_or_else(ToString::to_string, |value| {
@@ -278,7 +332,7 @@ pub fn run() -> bool {
         }),
     );
     let inventory = router::inventory();
-    healthy &= show(
+    report.show(
         inventory.is_ok(),
         "tunnel inventory",
         &inventory
@@ -291,18 +345,26 @@ pub fn run() -> bool {
                 )
             }),
     );
-    topology(&mut warnings, &settings, &inventory);
-    history(&mut warnings, &settings);
-    recent_changes(&settings);
+    topology(&mut report, &settings, &inventory);
+    history(&mut report, &settings);
+    recent_changes(&mut report, &settings);
     let list = native::List::read();
     let detail = list.as_ref().map_or_else(ToString::to_string, |value| {
         format!("{} tunnel(s) in priority order", value.tunnels.len())
     });
-    show(list.is_ok(), "native VPN reply", &detail);
+    report.push(
+        if list.is_ok() {
+            Status::Ok
+        } else {
+            Status::Warn
+        },
+        "native VPN reply",
+        &detail,
+    );
     let service = native::bus::<Value>("service", "list", &json!({"name":"wayline"}))
         .is_ok_and(|value| value["wayline"]["instances"]["monitor"]["running"] == true);
     let wanted = settings.as_ref().is_ok_and(Settings::monitoring);
-    healthy &= show(
+    report.show(
         service || !wanted,
         "monitor service",
         if service {
@@ -313,24 +375,38 @@ pub fn run() -> bool {
             "off by setting"
         },
     );
-    println!(
-        "monitor config: {}; status socket: {}",
-        size(MONITOR_CONFIG),
-        size(STATUS_SOCKET)
+    report.info(
+        "monitor config",
+        format!(
+            "{}; status socket: {}",
+            size(MONITOR_CONFIG),
+            size(STATUS_SOCKET)
+        ),
     );
-    monitor_details(&mut warnings, &settings);
+    monitor_details(&mut report, &settings);
     if let Some(status) = update::Status::read() {
         let value = serde_json::to_value(&status).unwrap_or_default();
-        println!("last update check: {value}");
+        report.info("last update check", value.to_string());
         if value["failed"] == true {
-            warn(
-                &mut warnings,
-                "last update check",
-                "The last update failed.",
-            );
+            report.warn("last update check", "The last update failed.");
         }
     }
-    let result = match (healthy, warnings) {
+    report
+}
+
+pub fn run() -> bool {
+    println!("Wayline doctor. Send this output when you report a problem.");
+    let report = collect();
+    for check in &report.checks {
+        match check.status {
+            Status::Ok => println!("[ ok ] {}: {}", check.label, check.detail),
+            Status::Fail => println!("[FAIL] {}: {}", check.label, check.detail),
+            Status::Warn => println!("[WARN] {}: {}", check.label, check.detail),
+            Status::Info => println!("{}: {}", check.label, check.detail),
+        }
+    }
+    let healthy = report.healthy();
+    let result = match (healthy, report.warnings()) {
         (false, _) => "Result: problems found".to_owned(),
         (true, 0) => "Result: healthy".to_owned(),
         (true, count) => format!("Result: healthy with {count} warning(s)"),

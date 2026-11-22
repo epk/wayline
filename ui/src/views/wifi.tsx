@@ -1,5 +1,5 @@
 import { Button } from '@ui-sdk/react/button';
-import { useMemo } from 'react';
+import { useMemo, type ReactNode } from 'react';
 import { Chart, type Marker } from '../chart.tsx';
 import { toneLabel, wifiLevel } from '../derived.ts';
 import {
@@ -41,6 +41,28 @@ const level = (kind: keyof typeof wifiLevel, value: number | null | undefined) =
   ) : (
     ''
   );
+
+function Group(props: { title: string; rows: [string, ReactNode, ReactNode?][] }) {
+  return (
+    <section className="wl-group" aria-label={props.title}>
+      <h4>{props.title}</h4>
+      <dl>
+        {props.rows.map(([label, value, sub]) => (
+          <div key={label}>
+            <dt>{label}</dt>
+            <dd>
+              <span className="wl-num">
+                {value}
+                {typeof sub === 'object' && sub}
+              </span>
+              {typeof sub === 'string' && sub !== '' && <small>{sub}</small>}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+  );
+}
 
 export function WifiView() {
   const s = state.value;
@@ -138,117 +160,141 @@ export function WifiView() {
           </p>
         )}
         {l && (
-          <Facts
-            label="Current link"
-            items={[
-              {
-                label: 'Network',
-                value: l.ssid || 'Hidden network',
-                sub: l.bssid + ' · ' + (w.interface || ''),
-              },
-              {
-                label: 'Signal',
-                value: dbm(l.signal),
-                sub: (
-                  <>
-                    {level('signal', l.signal)} noise {dbm(l.noise)}
-                  </>
-                ),
-              },
-              { label: 'SNR', value: finite(snr) ? snr + ' dB' : dash, sub: level('snr', snr) },
-              {
-                label: 'Channel',
-                value: l.channel ? String(l.channel) : 'Unknown',
-                sub: [
-                  finite(l.frequency) ? band(l.frequency) + ' (' + l.frequency + ' MHz)' : '',
-                  l.width ? l.width + ' MHz wide' : '',
-                  l.hwmode ? '802.11' + l.hwmode : '',
-                  l.htmode || '',
-                  l.encryption || '',
-                ]
-                  .filter(Boolean)
-                  .join(' · '),
-              },
-              { label: 'Transmit PHY rate', value: kbit(l.tx.kbps), sub: rateDetail(l.tx) },
-              { label: 'Receive PHY rate', value: kbit(l.rx.kbps), sub: rateDetail(l.rx) },
-              {
-                label: 'Expected throughput',
-                value: kbit(l.expected_kbps),
-                sub: 'driver estimate',
-              },
-              {
-                label: 'Channel busy',
-                value: percent(busyPct),
-                sub: level('busy', busyPct),
-              },
-              {
-                label: 'Link up',
-                value: finite(l.connected_seconds) ? span(l.connected_seconds) : 'Connected',
-                sub: finite(l.inactive_ms) ? 'inactive ' + l.inactive_ms + ' ms' : '',
-              },
-              {
-                label: 'Latency over this link',
-                value: uplink && finite(uplink.median) ? uplink.median.toFixed(2) + ' ms' : dash,
-                sub: !w.uplink
-                  ? 'The repeater is not an IPv4 uplink right now.'
-                  : !uplink || !finite(uplink.median)
-                    ? 'Turn on Direct internet in Settings to measure it.'
-                    : (uplink.active ? 'Active uplink ' : 'Standby uplink ') + uplink.interface,
-              },
-            ]}
-          />
+          <>
+            <p className="wl-link-line">
+              <strong>{l.ssid || 'Hidden network'}</strong>
+              {[
+                finite(l.frequency) ? band(l.frequency) : '',
+                l.channel ? 'channel ' + l.channel : '',
+                finite(l.connected_seconds) ? 'up ' + span(l.connected_seconds) : 'connected',
+              ]
+                .filter(Boolean)
+                .map((part) => (
+                  <span key={part}>{part}</span>
+                ))}
+            </p>
+            <Facts
+              label="Current link"
+              items={[
+                {
+                  label: 'Signal',
+                  value: dbm(l.signal),
+                  sub: (
+                    <>
+                      {level('signal', l.signal)} signal to noise {finite(snr) ? snr + ' dB' : dash}{' '}
+                      · noise {dbm(l.noise)}
+                    </>
+                  ),
+                },
+                {
+                  label: 'Link rate',
+                  value: (
+                    <>
+                      {kbit(l.tx.kbps)}
+                      <span className="wl-muted wl-fact-small"> up</span>
+                    </>
+                  ),
+                  sub: kbit(l.rx.kbps) + ' down',
+                  title:
+                    'Transmit: ' +
+                    (rateDetail(l.tx) || 'unknown') +
+                    '. Receive: ' +
+                    (rateDetail(l.rx) || 'unknown') +
+                    '.',
+                },
+                {
+                  label: 'Channel busy',
+                  value: percent(busyPct),
+                  sub: level('busy', busyPct),
+                },
+                {
+                  label: 'Latency over this link',
+                  value: uplink && finite(uplink.median) ? uplink.median.toFixed(2) + ' ms' : dash,
+                  sub: !w.uplink
+                    ? 'The repeater is not an IPv4 uplink right now.'
+                    : !uplink || !finite(uplink.median)
+                      ? 'Turn on Direct internet in Settings to measure it.'
+                      : (uplink.active ? 'Active uplink ' : 'Standby uplink ') + uplink.interface,
+                },
+              ]}
+            />
+            <dl className="wl-spec" aria-label="Link details">
+              {(
+                [
+                  ['Access point', l.bssid],
+                  ['Interface', w.interface || ''],
+                  [
+                    'Frequency',
+                    [
+                      finite(l.frequency) ? l.frequency + ' MHz' : '',
+                      l.width ? l.width + ' MHz wide' : '',
+                    ]
+                      .filter(Boolean)
+                      .join(', '),
+                  ],
+                  [
+                    'Standard',
+                    [l.hwmode ? '802.11' + l.hwmode : '', l.htmode || '']
+                      .filter(Boolean)
+                      .join(', '),
+                  ],
+                  ['Security', l.encryption || ''],
+                  ['Sending', rateDetail(l.tx)],
+                  ['Receiving', rateDetail(l.rx)],
+                  ['Expected throughput', finite(l.expected_kbps) ? kbit(l.expected_kbps) : ''],
+                ] as [string, string][]
+              )
+                .filter(([, value]) => value)
+                .map(([label, value]) => (
+                  <div key={label}>
+                    <dt>{label}</dt>
+                    <dd>{value}</dd>
+                  </div>
+                ))}
+            </dl>
+          </>
         )}
         {doc && finite(sum.samples) && sum.samples > 0 && (
           <>
             <h3 className="wl-h3">Selected range</h3>
-            <Facts
-              label="Selected range"
-              items={[
-                { label: 'Connected', value: percent(sum.uptime), sub: sum.samples + ' samples' },
-                {
-                  label: 'Average signal',
-                  value: dbm(sum.signal),
-                  sub: level('signal', sum.signal),
-                },
-                {
-                  label: 'Weakest / strongest',
-                  value: dbm(sum.signalMin),
-                  sub: dbm(sum.signalMax),
-                },
-                {
-                  label: 'Average SNR',
-                  value: finite(sum.snr) ? sum.snr.toFixed(0) + ' dB' : dash,
-                  sub: level('snr', sum.snr),
-                },
-                {
-                  label: 'Average tx rate',
-                  value: mbit(sum.txRate),
-                  sub: 'min ' + mbit(sum.txRateMin),
-                },
-                {
-                  label: 'Retries',
-                  value: percent(sum.retries),
-                  sub: level('retries', sum.retries),
-                },
-                { label: 'Failures', value: percent(sum.failures) },
-                { label: 'Channel busy', value: percent(sum.busy), sub: level('busy', sum.busy) },
-                {
-                  label: 'Own / others airtime',
-                  value: percent(own),
-                  sub:
+            <div className="wl-groups">
+              <Group
+                title="Connection"
+                rows={[
+                  ['Connected', percent(sum.uptime), sum.samples + ' samples'],
+                  ['Drops', String(sum.disconnects ?? 0)],
+                  ['Roams', String(sum.roams ?? 0)],
+                ]}
+              />
+              <Group
+                title="Signal"
+                rows={[
+                  ['Average', dbm(sum.signal), level('signal', sum.signal)],
+                  ['Range', dbm(sum.signalMin) + ' to ' + dbm(sum.signalMax)],
+                  [
+                    'Signal to noise',
+                    finite(sum.snr) ? sum.snr.toFixed(0) + ' dB' : dash,
+                    level('snr', sum.snr),
+                  ],
+                ]}
+              />
+              <Group
+                title="Throughput and airtime"
+                rows={[
+                  ['Average tx rate', mbit(sum.txRate), 'min ' + mbit(sum.txRateMin)],
+                  ['Retries', percent(sum.retries), level('retries', sum.retries)],
+                  ['Failures', percent(sum.failures)],
+                  [
+                    'Channel busy',
+                    percent(sum.busy),
                     finite(sum.busy) && finite(own)
-                      ? percent(Math.max(0, sum.busy - own)) + ' others'
-                      : '',
-                },
-                { label: 'Drops', value: String(sum.disconnects ?? 0) },
-                { label: 'Roams', value: String(sum.roams ?? 0) },
-                {
-                  label: 'Data down / up',
-                  value: bytes(sum.rxBytes),
-                  sub: bytes(sum.txBytes) + ' up',
-                },
-              ]}
-            />
+                      ? 'own ' + percent(own) + ' · others ' + percent(Math.max(0, sum.busy - own))
+                      : level('busy', sum.busy),
+                  ],
+                  ['Data', bytes(sum.rxBytes) + ' down', bytes(sum.txBytes) + ' up'],
+                ]}
+              />
+            </div>
           </>
         )}
         {data.error && (
@@ -312,11 +358,11 @@ export function WifiView() {
             ]}
           />
           <Chart
-            title="SNR (dB)"
+            title="Signal to noise (dB)"
             label="Signal-to-noise ratio over the selected range"
             x={built.x}
             ys={built.snr}
-            lines={[{ label: 'SNR', color: 'series-5', width: 2 }]}
+            lines={[{ label: 'Signal to noise', color: 'series-5', width: 2 }]}
             thresholds={[
               { value: 25, label: 'good ≥ 25', tone: 'good' },
               { value: 15, label: 'poor < 15', tone: 'danger' },
@@ -328,7 +374,7 @@ export function WifiView() {
             y={(_l, high) => [0, Math.max(40, (finite(high) ? high : 30) + 5)]}
           />
           <Chart
-            title="PHY rate (Mbit/s)"
+            title="Link rate (Mbit/s)"
             label="Link rate over the selected range"
             x={built.x}
             ys={built.rate}

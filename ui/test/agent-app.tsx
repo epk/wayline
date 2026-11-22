@@ -21,6 +21,7 @@ const chunks: Record<ChunkName, () => Promise<Record<string, unknown>>> = {
   traffic: () => import('../src/views/traffic.tsx'),
   router: () => import('../src/views/router.tsx'),
   events: () => import('../src/views/events.tsx'),
+  health: () => import('../src/views/health.tsx'),
   settings: () => import('../src/settings.tsx'),
   agent: () => import('../src/agent.tsx'),
 };

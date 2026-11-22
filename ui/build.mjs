@@ -177,6 +177,7 @@ const input = {
   traffic: root + 'src/views/traffic.tsx',
   router: root + 'src/views/router.tsx',
   events: root + 'src/views/events.tsx',
+  health: root + 'src/views/health.tsx',
   settings: root + 'src/settings.tsx',
   agent: root + 'src/agent.tsx',
 };

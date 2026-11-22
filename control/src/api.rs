@@ -889,3 +889,28 @@ pub fn start_update(method: &str) -> Result<Value> {
     let started = update::start(method)?;
     Ok(json!({"started":started,"update":update::view()}))
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Diagnostics {
+    healthy: bool,
+    warnings: usize,
+    checks: Vec<crate::doctor::Check>,
+    storage: Option<history::Storage>,
+    generated: u64,
+}
+
+pub fn checkup() -> Result<Diagnostics> {
+    let report = crate::doctor::collect();
+    let storage = Settings::read()
+        .ok()
+        .map(|config| runtime::reading("history", || Ok(history::storage(&config))))
+        .transpose()?;
+    Ok(Diagnostics {
+        healthy: report.healthy(),
+        warnings: report.warnings(),
+        checks: report.checks,
+        storage,
+        generated: runtime::now() * 1_000,
+    })
+}

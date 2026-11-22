@@ -302,8 +302,8 @@ export function SettingsDrawer() {
               onChange={(telemetry) => updateDraft({ telemetry })}
             />
             <p className="wl-muted">
-              CPU, memory, temperature, conntrack, per-interface throughput, WireGuard handshakes.
-              Sampled every 5 seconds and kept like latency.
+              CPU, memory, temperature, tracked connections, per-interface throughput, WireGuard
+              handshakes. Sampled every 5 seconds and kept like latency.
             </p>
           </section>
           <section className="wl-set" aria-labelledby="wl-set-exit">

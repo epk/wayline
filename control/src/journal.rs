@@ -325,6 +325,34 @@ pub fn expire<R: Record>(root: &Path, keep_seconds: u64, now: u64) -> Result<()>
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+pub struct Summary {
+    pub kind: &'static str,
+    pub files: usize,
+    pub rows: usize,
+    pub bytes: u64,
+    pub first: Option<u64>,
+    pub last: Option<u64>,
+}
+
+pub fn summary<R: Record>(root: &Path) -> Summary {
+    let found = days::<R>(root);
+    let bytes = found
+        .iter()
+        .filter_map(|day| fs::metadata(day_path::<R>(root, *day)).ok())
+        .map(|meta| meta.len())
+        .sum();
+    let rows = all::<R>(root).unwrap_or_default();
+    Summary {
+        kind: R::KIND,
+        files: found.len(),
+        rows: rows.len(),
+        bytes,
+        first: rows.first().map(Record::at),
+        last: rows.last().map(Record::at),
+    }
+}
+
 pub fn report<R: Record>(root: &Path) -> String {
     let found = days::<R>(root);
     let bytes: u64 = found

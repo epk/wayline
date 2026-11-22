@@ -29,6 +29,7 @@ export interface DataSource {
   getHistory(query: LatencyQuery): Promise<LatencyDoc>;
   getWifiHistory(query: HistoryQuery): Promise<WifiDoc>;
   getTelemetryHistory(query: HistoryQuery): Promise<TelemetryDoc>;
+  getDiagnostics?(): Promise<unknown>;
   setConfig?(request: Revisioned & { config: Settings }): Promise<unknown>;
   selectTunnel?(request: Revisioned & { section_id: string }): Promise<unknown>;
   setTunnelEnabled?(

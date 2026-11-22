@@ -160,7 +160,7 @@ test('every control on the page has a name an agent can use', () => {
   const tabs = list.find((entry) => entry.label === 'Views');
   assert.deepEqual(
     tabs.items.map((item) => item.label),
-    ['Overview', 'Paths', 'Wi-Fi', 'Traffic', 'Router', 'Events'],
+    ['Overview', 'Paths', 'Wi-Fi', 'Traffic', 'Router', 'Events', 'Health'],
   );
 });
 

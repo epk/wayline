@@ -43,7 +43,18 @@ import {
   state,
   wanAvailable,
 } from '../store.ts';
-import { Badge, Facts, Mos, MosExplain, scaleNote, Strip, Tag, When, type Tone } from '../ui.tsx';
+import {
+  Badge,
+  CALL_QUALITY,
+  Facts,
+  Mos,
+  MosExplain,
+  scaleNote,
+  Strip,
+  Tag,
+  When,
+  type Tone,
+} from '../ui.tsx';
 
 function Hero() {
   const s = state.value;
@@ -197,12 +208,18 @@ function PathFacts(props: { p: PathHealth; target: string }) {
     <Facts
       items={[
         { label: 'Latency', value: ms(p.median), sub: 'median to ' + props.target },
-        { label: 'Jitter', value: ms(p.jitter), sub: 'mean |ΔRTT|' },
+        {
+          label: 'Jitter',
+          value: ms(p.jitter),
+          sub: 'variation between replies',
+          title: 'Average change in round-trip time from one reply to the next.',
+        },
         { label: 'Loss', value: percent(p.loss.pct), sub: lossSub(p, props.target) },
         {
-          label: 'MOS',
+          label: 'Call quality',
+          title: CALL_QUALITY,
           value: <Mos score={p.score} />,
-          sub: p.score ? 'R ' + p.score.r.toFixed(1) : 'needs latency, jitter, loss',
+          sub: p.score ? 'score out of 5' : 'needs latency, jitter, loss',
         },
       ]}
     />
@@ -251,7 +268,7 @@ function InternetCard(props: { item: Health }) {
     <Card item={props.item} title="Internet (direct WAN)">
       {!p ? (
         <Enable
-          text="Measure the active uplink without the VPN: latency, jitter, loss and MOS to each destination."
+          text="Measure the active uplink without the VPN: latency, jitter, loss and call quality to each destination."
           label="Measure direct internet"
           onClick={() =>
             void enableSetting(
@@ -365,7 +382,7 @@ function WifiCard(props: { item: Health }) {
     >
       {!w.enabled ? (
         <Enable
-          text="Record signal, noise, PHY rate, retries and channel load of the network this router joins as a repeater."
+          text="Record signal, noise, link rate, retries and channel load of the network this router joins as a repeater."
           label="Monitor upstream Wi-Fi"
           onClick={() =>
             void enableSetting(
@@ -399,11 +416,17 @@ function WifiCard(props: { item: Health }) {
                 sub: finite(l.signal) ? levelBadge(wifiLevel.signal(l.signal)) : '',
               },
               {
-                label: 'SNR',
+                label: 'Signal to noise',
+                title: 'How far the signal stands above background noise, in dB. Higher is better.',
                 value: finite(snr) ? snr + ' dB' : dash,
                 sub: finite(snr) ? levelBadge(wifiLevel.snr(snr)) : '',
               },
-              { label: 'PHY tx / rx', value: kbit(l.tx.kbps), sub: 'rx ' + kbit(l.rx.kbps) },
+              {
+                label: 'Link rate',
+                title: 'Negotiated radio rate to the access point, not actual throughput.',
+                value: kbit(l.tx.kbps) + ' up',
+                sub: kbit(l.rx.kbps) + ' down',
+              },
               {
                 label: 'Channel busy',
                 value: percent(busyPct),
@@ -451,7 +474,7 @@ function RouterCard(props: { item: Health }) {
     >
       {!s.config.telemetry ? (
         <Enable
-          text="Router and interface telemetry: CPU, memory, temperature, conntrack, per-interface throughput, WireGuard handshakes."
+          text="Router and interface telemetry: CPU, memory, temperature, tracked connections, per-interface throughput, WireGuard handshakes."
           label="Record router telemetry"
           onClick={() =>
             void enableSetting(
@@ -483,7 +506,8 @@ function RouterCard(props: { item: Health }) {
               sub: over(sys.temperature, routerLimits.temperature),
             },
             {
-              label: 'Conntrack',
+              label: 'Tracked connections',
+              title: 'Connections the router firewall is tracking (conntrack), against its limit.',
               value: finite(sys.conntrack) ? String(sys.conntrack) : dash,
               sub:
                 over(ct, routerLimits.conntrack) ||
@@ -515,9 +539,9 @@ export function OverviewView() {
       </div>
       <p className="wl-muted wl-small">
         Health states are heuristics: Down means an ongoing incident (every probe lost for at least
-        15 s) or a disconnected link; Degraded means loss ≥ 1 %, MOS below 3.6, a Wi-Fi metric in
-        its poor band, or router CPU, memory or conntrack ≥ {routerLimits.cpu} % or temperature ≥{' '}
-        {routerLimits.temperature} °C.
+        15 s) or a disconnected link; Degraded means loss ≥ 1 %, call quality below 3.6, a Wi-Fi
+        metric in its poor band, or router CPU, memory or tracked connections ≥ {routerLimits.cpu} %
+        or temperature ≥ {routerLimits.temperature} °C.
       </p>
       <div className="wl-split">
         <section className="wl-panel" aria-labelledby="wl-ov-incidents">

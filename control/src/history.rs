@@ -1081,6 +1081,55 @@ pub fn logged_incidents(
     stored
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Storage {
+    root: String,
+    in_memory: bool,
+    days: u32,
+    bytes: u64,
+    cap: u64,
+    tiers: Vec<columnar::TierFiles>,
+    kept: Vec<Kept>,
+    records: Vec<journal::Summary>,
+    dimensions: Option<u64>,
+    legacy: Vec<String>,
+    pending: usize,
+    last_collect: Option<u64>,
+}
+
+pub fn storage(config: &Settings) -> Storage {
+    let root = root(config);
+    let legacy = LEGACY
+        .iter()
+        .chain(&["events.json", "incidents.json"])
+        .filter(|name| root.join(name).exists())
+        .map(|name| (*name).to_owned())
+        .collect();
+    Storage {
+        in_memory: root.starts_with(RUNTIME),
+        root: root.display().to_string(),
+        days: config.history_days,
+        bytes: columnar::bytes(&root),
+        cap: columnar::cap(&root),
+        tiers: columnar::inventory(&root),
+        kept: availability(config).tiers,
+        records: vec![
+            journal::summary::<Event>(&root),
+            journal::summary::<Logged>(&root),
+        ],
+        dimensions: fs::metadata(root.join("dimensions.parquet"))
+            .ok()
+            .map(|meta| meta.len()),
+        legacy,
+        pending: fs::read_dir(pending_dir(&root)).map_or(0, Iterator::count),
+        last_collect: fs::read_to_string(Path::new(RUNTIME).join("last-collect"))
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|seconds| seconds * 1_000),
+    }
+}
+
 pub fn report(config: &Settings) -> Report {
     let root = root(config);
     let mut lines = columnar::report(&root);

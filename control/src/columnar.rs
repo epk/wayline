@@ -621,6 +621,59 @@ pub fn series(
     Ok(found)
 }
 
+#[derive(serde::Serialize)]
+pub struct TierFiles {
+    pub kind: String,
+    pub step: u64,
+    pub files: usize,
+    pub bytes: u64,
+    pub first: Option<u64>,
+    pub last: Option<u64>,
+}
+
+pub fn inventory(root: &Path) -> Vec<TierFiles> {
+    let mut found = Vec::new();
+    for dir in kinds(root) {
+        let Some(kind) = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("kind="))
+        else {
+            continue;
+        };
+        for tier in tiers() {
+            let starts = starts(&dir.join(format!("step={}", tier.step)), tier.step);
+            if starts.is_empty() {
+                continue;
+            }
+            let bytes = starts
+                .iter()
+                .filter_map(|start| {
+                    fs::metadata(chunk_path(
+                        &dir.join(format!("step={}", tier.step)),
+                        *start,
+                        tier.step,
+                    ))
+                    .ok()
+                })
+                .map(|meta| meta.len())
+                .sum();
+            found.push(TierFiles {
+                kind: kind.to_owned(),
+                step: tier.step,
+                files: starts.len(),
+                bytes,
+                first: starts.first().map(|start| start * tier.step * 1_000),
+                last: starts
+                    .last()
+                    .map(|start| (start + tier.span) * tier.step * 1_000),
+            });
+        }
+    }
+    found.sort_by(|left, right| (&left.kind, left.step).cmp(&(&right.kind, right.step)));
+    found
+}
+
 pub fn report(root: &Path) -> Vec<String> {
     let found = files(root);
     let total: u64 = found.iter().map(|(_, bytes, _)| bytes).sum();

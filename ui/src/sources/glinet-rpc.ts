@@ -8,10 +8,26 @@ export type Transport = (
   timeout: number,
 ) => unknown;
 
-export const reads = ['get_state', 'get_history', 'get_wifi_history', 'get_telemetry_history'];
+export const reads = [
+  'get_state',
+  'get_history',
+  'get_wifi_history',
+  'get_telemetry_history',
+  'get_diagnostics',
+];
 export const writeObject = 'wayline_' + WAYLINE_VERSION.replace(/\./g, '_');
+// GL.iNet's web server loads an RPC script once per object name and keeps it.
+// The reads from the first release stay on the stable name so an older page can
+// still detect a version change; anything newer uses the per-release name,
+// which every upgrade loads fresh.
+export const stableReads = [
+  'get_state',
+  'get_history',
+  'get_wifi_history',
+  'get_telemetry_history',
+];
 export const objectFor = (method: string): string =>
-  reads.includes(method) ? 'wayline' : writeObject;
+  stableReads.includes(method) ? 'wayline' : writeObject;
 export const timeoutFor = (method: string): number =>
   method === 'set_tunnel_enabled' ? 75000 : method === 'select_tunnel' ? 45000 : 12000;
 export const staleMessage = 'The Wayline version changed. Reload the page before another change.';
@@ -69,6 +85,10 @@ export class GlinetRpcSource implements DataSource {
       await this.call('get_wifi_history', { ...query, format: 'arrow' }),
       wifiDoc,
     );
+  }
+
+  getDiagnostics(): Promise<unknown> {
+    return this.call('get_diagnostics');
   }
 
   async getTelemetryHistory(query: HistoryQuery) {

@@ -1009,6 +1009,63 @@ window.previewApi = {
     await later(120);
     return wifiHistory(start, end, step);
   },
+  get_diagnostics: async () => {
+    await later(120);
+    const now = Date.now();
+    const hour = 3_600_000;
+    const tier = (kind, step, files, size, span) => ({
+      kind,
+      step,
+      files,
+      bytes: size,
+      first: now - span,
+      last: now,
+    });
+    return {
+      healthy: true,
+      warnings: 0,
+      generated: now,
+      checks: [
+        { status: 'info', label: 'package version', detail: release },
+        { status: 'ok', label: 'firmware support', detail: 'full (tested module). Preview data.' },
+        { status: 'ok', label: '/www/views/wayline', detail: '13 page chunks' },
+        { status: 'ok', label: 'monitor service', detail: 'running' },
+        { status: 'ok', label: 'WAN path', detail: 'wwan on apclii0' },
+        { status: 'info', label: 'measurement series', detail: '7' },
+        { status: 'info', label: 'probe interval', detail: '1 s' },
+      ],
+      storage: {
+        root: '/etc/wayline/history',
+        inMemory: false,
+        days: 30,
+        bytes: 398_862,
+        cap: 100_663_296,
+        tiers: [
+          tier('latency', 15, 5, 95_138, 6 * hour),
+          tier('latency', 60, 2, 32_334, 24 * hour),
+          tier('latency', 300, 2, 21_807, 72 * hour),
+          tier('latency', 3600, 1, 9_602, 168 * hour),
+          tier('wifi', 15, 5, 51_036, 6 * hour),
+          tier('system', 15, 5, 33_291, 6 * hour),
+          tier('interface', 15, 5, 45_032, 6 * hour),
+        ],
+        kept: [
+          { step: 15, keptSeconds: 21_600 },
+          { step: 60, keptSeconds: 259_200 },
+          { step: 300, keptSeconds: 2_592_000 },
+          { step: 3600, keptSeconds: 2_592_000 },
+        ],
+        records: [
+          { kind: 'event', files: 1, rows: 16, bytes: 2_558, first: now - 5 * hour, last: now },
+          { kind: 'incident', files: 1, rows: 2, bytes: 1_802, first: now - 4 * hour, last: now },
+        ],
+        dimensions: 3_686,
+        legacy: [],
+        pending: 0,
+        lastCollect: now - 120_000,
+      },
+    };
+  },
   get_telemetry_history: async ({ start, end, step, format }) => {
     if (format !== 'arrow') throw Error('The preview only serves Arrow history.');
     if (!state.config.telemetry) throw Error('Router telemetry is off.');
@@ -1037,10 +1094,18 @@ window.previewApi = {
     ]),
 };
 
-const reads = ['get_state', 'get_history', 'get_wifi_history', 'get_telemetry_history'];
+const reads = [
+  'get_state',
+  'get_history',
+  'get_wifi_history',
+  'get_telemetry_history',
+  'get_diagnostics',
+];
 window.previewRpc = (method, params) => {
   const [sid, object, operation, request] = params;
-  const expected = reads.includes(operation) ? 'wayline' : 'wayline_' + release.replace(/\./g, '_');
+  const expected = reads.slice(0, 4).includes(operation)
+    ? 'wayline'
+    : 'wayline_' + release.replace(/\./g, '_');
   if (
     method !== 'call' ||
     sid !== 'sid' ||
@@ -1063,6 +1128,9 @@ class PreviewSource {
   }
   getState() {
     return this.api.get_state();
+  }
+  getDiagnostics() {
+    return this.api.get_diagnostics();
   }
   async getHistory(query) {
     return decodeHistory(await this.api.get_history({ ...query, format: 'arrow' }), latencyDoc);
