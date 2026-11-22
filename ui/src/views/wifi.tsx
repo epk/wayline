@@ -349,7 +349,7 @@ export function WifiView() {
           <p>
             Retries = retried / (sent + retried) frames. Failures = failed / sent frames. Counters
             reset on reassociation. Channel busy = Δbusy / Δactive time of the serving frequency.
-            Own airtime = Δ(rx + tx) / Δactive. Others = busy − own.
+            Own airtime = Δ(receive + send time) / Δactive. Others = busy − own.
           </p>
           <p>
             A drop is connected → disconnected, a silent reassociation, or a change of network. A
@@ -438,14 +438,14 @@ export function WifiView() {
             y={(_l, high) => [0, Math.min(100, Math.max(10, high * 1.2))]}
           />
           <Chart
-            title="Airtime: own vs others (%)"
-            detail={scaleNote('buckets') + ' · own = rx + tx air, others = busy − own'}
+            title="Airtime: this router vs others (%)"
+            detail={scaleNote('buckets') + ' · this router = its own receive and send time'}
             label="Airtime used by this router versus other stations"
             x={built.x}
             ys={built.air}
             lines={[
               { label: 'Channel busy', color: 'series-6', width: 1 },
-              { label: 'Own (rx + tx)', color: 'series-2', width: 1.5, fill: 0.35 },
+              { label: 'This router', color: 'series-2', width: 1.5, fill: 0.35 },
               { label: 'Others', color: 'series-1', width: 1.5 },
             ]}
             bands={[{ upper: 0, lower: 1, color: 'series-1', alpha: 0.18 }]}

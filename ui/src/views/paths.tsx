@@ -666,8 +666,10 @@ function History() {
   const fmt = (v: number) => v.toFixed(2) + ' ms';
   const active = (row: Row) => row.tunnel && !!tunnels.find((t) => t.id === row.owner)?.preferred;
   const pick = (row: Row, e: Event | undefined) => {
-    const k = e as KeyboardEvent | MouseEvent | undefined;
-    isolate(row.owner, row.tunnel, !!k && (k.ctrlKey || k.metaKey || k.shiftKey));
+    const k = e as KeyboardEvent | PointerEvent | undefined;
+    // A finger has no Ctrl key, so each tap adds or removes one series.
+    const touch = !!k && 'pointerType' in k && k.pointerType !== '' && k.pointerType !== 'mouse';
+    isolate(row.owner, row.tunnel, !!k && (touch || k.ctrlKey || k.metaKey || k.shiftKey));
   };
   return (
     <Panel
@@ -675,14 +677,21 @@ function History() {
       title={'Latency to ' + target}
       sub={scaleNote('medians') + '. Gaps mean no measurement.'}
       foot={
-        <ul className="wl-tips" aria-label="Chart controls">
-          <li>Click a series to show only it</li>
-          <li>
-            <kbd>Ctrl</kbd> or <kbd>⌘</kbd>-click to add more
-          </li>
-          <li>Drag to zoom</li>
-          <li>Double-click to reset</li>
-        </ul>
+        <>
+          <ul className="wl-tips wl-for-mouse" aria-label="Chart controls">
+            <li>Click a series to show only it</li>
+            <li>
+              <kbd>Ctrl</kbd> or <kbd>⌘</kbd>-click to add more
+            </li>
+            <li>Drag to zoom</li>
+            <li>Double-click to reset</li>
+          </ul>
+          <ul className="wl-tips wl-for-touch" aria-label="Chart controls">
+            <li>Tap series to show only those</li>
+            <li>Tap one again to hide it</li>
+            <li>Pick a range above to zoom</li>
+          </ul>
+        </>
       }
     >
       {built.rows.length > 0 && (

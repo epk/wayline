@@ -117,16 +117,16 @@ export function TrafficView() {
                   <th scope="col">Interface</th>
                   <th scope="col">Kind</th>
                   <th scope="col" className="wl-n">
-                    Rx rate
+                    Receive rate
                   </th>
                   <th scope="col" className="wl-n">
-                    Tx rate
+                    Send rate
                   </th>
                   <th scope="col" className="wl-n">
-                    Rx total
+                    Received
                   </th>
                   <th scope="col" className="wl-n">
-                    Tx total
+                    Sent
                   </th>
                   <th scope="col" className="wl-n">
                     Errors
@@ -152,16 +152,16 @@ export function TrafficView() {
                         )}
                       </th>
                       <td data-label="Kind">{i.kind}</td>
-                      <td className="wl-n wl-num" data-label="Rx rate">
+                      <td className="wl-n wl-num" data-label="Receive rate">
                         {bits(i.rxBps)}
                       </td>
-                      <td className="wl-n wl-num" data-label="Tx rate">
+                      <td className="wl-n wl-num" data-label="Send rate">
                         {bits(i.txBps)}
                       </td>
-                      <td className="wl-n wl-num" data-label="Rx total">
+                      <td className="wl-n wl-num" data-label="Received">
                         {bytes(i.rxBytes)}
                       </td>
-                      <td className="wl-n wl-num" data-label="Tx total">
+                      <td className="wl-n wl-num" data-label="Sent">
                         {bytes(i.txBytes)}
                       </td>
                       <td className="wl-n wl-num" data-label="Errors">
@@ -220,14 +220,14 @@ export function TrafficView() {
             <Chart
               key={i.id}
               title={i.name + ' throughput (bit/s)'}
-              label={'Receive and transmit throughput of ' + i.name}
+              label={'Receive and send throughput of ' + i.name}
               x={built.x}
               ys={[i.rx, i.rxPeak, i.tx, i.txPeak]}
               lines={[
-                { label: 'Rx average', color: 'series-2', width: 1.8 },
-                { label: 'Rx peak', color: 'series-2', width: 1, dash: [2, 3] },
-                { label: 'Tx average', color: 'series-1', width: 1.8 },
-                { label: 'Tx peak', color: 'series-1', width: 1, dash: [2, 3] },
+                { label: 'Receive average', color: 'series-2', width: 1.8 },
+                { label: 'Receive peak', color: 'series-2', width: 1, dash: [2, 3] },
+                { label: 'Send average', color: 'series-1', width: 1.8 },
+                { label: 'Send peak', color: 'series-1', width: 1, dash: [2, 3] },
               ]}
               format={bits}
               axis={rateAxis}

@@ -2008,6 +2008,18 @@ th[aria-sort='descending'] .wl-sort::after {
     position-area: block-start span-inline-start;
   }
 }
+/* Chart hints for the device in hand: mouse gestures, or taps. */
+.wl-for-touch {
+  display: none !important;
+}
+@media (pointer: coarse) {
+  .wl-for-mouse {
+    display: none !important;
+  }
+  .wl-for-touch {
+    display: flex !important;
+  }
+}
 /* Fingers need more than the 18px line box: widen the tap area invisibly. */
 @media (pointer: coarse) {
   .wl-tip::before {
