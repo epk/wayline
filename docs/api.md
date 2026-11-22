@@ -12,7 +12,16 @@ Every call is `$rpcRequest('call', ['sid', object, method, params])`.
 
 Reads: `get_state`, `get_history`, `get_wifi_history`, `get_telemetry_history`, `get_diagnostics`.
 Writes: `set_config`, `select_tunnel`, `set_tunnel_enabled`, `purge_history`,
-`check_update`, `install_update` (unchanged from v1).
+`check_update`, `install_update` (unchanged from v1), `clear_update`.
+
+`update.needsAttention` is true after an installation was interrupted or its
+result could not be confirmed. The flag is kept in `/etc/wayline/update-attention`,
+so it survives a reboot. While it is set, checks still run but installs,
+manual or automatic, are refused. `clear_update` (no parameters) first confirms
+that `/usr/share/wayline/version` matches the package manager's record for
+`wayline` and that both binaries exist, then clears the flag. It replies
+`{ "cleared": true, "update": <update status> }`, or fails with the reason the
+installed package does not check out. `wayline-ctl update --clear` does the same.
 
 Times are Unix milliseconds unless a field name ends in `Seconds` or the field
 is documented as seconds. Latency values on the wire are integer microseconds.
@@ -61,6 +70,12 @@ Unchanged v1 fields, plus:
 - `tunnels[].samples`, `tunnels[].lost`, `uplinks[].samples`,
   `uplinks[].lost`: probes in the recent window and how many were lost.
 
+- `egress.paths[].verified: boolean`: always false for now. The exit IP,
+  `location` and `colo` come from `http://1.1.1.1/cdn-cgi/trace` over plain
+  HTTP, so anyone on the path (the ISP, or the VPN provider inside a tunnel) can
+  change them. HTTPS through `curl` is not used because curl cannot set the
+  socket mark that GL.iNet policy routing needs to send the probe through a
+  given tunnel, and the control program has no TLS library of its own.
 - `config.upstreamWifi: boolean`, `config.telemetry: boolean`.
 - `probe: { interval: seconds, timeout: ms }`.
 - `tunnels[].jitter`, `uplinks[].jitter`: `number | null`, milliseconds, mean

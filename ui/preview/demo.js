@@ -17,7 +17,8 @@ const level = ['monitoring', 'unsupported', 'newer'].includes(query.get('compat'
   ? query.get('compat')
   : 'full';
 const wanDown = query.get('wan') === 'unavailable';
-const updateFailed = query.get('update') === 'failed';
+const updateLatched = query.get('update') === 'latched';
+const updateFailed = updateLatched || query.get('update') === 'failed';
 const release = '0.1.0-alpha.25';
 const installed = query.get('stale') === '1' ? '0.0.0' : release;
 const directExit = query.get('exit') === 'direct';
@@ -49,9 +50,11 @@ const state = {
         latest: release,
         available: true,
         phase: 'failed',
-        message: 'The package signature did not match. Nothing was installed.',
+        message: updateLatched
+          ? 'Update stopped. opkg did not finish in time.'
+          : 'The package signature did not match. Nothing was installed.',
         failed: true,
-        needsAttention: true,
+        needsAttention: updateLatched,
         checkedAt: nowSeconds() - 120,
         updatedAt: nowSeconds() - 120,
       }
@@ -1092,6 +1095,17 @@ window.previewApi = {
             ],
           ]),
     ]),
+  clear_update: () => {
+    state.update = {
+      ...state.update,
+      phase: 'idle',
+      failed: false,
+      needsAttention: false,
+      message: 'Wayline ' + installed + ' matches the package manager. Updates can run again.',
+      updatedAt: nowSeconds(),
+    };
+    return Promise.resolve({ cleared: true, update: copy(state.update) });
+  },
 };
 
 const reads = [
@@ -1125,6 +1139,7 @@ class PreviewSource {
     this.purgeHistory = (request) => api.purge_history(request);
     this.checkUpdate = () => api.check_update();
     this.installUpdate = () => api.install_update();
+    this.clearUpdate = () => api.clear_update();
   }
   getState() {
     return this.api.get_state();

@@ -25,6 +25,8 @@ pub struct Record {
     unhealthy_since: Option<u64>,
     #[serde(default)]
     observed_at: u64,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -208,22 +210,133 @@ pub fn step(config: &Settings) -> Result<()> {
                 .map_or_else(|| target.clone(), |tunnel| tunnel.name.clone()),
             reason: reason.text().into(),
         };
+        let before = match Snapshot::take() {
+            Ok(before) => before,
+            Err(error) => {
+                record.last_error = Some(format!("{error:#}"));
+                return record.write();
+            }
+        };
+        let idle_since = record.at;
         record.at = runtime::now();
         record.needs_attention = true;
         record.write()?;
-        api::apply(&target, &revision, api::Selection::Automatic)?;
-        Record {
-            at: runtime::now(),
-            last: Some(switch),
-            ..Record::default()
+        match api::apply(&target, &revision, api::Selection::Automatic) {
+            Ok(_) => Record {
+                at: runtime::now(),
+                last: Some(switch),
+                ..Record::default()
+            }
+            .write(),
+            Err(error) => {
+                let after = Snapshot::take().ok();
+                record.failed(idle_since, &before, after.as_ref(), &error);
+                record.write()?;
+                Err(error)
+            }
         }
-        .write()
     })
+}
+
+#[derive(PartialEq)]
+struct Snapshot {
+    revision: String,
+    order: Vec<(u32, bool)>,
+    defaults: serde_json::Value,
+}
+
+impl Snapshot {
+    fn take() -> Result<Self> {
+        let list = native::List::read()?;
+        Ok(Self {
+            revision: router::revision()?,
+            order: list
+                .tunnels
+                .iter()
+                .map(|tunnel| (tunnel.number, tunnel.enabled))
+                .collect(),
+            defaults: list.default_tunnels,
+        })
+    }
+}
+
+impl Record {
+    fn failed(
+        &mut self,
+        idle_since: u64,
+        before: &Snapshot,
+        after: Option<&Snapshot>,
+        error: &anyhow::Error,
+    ) {
+        self.last_error = Some(format!("{error:#}"));
+        if after == Some(before) {
+            self.at = idle_since;
+            self.needs_attention = false;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Reason, Record, View, decide};
+    use super::{Reason, Record, Snapshot, View, decide};
+
+    fn snapshot(order: &[(u32, bool)]) -> Snapshot {
+        Snapshot {
+            revision: "abc".into(),
+            order: order.to_vec(),
+            defaults: serde_json::json!([1]),
+        }
+    }
+
+    fn attempted() -> Record {
+        Record {
+            at: 2000,
+            needs_attention: true,
+            ..Record::default()
+        }
+    }
+
+    #[test]
+    fn a_failure_that_left_the_router_unchanged_retries() {
+        let before = snapshot(&[(1, true), (2, true)]);
+        let mut record = attempted();
+        record.failed(
+            1000,
+            &before,
+            Some(&snapshot(&[(1, true), (2, true)])),
+            &anyhow::anyhow!("State changed before selection. Refresh first."),
+        );
+        assert!(!record.needs_attention);
+        assert_eq!(record.at, 1000);
+        assert_eq!(
+            record.last_error.as_deref(),
+            Some("State changed before selection. Refresh first.")
+        );
+    }
+
+    #[test]
+    fn an_unverifiable_outcome_latches() {
+        let before = snapshot(&[(1, true), (2, true)]);
+        let error = anyhow::anyhow!("Selection changed concurrently. Refresh first.");
+        let mut changed = attempted();
+        changed.failed(
+            1000,
+            &before,
+            Some(&snapshot(&[(2, true), (1, true)])),
+            &error,
+        );
+        assert!(changed.needs_attention);
+        assert_eq!(changed.at, 2000);
+        let mut moved = attempted();
+        let mut revised = snapshot(&[(1, true), (2, true)]);
+        revised.revision = "def".into();
+        moved.failed(1000, &before, Some(&revised), &error);
+        assert!(moved.needs_attention);
+        let mut unknown = attempted();
+        unknown.failed(1000, &before, None, &error);
+        assert!(unknown.needs_attention);
+        assert!(unknown.last_error.is_some());
+    }
 
     fn view(id: &str, eligible: bool, median: Option<f64>) -> View<'_> {
         View {

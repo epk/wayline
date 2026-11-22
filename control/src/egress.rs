@@ -79,6 +79,8 @@ pub struct Egress {
     pub location: Option<String>,
     pub colo: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub verified: bool,
 }
 
 struct Trace {
@@ -114,6 +116,7 @@ fn probe_paths(paths: &[&PathInfo]) -> Vec<Egress> {
                 location: None,
                 colo: None,
                 error: None,
+                verified: false,
             };
             match outcome
                 .context("The egress probe timed out.")
@@ -222,11 +225,14 @@ pub fn render(results: &[Egress]) -> String {
             let head = format!("{} ({}):", egress.name, egress.interface);
             match (&egress.ip, &egress.error) {
                 (Some(ip), _) => {
-                    let details: Vec<&str> = [&egress.location, &egress.colo]
+                    let mut details: Vec<&str> = [&egress.location, &egress.colo]
                         .into_iter()
                         .flatten()
                         .map(String::as_str)
                         .collect();
+                    if !egress.verified {
+                        details.push("(unverified, plain HTTP)");
+                    }
                     if details.is_empty() {
                         format!("{head} {ip}")
                     } else {
@@ -239,4 +245,42 @@ pub fn render(results: &[Egress]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cache, Egress, render};
+    use anyhow::{Result, ensure};
+
+    fn egress(verified: bool) -> Egress {
+        Egress {
+            id: "wan".into(),
+            name: "WAN".into(),
+            interface: "eth1".into(),
+            ip: Some("203.0.113.7".into()),
+            location: Some("CA".into()),
+            colo: Some("YYZ".into()),
+            error: None,
+            verified,
+        }
+    }
+
+    #[test]
+    fn plain_http_results_are_labelled_unverified() -> Result<()> {
+        ensure!(
+            render(&[egress(false)]) == "WAN (eth1): 203.0.113.7  CA YYZ (unverified, plain HTTP)"
+        );
+        ensure!(render(&[egress(true)]) == "WAN (eth1): 203.0.113.7  CA YYZ");
+        let cache = Cache {
+            checked_at: 1,
+            paths: vec![egress(false)],
+        };
+        let value = serde_json::to_value(&cache)?;
+        ensure!(value["paths"][0]["verified"] == false);
+        let old: Cache = serde_json::from_str(
+            r#"{"checkedAt":1,"paths":[{"id":"wan","name":"WAN","interface":"eth1","ip":"203.0.113.7","location":null,"colo":null,"error":null}]}"#,
+        )?;
+        ensure!(old.paths.iter().all(|path| !path.verified));
+        Ok(())
+    }
 }

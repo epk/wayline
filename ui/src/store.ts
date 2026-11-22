@@ -280,6 +280,7 @@ export const updateState = computed(() => {
     message: updateError.value || u.message || '',
     failed: !!updateError.value || !!u.failed,
     checkedAt: u.checkedAt || 0,
+    latched: !!u.needsAttention,
   };
 });
 export const updateActive = computed(() => updatePhases.includes(state.value.update?.phase || ''));
@@ -753,25 +754,22 @@ export function say(text: string): void {
   if (text && !text.endsWith('…')) noticeTimer = setTimeout(() => (notice.value = ''), 10000);
 }
 
-export async function installUpdate(): Promise<void> {
+async function runUpdate(
+  command: 'installUpdate' | 'checkUpdate' | 'clearUpdate',
+  fallback: string,
+): Promise<void> {
   updateError.value = '';
   try {
-    const r = await write('installUpdate')();
+    const r = await write(command)();
     setUpdate(r.update);
   } catch (e) {
-    updateError.value = describe(e, 'Update unavailable.');
+    updateError.value = describe(e, fallback);
   }
 }
 
-export async function checkUpdates(): Promise<void> {
-  updateError.value = '';
-  try {
-    const r = await write('checkUpdate')();
-    setUpdate(r.update);
-  } catch (e) {
-    updateError.value = describe(e, 'Update check unavailable.');
-  }
-}
+export const installUpdate = () => runUpdate('installUpdate', 'Update unavailable.');
+export const checkUpdates = () => runUpdate('checkUpdate', 'Update check unavailable.');
+export const clearUpdate = () => runUpdate('clearUpdate', 'Could not clear the update block.');
 
 function setUpdate(update: UpdateStatus | undefined): void {
   if (!update || typeof update !== 'object') return;

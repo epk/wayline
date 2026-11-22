@@ -123,9 +123,18 @@ function Hero() {
       <div className="wl-hero-grid">
         {columns.map((c, i) => {
           const ip = c.egress && !c.egress.error ? c.egress.ip : '';
+          const unverified = ip && !c.egress?.verified;
           return (
             <div key={c.label} className={i ? 'wl-hero-secondary' : 'wl-hero-primary'}>
-              <p className="wl-label">{c.label}</p>
+              <p className="wl-label">
+                {c.label}
+                {unverified && (
+                  <span title="Read over plain HTTP, so the network path can change it.">
+                    {' '}
+                    (unverified)
+                  </span>
+                )}
+              </p>
               {ip ? (
                 <p className="wl-hero-ip wl-num">{ip}</p>
               ) : (

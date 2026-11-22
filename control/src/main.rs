@@ -68,6 +68,7 @@ fn run() -> Result<Value> {
         "select_tunnel" => api::select(&parse(&raw)?),
         "set_tunnel_enabled" => api::set_tunnel_enabled(&parse(&raw)?),
         "check_update" | "install_update" => api::start_update(&method),
+        "clear_update" => api::clear_update(),
         "tick" => applied(service::tick()),
         "restart" => applied(service::restart()),
         "boot" | "start" | "reload" | "reconcile" => applied(service::reconcile()),
@@ -87,12 +88,14 @@ Commands for people:
   doctor           Check the installation and print a report to share.
   update           Install the newest signed release, including alpha and beta releases.
   update --check   Report whether a newer signed release exists.
+  update --clear   After an interrupted update, confirm the installed package
+                   matches the package manager and allow updates again.
   egress           Show the public egress IP through each tunnel and the WAN uplink.
 
 The admin page, the scheduler and the service manager use the remaining
 operations, which print JSON: get_state, get_history, get_wifi_history,
 get_telemetry_history, get_diagnostics, purge_history, set_config,
-select_tunnel, set_tunnel_enabled, check_update, install_update,
+select_tunnel, set_tunnel_enabled, check_update, install_update, clear_update,
 tick, boot, start, stop, restart, reload, running, enabled, install, remove.";
 
 fn human(command: &str, option: Option<&str>) -> Option<Result<bool>> {
@@ -118,6 +121,12 @@ fn human(command: &str, option: Option<&str>) -> Option<Result<bool>> {
                     true
                 }),
         ),
+        ("update", Some("--clear")) => {
+            Some(privileged().and_then(|()| update::clear()).map(|status| {
+                println!("{}", status.message());
+                true
+            }))
+        }
         ("egress", None) => Some(privileged().and_then(|()| router::inventory()).map(
             |inventory| {
                 println!("{}", egress::render(&egress::probe(&inventory)));
