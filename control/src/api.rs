@@ -890,6 +890,11 @@ pub fn start_update(method: &str) -> Result<Value> {
     Ok(json!({"started":started,"update":update::view()}))
 }
 
+pub fn clear_update() -> Result<Value> {
+    update::clear()?;
+    Ok(json!({"cleared":true,"update":update::view()}))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnostics {

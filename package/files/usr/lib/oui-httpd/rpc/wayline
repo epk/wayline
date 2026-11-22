@@ -12,6 +12,7 @@ local methods = {
     'set_tunnel_enabled',
     'check_update',
     'install_update',
+    'clear_update',
 }
 local module = {}
 local function invoke(method, args)
