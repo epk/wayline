@@ -114,14 +114,112 @@ fn request(method: &str, args: &Value) -> Result<Value> {
         .clone())
 }
 
-pub fn check() -> Result<()> {
-    if !Path::new(ROOT.as_str()).exists() {
-        return Ok(());
+const EVIDENCE: &str = "artifacts/local/current/native-package.json";
+const CHECKS: [&str; 21] = [
+    "package_install_remove",
+    "settings_read_write",
+    "stale_write_rejected",
+    "unchanged_write_avoided",
+    "scheduler_idempotent",
+    "newer_module_compatibility",
+    "native_start_stop",
+    "monitor_choice_retained",
+    "tunnel_priority_retained",
+    "missing_profile_rejected",
+    "invalid_tunnel_request_rejected",
+    "exit_selection",
+    "authenticated_bridge",
+    "single_http_worker",
+    "cached_bridge_reproduced",
+    "missing_session_rejected",
+    "history_purge",
+    "revoked_session_rejected",
+    "local_session_bypass_rejected",
+    "offline_update_failure_reported",
+    "physical_router",
+];
+
+pub struct Evidence(serde_json::Map<String, Value>);
+
+impl Evidence {
+    fn new() -> Self {
+        let mut fields = serde_json::Map::new();
+        fields.insert("firmware_contract".into(), Value::Null);
+        fields.insert("package_format".into(), Value::Null);
+        for check in CHECKS {
+            fields.insert(check.into(), Value::Bool(false));
+        }
+        Self(fields)
     }
+
+    fn pass(&mut self, check: &str) {
+        self.0.insert(check.into(), Value::Bool(true));
+    }
+
+    fn set(&mut self, field: &str, value: Value) {
+        self.0.insert(field.into(), value);
+    }
+
+    fn finish(mut self, status: &str, reason: Option<&str>) -> Result<Value> {
+        self.set("status", json!(status));
+        self.set("reason", json!(reason));
+        let evidence = Value::Object(self.0);
+        let path = Path::new(EVIDENCE);
+        if let Some(directory) = path.parent() {
+            fs::create_dir_all(directory)?;
+        }
+        fs::write(path, serde_json::to_vec_pretty(&evidence)?)?;
+        Ok(evidence)
+    }
+}
+
+pub fn check() -> Result<Value> {
+    let mut evidence = Evidence::new();
+    if !Path::new(ROOT.as_str()).exists() {
+        let reason = format!(
+            "No extracted firmware root at {}. Run cargo xtask lab-native <extracted-root> or set WAYLINE_FIRMWARE_ROOT.",
+            ROOT.as_str()
+        );
+        println!("Native firmware checks skipped. {reason}");
+        return evidence.finish("skipped", Some(&reason));
+    }
+    match run(&mut evidence) {
+        Ok(()) => evidence.finish("passed", None),
+        Err(error) => {
+            println!("Native firmware checks failed. Partial evidence is in {EVIDENCE}.");
+            evidence.finish("failed", Some(&format!("{error:#}")))?;
+            Err(error)
+        }
+    }
+}
+
+fn http_workers() -> Result<usize> {
+    let mut workers = 0;
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            continue;
+        }
+        if fs::read(entry.path().join("cmdline"))
+            .is_ok_and(|command| command.starts_with(b"nginx: worker process"))
+        {
+            workers += 1;
+        }
+    }
+    Ok(workers)
+}
+
+fn run(evidence: &mut Evidence) -> Result<()> {
     let sh = Shell::new()?;
     cmd!(sh, "ip link set lo up").run()?;
+    let firmware = contract(Path::new(ROOT.as_str()))?;
+    evidence.set("firmware_contract", json!(firmware));
     ensure!(
-        FIRMWARE_CONTRACTS.contains(&contract(Path::new(ROOT.as_str()))?.as_str()),
+        FIRMWARE_CONTRACTS.contains(&firmware.as_str()),
         "The firmware contract differs."
     );
     let root = ROOT.as_str();
@@ -202,8 +300,13 @@ pub fn check() -> Result<()> {
         "The native HTTP service exited: {}",
         fs::read_to_string(Path::new(ROOT.as_str()).join("tmp/nginx.log"))?
     );
+    let workers = http_workers()?;
+    evidence.set("http_workers", json!(workers));
+    if workers == 1 {
+        evidence.pass("single_http_worker");
+    }
     println!("{}", call("/bin/ubus", &["list"])?);
-    let result = package_checks();
+    let result = package_checks(evidence);
     if result.is_err() {
         println!(
             "Native HTTP log: {}",
@@ -310,9 +413,10 @@ fn remove_package(format: &str) -> Result<()> {
     Ok(())
 }
 
-fn package_checks() -> Result<()> {
+fn package_checks(evidence: &mut Evidence) -> Result<()> {
     let version = crate::release_version(None)?;
     let format = package_format();
+    evidence.set("package_format", json!(format));
     println!("Checking the {format} package with native firmware binaries.");
     fixtures()?;
     install_package(&version, format)?;
@@ -339,6 +443,7 @@ fn package_checks() -> Result<()> {
         stored == config,
         "Native settings did not persist. Sent {config}, read {stored}."
     );
+    evidence.pass("settings_read_write");
     let path = Path::new(ROOT.as_str()).join("etc/wayline/settings.json");
     let saved = fs::read(&path)?;
     ensure!(
@@ -349,6 +454,7 @@ fn package_checks() -> Result<()> {
         fs::read(&path)? == saved,
         "A rejected settings request changed configuration."
     );
+    evidence.pass("stale_write_rejected");
     let current = request("get_state", &json!({}))?;
     let modified = fs::metadata(&path)?.modified()?;
     request(
@@ -359,15 +465,18 @@ fn package_checks() -> Result<()> {
         fs::metadata(&path)?.modified()? == modified,
         "Unchanged settings caused a write."
     );
+    evidence.pass("unchanged_write_avoided");
     compatibility_checks()?;
-    tunnel_controls()?;
-    bridge_checks()?;
+    evidence.pass("newer_module_compatibility");
+    tunnel_controls(evidence)?;
+    bridge_checks(evidence)?;
     request("install", &json!({}))?;
     let cron = fs::read_to_string(Path::new(ROOT.as_str()).join("etc/crontabs/root"))?;
     ensure!(
         cron.matches("/usr/sbin/wayline-ctl tick").count() == 1,
         "Installation duplicated its scheduler entry."
     );
+    evidence.pass("scheduler_idempotent");
     let started = request("check_update", &json!({}))?;
     ensure!(
         started["started"] == true && started["update"]["current"].is_string(),
@@ -385,21 +494,14 @@ fn package_checks() -> Result<()> {
         update["failed"] == true && update["phase"] == "failed",
         "An offline update failure did not reach the UI state."
     );
+    evidence.pass("offline_update_failure_reported");
     remove_package(format)?;
     ensure!(
         !fs::read_to_string(Path::new(ROOT.as_str()).join("etc/crontabs/root"))?
             .contains("/usr/sbin/wayline-ctl tick"),
         "Removal retained its scheduler entry."
     );
-    fs::create_dir_all("artifacts/local/current")?;
-    fs::write(
-        "artifacts/local/current/native-package.json",
-        serde_json::to_vec_pretty(
-            &json!({"firmware_contract":contract(Path::new(ROOT.as_str()))?,"package_format":format,"package_install_remove":true,"settings_read_write":true,"stale_write_rejected":true,"unchanged_write_avoided":true,"scheduler_idempotent":true,
-                "native_start_stop":true,"monitor_choice_retained":true,"tunnel_priority_retained":true,"missing_profile_rejected":true,"invalid_tunnel_request_rejected":true,
-                "authenticated_bridge":true,"single_http_worker":true,"missing_session_rejected":true,"revoked_session_rejected":true,"local_session_bypass_rejected":true,"physical_router":false}),
-        )?,
-    )?;
+    evidence.pass("package_install_remove");
     Ok(())
 }
 
@@ -481,7 +583,7 @@ fn http_object(sid: &str, object: &str, method: &str, params: &Value) -> Result<
     )?)?)
 }
 
-fn bridge_checks() -> Result<()> {
+fn bridge_checks(evidence: &mut Evidence) -> Result<()> {
     let shadow = Path::new(ROOT.as_str()).join("etc/shadow");
     let original = fs::read_to_string(&shadow)?;
     let crypt = call(
@@ -514,6 +616,7 @@ fn bridge_checks() -> Result<()> {
     fs::write(shadow, original)?;
     let sid = result?;
     cached_bridge_check(&sid)?;
+    evidence.pass("cached_bridge_reproduced");
     let response = http(&sid, "get_state", &json!({}))?;
     ensure!(
         response["error"].is_null() && response["result"]["capabilities"]["control"] == true,
@@ -527,12 +630,15 @@ fn bridge_checks() -> Result<()> {
         http(&sid, "set_tunnel_enabled", &args)?["result"]["unchanged"] == true,
         "An authenticated tunnel control failed."
     );
+    evidence.pass("authenticated_bridge");
     let policy = fs::read(Path::new(ROOT.as_str()).join("etc/config/route_policy"))?;
     ensure!(
         http("", "set_tunnel_enabled", &args)?["error"].is_object(),
         "The bridge accepted a missing session."
     );
+    evidence.pass("missing_session_rejected");
     purge_checks(&sid)?;
+    evidence.pass("history_purge");
     session("logout", &json!({"sid":sid}))?;
     ensure!(
         http(&sid, "set_tunnel_enabled", &args)?["error"].is_object(),
@@ -542,6 +648,7 @@ fn bridge_checks() -> Result<()> {
         fs::read(Path::new(ROOT.as_str()).join("etc/config/route_policy"))? == policy,
         "A rejected session changed the policy."
     );
+    evidence.pass("revoked_session_rejected");
     ensure!(
         session(
             "call",
@@ -550,7 +657,8 @@ fn bridge_checks() -> Result<()> {
             .is_object(),
         "A local RPC request bypassed administrator access."
     );
-    println!("Native authenticated bridge checks passed with one HTTP worker.");
+    evidence.pass("local_session_bypass_rejected");
+    println!("Native authenticated bridge checks passed.");
     Ok(())
 }
 
@@ -668,7 +776,7 @@ fn purge_checks(sid: &str) -> Result<()> {
     Ok(())
 }
 
-fn tunnel_controls() -> Result<()> {
+fn tunnel_controls(evidence: &mut Evidence) -> Result<()> {
     let init = Path::new(ROOT.as_str()).join("etc/init.d/vpn-client");
     let original_init = init.with_file_name("vpn-client-wayline-original");
     fs::rename(&init, &original_init)?;
@@ -676,11 +784,11 @@ fn tunnel_controls() -> Result<()> {
         "target/aarch64-unknown-linux-musl/release/wayline-dev",
         &init,
     )?;
-    let result = tunnel_control_checks();
-    let result = result.and_then(|()| selection_checks());
+    let result = tunnel_control_checks(evidence).and_then(|()| selection_checks());
     let restored = fs::rename(original_init, init);
     result?;
     restored?;
+    evidence.pass("exit_selection");
     Ok(())
 }
 
@@ -786,7 +894,23 @@ fn selection_scenarios() -> Result<()> {
     Ok(())
 }
 
-fn tunnel_control_checks() -> Result<()> {
+fn rejected_tunnel_request(request: &Value, path: &Path, saved: &[u8]) -> Result<()> {
+    ensure!(
+        call(
+            "/usr/sbin/wayline-ctl",
+            &["set_tunnel_enabled", &request.to_string()]
+        )
+        .is_err(),
+        "An invalid tunnel request succeeded: {request}"
+    );
+    ensure!(
+        fs::read(path)? == saved,
+        "A rejected tunnel request changed the policy."
+    );
+    Ok(())
+}
+
+fn tunnel_control_checks(evidence: &mut Evidence) -> Result<()> {
     let state = request("get_state", &json!({}))?;
     let path = Path::new(ROOT.as_str()).join("etc/config/route_policy");
     let saved = fs::read(&path)?;
@@ -804,21 +928,16 @@ fn tunnel_control_checks() -> Result<()> {
         json!({"section_id":"wayline_lab","enabled":true,"expected_revision":"stale"}),
         json!({"section_id":"unknown","enabled":true,"expected_revision":state["revision"]}),
         json!({"section_id":"wayline_lab","enabled":"true","expected_revision":state["revision"]}),
-        json!({"section_id":"wayline_lab","enabled":true,"expected_revision":state["revision"]}),
     ] {
-        ensure!(
-            call(
-                "/usr/sbin/wayline-ctl",
-                &["set_tunnel_enabled", &rejected.to_string()]
-            )
-            .is_err(),
-            "An invalid tunnel request succeeded."
-        );
-        ensure!(
-            fs::read(&path)? == saved,
-            "A rejected tunnel request changed the policy."
-        );
+        rejected_tunnel_request(&rejected, &path, &saved)?;
     }
+    evidence.pass("invalid_tunnel_request_rejected");
+    rejected_tunnel_request(
+        &json!({"section_id":"wayline_lab","enabled":true,"expected_revision":state["revision"]}),
+        &path,
+        &saved,
+    )?;
+    evidence.pass("missing_profile_rejected");
     native(
         "set_tunnel",
         &json!({"tunnel_id":2001,"via":{"type":"wireguard","configs":[{"group_id":991,"id_list":[991]}]}}),
@@ -879,6 +998,9 @@ fn tunnel_control_checks() -> Result<()> {
             );
         }
     }
+    evidence.pass("native_start_stop");
+    evidence.pass("monitor_choice_retained");
+    evidence.pass("tunnel_priority_retained");
     println!("Native tunnel control checks passed.");
     Ok(())
 }

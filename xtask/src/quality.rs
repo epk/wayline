@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -99,6 +99,41 @@ pub fn lint() -> Result<()> {
         Path::new("devenv.lock").is_file(),
         "The Nix inputs need a lock file."
     );
+    versions()
+}
+
+fn readme_versions(readme: &str) -> Result<Vec<&str>> {
+    let marker = "This README describes **";
+    let start = readme
+        .find(marker)
+        .context("README.md does not name the version it describes.")?
+        + marker.len();
+    let described = readme[start..]
+        .split("**")
+        .next()
+        .context("README.md does not name the version it describes.")?;
+    let mut versions = vec![described];
+    versions.extend(readme.split("WAYLINE_VERSION=").skip(1).map(|rest| {
+        rest.split(|character: char| character.is_whitespace() || character == '`')
+            .next()
+            .unwrap_or_default()
+    }));
+    Ok(versions)
+}
+
+fn versions() -> Result<()> {
+    let version = crate::metadata::version()?.to_string();
+    for found in readme_versions(&fs::read_to_string("README.md")?)? {
+        ensure!(
+            found == version,
+            "README.md names version {found}, but monitor/Cargo.toml is {version}."
+        );
+    }
+    let control = crate::metadata::manifest_version(&fs::read_to_string("control/Cargo.toml")?)?;
+    ensure!(
+        control.to_string() == version,
+        "control/Cargo.toml is {control}, but monitor/Cargo.toml is {version}."
+    );
     Ok(())
 }
 
@@ -110,4 +145,17 @@ pub fn format() -> Result<()> {
     cmd!(sh, "nixfmt {NIX...}").run()?;
     cmd!(sh, "pnpm --dir ui format").run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readme_versions;
+
+    #[test]
+    fn readme_versions_include_the_description_and_examples() -> anyhow::Result<()> {
+        let readme = "This README describes **1.2.3**, which adds things.\n\n```sh\ncurl x | WAYLINE_VERSION=1.2.2 sh\n```\nRun `WAYLINE_VERSION=1.2.3 sh install.sh`.\n";
+        assert_eq!(readme_versions(readme)?, ["1.2.3", "1.2.2", "1.2.3"]);
+        assert!(readme_versions("No version here.").is_err());
+        Ok(())
+    }
 }

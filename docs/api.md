@@ -6,13 +6,17 @@ and their metadata ([metrics.md](metrics.md)), `dimensions.parquet`, and the
 relay payload ([relay.md](relay.md)).
 
 The page talks to `wayline-ctl` through the GL.iNet RPC bridge in
-`package/files/usr/lib/oui-httpd/rpc/wayline`. Reads use the RPC object
-`wayline`. Writes use the versioned object `wayline_<version with dots as underscores>`.
+`package/files/usr/lib/oui-httpd/rpc/wayline`. The reads from the first
+release use the RPC object `wayline`. Every other method, including the newer
+read `get_diagnostics`, uses the versioned object
+`wayline_<version with dots as underscores>` (see [get_diagnostics](#get_diagnostics)).
 Every call is `$rpcRequest('call', ['sid', object, method, params])`.
 
-Reads: `get_state`, `get_history`, `get_wifi_history`, `get_telemetry_history`, `get_diagnostics`.
-Writes: `set_config`, `select_tunnel`, `set_tunnel_enabled`, `purge_history`,
-`check_update`, `install_update` (unchanged from v1).
+Reads: `get_state`, `get_history`, `get_wifi_history`, `get_telemetry_history`
+on `wayline`, and `get_diagnostics` on `wayline_<version>`.
+Writes, all on `wayline_<version>`: `set_config`, `select_tunnel`,
+`set_tunnel_enabled`, `purge_history`, `check_update`, `install_update`
+(unchanged from v1).
 
 Times are Unix milliseconds unless a field name ends in `Seconds` or the field
 is documented as seconds. Latency values on the wire are integer microseconds.
