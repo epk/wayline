@@ -731,12 +731,14 @@ pub fn set_config(request: SetConfig) -> Result<Value> {
                 };
                 auto::Record::touch(attention)?;
                 runtime::store(SETTINGS, &config)?;
+                let relocated = history::relocate(&previous, &config);
                 let hosts = router::hosts(&config, &inventory);
                 let mut resolved = Resolved::read();
                 if resolved.stale(&hosts) {
                     resolved.refresh(&hosts)?;
                 }
                 service::reconcile()?;
+                relocated?;
             }
             Ok(json!({"applied":true}))
         })
@@ -888,6 +890,11 @@ pub fn apply(id: &str, expected_revision: &str, selection: Selection) -> Result<
 pub fn start_update(method: &str) -> Result<Value> {
     let started = update::start(method)?;
     Ok(json!({"started":started,"update":update::view()}))
+}
+
+pub fn clear_update() -> Result<Value> {
+    update::clear()?;
+    Ok(json!({"cleared":true,"update":update::view()}))
 }
 
 #[derive(Serialize)]

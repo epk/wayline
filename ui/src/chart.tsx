@@ -15,8 +15,6 @@ import {
 } from './store.ts';
 import type { Column } from './types.ts';
 
-const loadPlot = (): Promise<typeof uPlot> => Promise.resolve(uPlot);
-
 export interface Line {
   label: string;
   color: string;
@@ -159,7 +157,15 @@ export function Chart(props: ChartProps) {
   ]);
   const xRange = (): [number, number] => [windowStart.value / 1000, windowEnd.value / 1000];
   const data = [props.x, ...props.ys] as uPlot.AlignedData;
-  const feed = [windowStart.value, windowEnd.value, props.markers, props.thresholds, ...data];
+  // Views pass thresholds as inline literals, so compare them by value; the
+  // rest keep their identity until the history document changes.
+  const feed = [
+    windowStart.value,
+    windowEnd.value,
+    props.markers,
+    JSON.stringify(props.thresholds),
+    ...data,
+  ];
 
   const hideTip = () => {
     if (tip.current) tip.current.hidden = true;
@@ -294,127 +300,119 @@ export function Chart(props: ChartProps) {
   };
 
   useEffect(() => {
-    let live = true;
-    const el = host.current;
-    if (!el) return undefined;
+    if (!host.current || !box.current) return;
     if (built.current === key && plot.current) {
       const prev = fed.current;
       if (prev.length !== feed.length || feed.some((d, i) => d !== prev[i])) {
         fed.current = feed;
         plot.current.setData(data);
       }
-      return undefined;
+      return;
     }
-    if (!canDraw()) return undefined;
-    void loadPlot().then((UPlot) => {
-      if (!live || !host.current || !box.current) return;
-      plot.current?.destroy();
-      const t = readTheme(box.current);
-      const p = latest.current;
-      const font = '12px system-ui, -apple-system, "Segoe UI", sans-serif';
-      const axis = (extra: Partial<uPlot.Axis>): uPlot.Axis => ({
-        stroke: t.muted,
-        font,
-        labelFont: font,
-        grid: { stroke: t.border, width: 1 },
-        ticks: { stroke: t.border, width: 1 },
-        ...extra,
-      });
-      const series: uPlot.Series[] = [
-        {},
-        ...p.lines.map((line) => {
-          const stroke = color(t, line.color);
-          return {
-            label: line.label,
-            stroke: line.helper ? 'transparent' : stroke,
-            width: line.width || 1.5,
-            spanGaps: false,
-            show: line.show !== false,
-            ...(line.dash ? { dash: line.dash } : {}),
-            ...(line.fill ? { fill: withAlpha(stroke, line.fill) } : {}),
-            points: line.helper
-              ? { show: false }
-              : {
-                  show: true,
-                  size: 4,
-                  space: 0,
-                  stroke,
-                  fill: stroke,
-                  filter: (u: uPlot, i: number) => solo(u.data[i] as Column),
-                },
-          } as uPlot.Series;
-        }),
-      ];
-      const bands = (p.bands || []).map((b) => {
-        const fill = withAlpha(color(t, b.color), b.alpha);
-        return { series: [b.upper + 1, b.lower + 1] as [number, number], fill: () => fill };
-      });
-      const width = Math.max(240, box.current.clientWidth);
-      plot.current = new UPlot(
-        {
-          width,
-          height,
-          legend: { show: false },
-          focus: { alpha: 0.25 },
-          cursor: {
-            sync: { key: 'wayline' },
-            drag: { x: true, y: false, setScale: false },
-            focus: { prox: -1 },
-          },
-          scales: {
-            x: { time: true, range: () => xRange() },
-            y: {
-              range: (_u: uPlot, low: number, high: number) =>
-                latest.current.y ? latest.current.y(low, high) : [0, high > 0 ? high * 1.15 : 1],
-            },
-          },
-          axes: [
-            axis({
-              grid: { show: false },
-              values: (_u: uPlot, values: number[]) =>
-                values.map((v) => stamp(v * 1000, range.value > 1440)),
-            }),
-            axis({
-              size: 52,
-              values: (_u: uPlot, values: number[]) =>
-                values.map((v) => (latest.current.axis || latest.current.format)(v)),
-            }),
-          ],
-          series,
-          bands,
-          hooks: {
-            setCursor: [updateTip],
-            setSelect: [
-              (u: uPlot) => {
-                if (!u.select.width) return;
-                const from = u.posToVal(u.select.left, 'x') * 1000;
-                const to = u.posToVal(u.select.left + u.select.width, 'x') * 1000;
-                u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
-                zoom(from, to);
+    if (!canDraw()) return;
+    plot.current?.destroy();
+    const t = readTheme(box.current);
+    const p = latest.current;
+    const font = '12px system-ui, -apple-system, "Segoe UI", sans-serif';
+    const axis = (extra: Partial<uPlot.Axis>): uPlot.Axis => ({
+      stroke: t.muted,
+      font,
+      labelFont: font,
+      grid: { stroke: t.border, width: 1 },
+      ticks: { stroke: t.border, width: 1 },
+      ...extra,
+    });
+    const series: uPlot.Series[] = [
+      {},
+      ...p.lines.map((line) => {
+        const stroke = color(t, line.color);
+        return {
+          label: line.label,
+          stroke: line.helper ? 'transparent' : stroke,
+          width: line.width || 1.5,
+          spanGaps: false,
+          show: line.show !== false,
+          ...(line.dash ? { dash: line.dash } : {}),
+          ...(line.fill ? { fill: withAlpha(stroke, line.fill) } : {}),
+          points: line.helper
+            ? { show: false }
+            : {
+                show: true,
+                size: 4,
+                space: 0,
+                stroke,
+                fill: stroke,
+                filter: (u: uPlot, i: number) => solo(u.data[i] as Column),
               },
-            ],
-            draw: [draw],
+        } as uPlot.Series;
+      }),
+    ];
+    const bands = (p.bands || []).map((b) => {
+      const fill = withAlpha(color(t, b.color), b.alpha);
+      return { series: [b.upper + 1, b.lower + 1] as [number, number], fill: () => fill };
+    });
+    const width = Math.max(240, box.current.clientWidth);
+    plot.current = new uPlot(
+      {
+        width,
+        height,
+        legend: { show: false },
+        focus: { alpha: 0.25 },
+        cursor: {
+          sync: { key: 'wayline' },
+          drag: { x: true, y: false, setScale: false },
+          focus: { prox: -1 },
+        },
+        scales: {
+          x: { time: true, range: () => xRange() },
+          y: {
+            range: (_u: uPlot, low: number, high: number) =>
+              latest.current.y ? latest.current.y(low, high) : [0, high > 0 ? high * 1.15 : 1],
           },
         },
-        data,
-        host.current,
-      );
-      plot.current.over.addEventListener('dblclick', resetZoom);
-      const over = plot.current;
-      over.over.addEventListener('mouseenter', () => {
-        hovered = over;
-      });
-      over.over.addEventListener('mouseleave', () => {
-        if (hovered === over) hovered = null;
-        hideTip();
-      });
-      built.current = key;
-      fed.current = feed;
-      applyShow(plot.current, p.visible);
+        axes: [
+          axis({
+            grid: { show: false },
+            values: (_u: uPlot, values: number[]) =>
+              values.map((v) => stamp(v * 1000, range.value > 1440)),
+          }),
+          axis({
+            size: 52,
+            values: (_u: uPlot, values: number[]) =>
+              values.map((v) => (latest.current.axis || latest.current.format)(v)),
+          }),
+        ],
+        series,
+        bands,
+        hooks: {
+          setCursor: [updateTip],
+          setSelect: [
+            (u: uPlot) => {
+              if (!u.select.width) return;
+              const from = u.posToVal(u.select.left, 'x') * 1000;
+              const to = u.posToVal(u.select.left + u.select.width, 'x') * 1000;
+              u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
+              zoom(from, to);
+            },
+          ],
+          draw: [draw],
+        },
+      },
+      data,
+      host.current,
+    );
+    plot.current.over.addEventListener('dblclick', resetZoom);
+    const over = plot.current;
+    over.over.addEventListener('mouseenter', () => {
+      hovered = over;
     });
-    return () => {
-      live = false;
-    };
+    over.over.addEventListener('mouseleave', () => {
+      if (hovered === over) hovered = null;
+      hideTip();
+    });
+    built.current = key;
+    fed.current = feed;
+    applyShow(plot.current, p.visible);
   });
 
   useEffect(() => applyShow(plot.current, props.visible), [props.visible]);

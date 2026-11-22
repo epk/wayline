@@ -257,7 +257,6 @@ export const step = computed(() =>
     ? stepFor(tiers.value, range.value, offset.value) || legacyStep(range.value)
     : legacyStep(range.value),
 );
-export const tier = computed(() => tiers.value.find((t) => t.step === step.value) || null);
 export const windowStart = computed(() => anchor.value - (offset.value + range.value) * 60000);
 export const windowEnd = computed(() => windowStart.value + range.value * 60000);
 
@@ -280,6 +279,7 @@ export const updateState = computed(() => {
     message: updateError.value || u.message || '',
     failed: !!updateError.value || !!u.failed,
     checkedAt: u.checkedAt || 0,
+    latched: !!u.needsAttention,
   };
 });
 export const updateActive = computed(() => updatePhases.includes(state.value.update?.phase || ''));
@@ -360,6 +360,7 @@ async function refreshState(): Promise<boolean> {
           next.tunnels[0] || { id: '' }
         ).id;
     }
+    fitRange();
     if (updateActive.value && !updateTimer) startUpdatePoll();
     loadHistories(false);
     return true;
@@ -505,8 +506,22 @@ export function chooseTarget(target: string): void {
   loadHistories(false);
 }
 
+const clampOffset = (minutes: number): number =>
+  Math.round(Math.max(0, Math.min(maxMinutes.value - range.value, minutes)));
+
+// Shorter retention can leave the chosen range longer than what is kept, which
+// would put the window end in the future. Fall back to the longest kept range.
+function fitRange(): void {
+  const kept = ranges.value;
+  if (range.value > maxMinutes.value || !kept.some((r) => r.minutes === preset.value)) {
+    const fit = kept.filter((r) => r.minutes <= range.value).pop() || kept[0];
+    if (fit) preset.value = range.value = fit.minutes;
+  }
+  offset.value = clampOffset(offset.value);
+}
+
 export function setOffset(minutes: number): void {
-  offset.value = Math.round(Math.min(maxMinutes.value - range.value, Math.max(0, minutes)));
+  offset.value = clampOffset(minutes);
   loadHistories(false);
 }
 
@@ -753,25 +768,22 @@ export function say(text: string): void {
   if (text && !text.endsWith('…')) noticeTimer = setTimeout(() => (notice.value = ''), 10000);
 }
 
-export async function installUpdate(): Promise<void> {
+async function runUpdate(
+  command: 'installUpdate' | 'checkUpdate' | 'clearUpdate',
+  fallback: string,
+): Promise<void> {
   updateError.value = '';
   try {
-    const r = await write('installUpdate')();
+    const r = await write(command)();
     setUpdate(r.update);
   } catch (e) {
-    updateError.value = describe(e, 'Update unavailable.');
+    updateError.value = describe(e, fallback);
   }
 }
 
-export async function checkUpdates(): Promise<void> {
-  updateError.value = '';
-  try {
-    const r = await write('checkUpdate')();
-    setUpdate(r.update);
-  } catch (e) {
-    updateError.value = describe(e, 'Update check unavailable.');
-  }
-}
+export const installUpdate = () => runUpdate('installUpdate', 'Update unavailable.');
+export const checkUpdates = () => runUpdate('checkUpdate', 'Update check unavailable.');
+export const clearUpdate = () => runUpdate('clearUpdate', 'Could not clear the update block.');
 
 function setUpdate(update: UpdateStatus | undefined): void {
   if (!update || typeof update !== 'object') return;

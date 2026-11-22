@@ -22,6 +22,12 @@ struct State {
     boot: String,
     first_offset_ms: i64,
     synced: Option<Source>,
+    #[serde(default)]
+    trusted_offset_ms: Option<i64>,
+    #[serde(default)]
+    moved_ms: Option<i64>,
+    #[serde(default)]
+    announced: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -31,6 +37,7 @@ pub struct Clock {
     pub synced: bool,
     pub source: Option<Source>,
     pub offset_ms: i64,
+    pub moved_ms: Option<i64>,
 }
 
 pub struct Observation<'a> {
@@ -50,7 +57,7 @@ fn decide(state: &mut State, observation: &Observation, ntp_valid: bool) -> Cloc
         *state = State {
             boot: observation.boot.to_owned(),
             first_offset_ms: offset,
-            synced: None,
+            ..State::default()
         };
     }
     if state.synced.is_none() {
@@ -64,12 +71,60 @@ fn decide(state: &mut State, observation: &Observation, ntp_valid: bool) -> Cloc
             None
         };
     }
+    if state.synced == Some(Source::Connectivity) {
+        let trusted = *state.trusted_offset_ms.get_or_insert(offset);
+        if (offset - trusted).abs() > STEP_MS {
+            state.synced = Some(Source::Step);
+            state.moved_ms = Some(offset - trusted);
+        } else if ntp_valid {
+            state.synced = Some(Source::Ntp);
+        }
+    }
     Clock {
         boot: state.boot.clone(),
         synced: state.synced.is_some() && !observation.boot.is_empty(),
         source: state.synced,
         offset_ms: offset,
+        moved_ms: state.moved_ms.filter(|_| !state.announced),
     }
+}
+
+pub fn moved_note(moved_ms: i64) -> String {
+    let minutes = moved_ms.unsigned_abs().div_ceil(60_000);
+    let direction = if moved_ms > 0 { "forward" } else { "back" };
+    format!(
+        "The router clock moved {direction} by about {minutes} min after Wayline had trusted it from connectivity alone. History saved earlier in this boot may be shown at the wrong time."
+    )
+}
+
+pub fn announce() -> Result<()> {
+    announce_in(Path::new(RUNTIME))
+}
+
+fn announce_in(directory: &Path) -> Result<()> {
+    let path = directory.join("clock.json");
+    let mut state: State = runtime::load(&path);
+    if state.moved_ms.is_some() && !state.announced {
+        state.announced = true;
+        runtime::store(&path, &state)?;
+    }
+    Ok(())
+}
+
+pub fn of(parts: &runtime::Parts) -> Result<Option<Clock>> {
+    if parts.boot_id.is_empty() {
+        return Ok(None);
+    }
+    observe(&Observation {
+        boot: &parts.boot_id,
+        boot_ms: parts.boot_ms,
+        wall_ms: parts.wall_ms,
+        reachable: parts
+            .series
+            .iter()
+            .any(|series| series.state.live() && series.received > 0),
+    })
+    .map(Some)
 }
 
 pub fn observe(observation: &Observation) -> Result<Clock> {
@@ -134,7 +189,9 @@ pub fn restamp<T: Stamped>(items: &mut [T], offset_ms: i64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Observation, Source, State, corrected, decide, observe_in, restamp};
+    use super::{
+        Observation, Source, State, announce_in, corrected, decide, moved_note, observe_in, restamp,
+    };
     use wayline_protocol::WifiBucket;
 
     fn seen(boot: &str, boot_ms: u64, wall_ms: u64, reachable: bool) -> Observation<'_> {
@@ -244,6 +301,72 @@ mod tests {
             &seen("boot-b", 5_000, 1_700_000_005_000, false),
         )?;
         anyhow::ensure!(!next.synced, "A new boot starts unsynced.");
+        Ok(())
+    }
+
+    #[test]
+    fn connectivity_trust_is_provisional_until_the_clock_steps() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let valid = root.join("ntp-valid");
+        let base = 1_700_000_000_000;
+        observe_in(root, &valid, &seen("b", 60_000, base + 60_000, true))?;
+        let trusted = observe_in(root, &valid, &seen("b", 960_000, base + 960_000, true))?;
+        anyhow::ensure!(trusted.synced && trusted.source == Some(Source::Connectivity));
+        anyhow::ensure!(trusted.moved_ms.is_none());
+        let drift = observe_in(root, &valid, &seen("b", 990_000, base + 1_010_000, true))?;
+        anyhow::ensure!(drift.source == Some(Source::Connectivity) && drift.moved_ms.is_none());
+        let hour: u64 = 3_600_000;
+        let stepped = observe_in(
+            root,
+            &valid,
+            &seen("b", 1_020_000, base + 1_020_000 + hour, true),
+        )?;
+        anyhow::ensure!(stepped.synced && stepped.source == Some(Source::Step));
+        anyhow::ensure!(
+            stepped.moved_ms == Some(3_600_000),
+            "{:?}",
+            stepped.moved_ms
+        );
+        anyhow::ensure!(moved_note(3_600_000).contains("forward by about 60 min"));
+        anyhow::ensure!(
+            observe_in(
+                root,
+                &valid,
+                &seen("b", 1_030_000, base + 1_030_000 + hour, true)
+            )?
+            .moved_ms
+            .is_some(),
+            "The move is reported until it is announced."
+        );
+        announce_in(root)?;
+        let later = observe_in(
+            root,
+            &valid,
+            &seen("b", 1_040_000, base + 1_040_000 + hour, true),
+        )?;
+        anyhow::ensure!(later.synced && later.moved_ms.is_none());
+        let mut state = State {
+            boot: "c".into(),
+            first_offset_ms: 5,
+            synced: Some(Source::Connectivity),
+            ..State::default()
+        };
+        let upgraded = decide(
+            &mut state,
+            &seen("c", 2_000_000, base + 2_000_000, true),
+            false,
+        );
+        anyhow::ensure!(
+            upgraded.moved_ms.is_none(),
+            "A state saved before this field must not look like a step."
+        );
+        let confirmed = decide(
+            &mut state,
+            &seen("c", 2_010_000, base + 2_010_000, true),
+            true,
+        );
+        anyhow::ensure!(confirmed.source == Some(Source::Ntp));
         Ok(())
     }
 }

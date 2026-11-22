@@ -12,6 +12,10 @@ const RELEASES_LIMIT: usize = 2_097_152;
 const RELEASES: &str = "https://api.github.com/repos/epk/wayline/releases?per_page=10";
 const STALE_AFTER: u64 = 240;
 const DONE_VISIBLE: u64 = 600;
+const LATCH: &str = "/etc/wayline/update-attention";
+const VERSION_FILE: &str = "/usr/share/wayline/version";
+const BINARIES: [&str; 2] = ["/usr/sbin/wayline-ctl", "/usr/sbin/waylined"];
+const BLOCKED: &str = "A previous installation needs checking. Confirm the router works, then run wayline-ctl update --clear or choose Clear on this page.";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +60,13 @@ impl Format {
         match self {
             Self::Opkg => "ipk",
             Self::Apk => "apk",
+        }
+    }
+
+    const fn database(self) -> &'static str {
+        match self {
+            Self::Opkg => "/usr/lib/opkg/status",
+            Self::Apk => "/lib/apk/db/installed",
         }
     }
 
@@ -180,7 +191,7 @@ impl Status {
             phase,
             message,
             failed: false,
-            needs_attention: false,
+            needs_attention: latched(),
             checked_at: at,
             updated_at: at,
         }
@@ -196,7 +207,7 @@ impl Status {
             phase: Phase::Failed,
             message: format!("Update stopped. {error}"),
             failed: true,
-            needs_attention: previous.needs_attention || previous.phase == Phase::Installing,
+            needs_attention: latched(),
             checked_at: at,
             updated_at: at,
         }
@@ -219,13 +230,132 @@ fn effective(mut status: Status, at: u64) -> Status {
 }
 
 pub fn view() -> Status {
-    effective(
+    let mut status = effective(
         Status::read().unwrap_or_else(|| Status {
             current: runtime::version(),
             ..Status::default()
         }),
         runtime::now(),
-    )
+    );
+    status.needs_attention |= latched();
+    status
+}
+
+fn latched_at(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+fn latched() -> bool {
+    latched_at(Path::new(LATCH))
+}
+
+fn arm(path: &Path, version: &str) -> Result<()> {
+    let note = format!("{version} {}\n", runtime::now());
+    wayline_support::atomic(path, note.as_bytes()).context("Could not record the installation.")
+}
+
+fn disarm(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+fn apk_form(version: &str) -> Option<String> {
+    let parsed = Version::parse(version).ok()?;
+    let core = format!("{}.{}.{}", parsed.major, parsed.minor, parsed.patch);
+    if parsed.pre.is_empty() {
+        return Some(core);
+    }
+    let (label, number) = parsed
+        .pre
+        .as_str()
+        .split_once('.')
+        .unwrap_or((parsed.pre.as_str(), "0"));
+    Some(format!("{core}_{label}{number}"))
+}
+
+fn recorded(database: &str, format: Format) -> Option<String> {
+    database.split("\n\n").find_map(|stanza| {
+        let field = |key: &str| {
+            stanza
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .map(str::trim)
+        };
+        let found = match format {
+            Format::Opkg => (field("Package:") == Some("wayline")
+                && field("Status:").is_some_and(|status| status.ends_with(" installed")))
+            .then(|| field("Version:"))
+            .flatten(),
+            Format::Apk => (field("P:") == Some("wayline"))
+                .then(|| field("V:"))
+                .flatten(),
+        };
+        found.map(str::to_owned)
+    })
+}
+
+fn matches_record(installed: &str, record: &str, format: Format) -> bool {
+    match format {
+        Format::Opkg => record == installed,
+        Format::Apk => apk_form(installed).is_some_and(|expected| {
+            record.strip_prefix(&expected).is_some_and(|rest| {
+                rest.is_empty()
+                    || rest.strip_prefix("-r").is_some_and(|number| {
+                        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+        }),
+    }
+}
+
+fn verify_installed(format: Format) -> Result<String> {
+    let installed = fs::read_to_string(VERSION_FILE)
+        .context("The installed version file is missing. Reinstall Wayline.")?
+        .trim()
+        .to_owned();
+    for binary in BINARIES {
+        ensure!(
+            Path::new(binary).is_file(),
+            "{binary} is missing. Reinstall Wayline."
+        );
+    }
+    let database = fs::read_to_string(format.database())
+        .context("Could not read the package manager's records.")?;
+    let record = recorded(&database, format)
+        .context("The package manager does not list Wayline as installed. Reinstall Wayline.")?;
+    ensure!(
+        matches_record(&installed, &record, format),
+        "Wayline {installed} does not match the package manager's record {record}. Reinstall Wayline."
+    );
+    Ok(installed)
+}
+
+pub fn clear() -> Result<Status> {
+    runtime::locked("update", || {
+        let installed = verify_installed(Format::detect())?;
+        disarm(Path::new(LATCH))?;
+        let previous = Status::read().unwrap_or_default();
+        let status = Status {
+            current: installed.clone(),
+            latest: previous.latest,
+            available: previous.available,
+            phase: Phase::Idle,
+            message: format!(
+                "Wayline {installed} matches the package manager. Updates can run again."
+            ),
+            failed: false,
+            needs_attention: false,
+            checked_at: previous.checked_at,
+            updated_at: runtime::now(),
+        };
+        status.write()?;
+        Ok(status)
+    })
 }
 
 fn download(url: &str, path: &Path, limit: u64) -> Result<()> {
@@ -400,12 +530,14 @@ fn execute(operation: Operation, report: &dyn Fn(Phase, &str) -> Result<()>) -> 
     );
     let path = package.to_str().context("Invalid package path.")?;
     format.install(path, true)?;
+    arm(Path::new(LATCH), &manifest.version)?;
     report(Phase::Installing, "Installing the signed update.")?;
     format.install(path, false)?;
     ensure!(
         runtime::version() == manifest.version,
         "The installed version needs checking. Do not retry automatically."
     );
+    disarm(Path::new(LATCH))?;
     let message = format!("Updated to {}.", manifest.version);
     Ok(Status::finished(
         message,
@@ -416,19 +548,31 @@ fn execute(operation: Operation, report: &dyn Fn(Phase, &str) -> Result<()>) -> 
 }
 
 fn attempt(operation: Operation, previous: Option<&Status>) -> Result<Status> {
-    let status = if settled(previous) {
+    let status = if allowed(operation, previous, latched()) {
         let report =
             |phase: Phase, message: &str| Status::working(previous, phase, message).write();
         execute(operation, &report).unwrap_or_else(|error| Status::stopped(&error))
     } else {
-        Status::stopped(&anyhow::anyhow!("A previous installation needs checking."))
+        Status::stopped(&anyhow::anyhow!(BLOCKED))
     };
     status.write()?;
     Ok(status)
 }
 
-fn settled(previous: Option<&Status>) -> bool {
-    previous.is_none_or(|status| status.phase != Phase::Installing && !status.needs_attention)
+fn settled(previous: Option<&Status>, latched: bool) -> bool {
+    !latched && previous.is_none_or(|status| status.phase != Phase::Installing)
+}
+
+fn allowed(operation: Operation, previous: Option<&Status>, latched: bool) -> bool {
+    operation == Operation::Check || settled(previous, latched)
+}
+
+fn plan(requested: &str, auto_updates: bool, settled: bool) -> Operation {
+    if requested == "install_update" || (requested.is_empty() && auto_updates && settled) {
+        Operation::Install
+    } else {
+        Operation::Check
+    }
 }
 
 fn automatic_wait(previous: Option<&Status>) -> u64 {
@@ -486,10 +630,7 @@ pub fn job() -> Result<()> {
 pub fn run_now(operation: Operation) -> Result<Status> {
     runtime::locked("update", || {
         let previous = Status::read();
-        ensure!(
-            settled(previous.as_ref()),
-            "A previous installation needs checking."
-        );
+        ensure!(allowed(operation, previous.as_ref(), latched()), BLOCKED);
         attempt(operation, previous.as_ref())
     })
 }
@@ -502,10 +643,6 @@ pub fn scheduled(config: &Settings) -> Result<()> {
         let request = request_path();
         let requested = fs::read_to_string(&request).unwrap_or_default();
         let previous = Status::read();
-        ensure!(
-            settled(previous.as_ref()),
-            "A previous installation needs checking."
-        );
         let checked_at = previous.as_ref().map_or(0, |status| status.checked_at);
         if requested.is_empty()
             && (!config.auto_updates
@@ -513,12 +650,11 @@ pub fn scheduled(config: &Settings) -> Result<()> {
         {
             return Ok(());
         }
-        let operation =
-            if requested == "install_update" || (requested.is_empty() && config.auto_updates) {
-                Operation::Install
-            } else {
-                Operation::Check
-            };
+        let operation = plan(
+            &requested,
+            config.auto_updates,
+            settled(previous.as_ref(), latched()),
+        );
         attempt(operation, previous.as_ref())?;
         if request.exists() {
             fs::remove_file(request)?;
@@ -529,9 +665,98 @@ pub fn scheduled(config: &Settings) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Phase, Release, Status, automatic_wait, effective, newest};
+    use super::{
+        Format, Operation, Phase, Release, Status, allowed, apk_form, arm, automatic_wait, disarm,
+        effective, latched_at, matches_record, newest, plan, recorded, settled,
+    };
     use anyhow::{Result, ensure};
     use semver::Version;
+
+    #[test]
+    fn the_latch_survives_on_disk_until_disarmed() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let latch = folder.path().join("update-attention");
+        ensure!(!latched_at(&latch));
+        arm(&latch, "0.1.0-alpha.26")?;
+        ensure!(latched_at(&latch));
+        ensure!(std::fs::read_to_string(&latch)?.starts_with("0.1.0-alpha.26 "));
+        disarm(&latch)?;
+        ensure!(!latched_at(&latch));
+        disarm(&latch)?;
+        Ok(())
+    }
+
+    #[test]
+    fn checks_run_while_latched_but_installs_do_not() {
+        let installing = at(Phase::Installing, 0);
+        assert!(allowed(Operation::Check, None, true));
+        assert!(allowed(Operation::Check, Some(&installing), true));
+        assert!(!allowed(Operation::Install, None, true));
+        assert!(!allowed(Operation::Install, Some(&installing), false));
+        assert!(allowed(Operation::Install, None, false));
+        assert!(settled(Some(&at(Phase::Failed, 0)), false));
+        assert!(!settled(Some(&at(Phase::Failed, 0)), true));
+    }
+
+    #[test]
+    fn automatic_updates_only_check_while_latched() {
+        assert!(plan("", true, true) == Operation::Install);
+        assert!(plan("", true, false) == Operation::Check);
+        assert!(plan("", false, true) == Operation::Check);
+        assert!(plan("check_update", true, true) == Operation::Check);
+        assert!(plan("install_update", false, false) == Operation::Install);
+    }
+
+    #[test]
+    fn reads_the_package_manager_record() {
+        let opkg = "Package: luci\nVersion: 1\nStatus: install user installed\n\nPackage: wayline\nVersion: 0.1.0-alpha.25\nDepends: curl\nStatus: install user installed\nArchitecture: aarch64_cortex-a53\n";
+        assert_eq!(
+            recorded(opkg, Format::Opkg).as_deref(),
+            Some("0.1.0-alpha.25")
+        );
+        let half = "Package: wayline\nVersion: 0.1.0-alpha.26\nStatus: install user unpacked\n";
+        assert_eq!(recorded(half, Format::Opkg), None);
+        let apk = "C:Q1abc=\nP:busybox\nV:1.36\n\nC:Q1def=\nP:wayline\nV:0.1.0_alpha25\nA:aarch64_cortex-a53\n";
+        assert_eq!(recorded(apk, Format::Apk).as_deref(), Some("0.1.0_alpha25"));
+        assert_eq!(recorded("P:waylinex\nV:1\n", Format::Apk), None);
+    }
+
+    #[test]
+    fn compares_versions_in_the_package_manager_form() {
+        assert_eq!(apk_form("0.1.0-alpha.25").as_deref(), Some("0.1.0_alpha25"));
+        assert_eq!(apk_form("1.2.3").as_deref(), Some("1.2.3"));
+        assert!(matches_record(
+            "0.1.0-alpha.25",
+            "0.1.0-alpha.25",
+            Format::Opkg
+        ));
+        assert!(!matches_record(
+            "0.1.0-alpha.26",
+            "0.1.0-alpha.25",
+            Format::Opkg
+        ));
+        assert!(matches_record(
+            "0.1.0-alpha.25",
+            "0.1.0_alpha25",
+            Format::Apk
+        ));
+        assert!(matches_record(
+            "0.1.0-alpha.25",
+            "0.1.0_alpha25-r1",
+            Format::Apk
+        ));
+        assert!(!matches_record(
+            "0.1.0-alpha.25",
+            "0.1.0_alpha250",
+            Format::Apk
+        ));
+        assert!(!matches_record(
+            "0.1.0-alpha.25",
+            "0.1.0_alpha25-r",
+            Format::Apk
+        ));
+        assert!(!matches_record("garbage", "garbage", Format::Apk));
+    }
 
     fn release(tag_name: &str, draft: bool) -> Release {
         Release {

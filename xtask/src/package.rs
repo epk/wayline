@@ -469,6 +469,7 @@ pub fn release(version: &str) -> Result<()> {
         .run()?;
     }
     fs::copy("package/files/etc/wayline/release.pub", "dist/release.pub")?;
+    fs::copy("install.sh", "dist/install.sh")?;
     Ok(())
 }
 

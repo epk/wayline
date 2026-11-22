@@ -6,6 +6,3 @@ inputs:
     inputs:
       nixpkgs:
         follows: nixpkgs
-  ste:
-    url: github:danyuchn/asd-ste100-skill/master
-    flake: false

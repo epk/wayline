@@ -3,8 +3,10 @@ import { useEffect, useState } from 'react';
 import {
   bundleVersion,
   checkUpdates,
+  clearUpdate,
   installUpdate,
   reloadPage,
+  updateError,
   updatePhases,
   updatesDisabled,
   updateState,
@@ -51,6 +53,10 @@ export function UpdatePanel(props: { compact?: boolean }) {
   else if (u.phase === 'done')
     status =
       'Updated to ' + (u.latest || u.current) + (stale ? '. Reload this page to use it.' : '.');
+  const latched = u.latched && !active;
+  if (latched && !updateError.value)
+    status =
+      'An earlier installation did not finish, so installs are paused. Check that the router works, then choose Clear to confirm the installed package and allow updates again.';
   return (
     <div className={'wl-upd' + (props.compact ? ' wl-upd-compact' : '')}>
       {props.compact ? (
@@ -87,7 +93,12 @@ export function UpdatePanel(props: { compact?: boolean }) {
         <Button className="wl-button" disabled={working} onClick={() => void checkUpdates()}>
           Check for update
         </Button>
-        {u.available && (
+        {latched && (
+          <Button className="wl-button wl-primary" onClick={() => void clearUpdate()}>
+            Clear
+          </Button>
+        )}
+        {u.available && !u.latched && (
           <Button
             className="wl-button wl-primary"
             disabled={working}
@@ -107,7 +118,7 @@ export function UpdatePanel(props: { compact?: boolean }) {
             Reload page
           </Button>
         )}
-        {failed && (
+        {failed && !u.latched && (
           <Button
             className="wl-button"
             disabled={working}

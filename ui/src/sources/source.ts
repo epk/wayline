@@ -38,6 +38,7 @@ export interface DataSource {
   purgeHistory?(request: { confirm: true }): Promise<unknown>;
   checkUpdate?(): Promise<UpdateReply>;
   installUpdate?(): Promise<UpdateReply>;
+  clearUpdate?(): Promise<UpdateReply>;
 }
 
 export type WriteCommand =
@@ -46,4 +47,5 @@ export type WriteCommand =
   | 'setTunnelEnabled'
   | 'purgeHistory'
   | 'checkUpdate'
-  | 'installUpdate';
+  | 'installUpdate'
+  | 'clearUpdate';

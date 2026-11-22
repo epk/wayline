@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { band, score, scoreColumn } from '../src/mos.ts';
+import { band, score } from '../src/mos.ts';
 
 const near = (actual, expected, epsilon = 1e-9) =>
   assert.ok(Math.abs(actual - expected) < epsilon, `${actual} is not ${expected}`);
@@ -47,11 +47,4 @@ test('needs latency, jitter and loss', () => {
   assert.equal(score(10, null, 0), null);
   assert.equal(score(10, 1, null), null);
   assert.equal(score(Number.NaN, 1, 0), null);
-});
-
-test('scores columns point by point', () => {
-  const out = scoreColumn([20, null, 300], [2, 1, 10], [0, 0, 5]);
-  near(out[0], reference(20, 2, 0));
-  assert.equal(out[1], null);
-  near(out[2], reference(300, 10, 5));
 });

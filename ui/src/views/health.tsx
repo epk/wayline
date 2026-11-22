@@ -207,7 +207,7 @@ function ChecksPanel(props: { checks: Check[] }) {
     <Panel
       id="wl-health-checks"
       title="Components"
-      sub="The same checks as wayline-ctl doctor on the router."
+      sub="Checks of each part of Wayline on the router."
     >
       <ul className="wl-checks-list">
         {sorted.map((c) => (

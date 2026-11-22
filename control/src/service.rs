@@ -4,10 +4,12 @@ use crate::runtime;
 use crate::runtime::{DAEMON, MONITOR_CONFIG, RUNTIME, STATUS_SOCKET};
 use crate::settings::Settings;
 use crate::{auto, changes, dimensions, egress, history, native, update};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs as unix_fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 fn flush() {
@@ -130,17 +132,71 @@ pub enum Lifecycle {
     Disable,
 }
 
+const CRON_ENTRY: &[u8] = b"* * * * * /usr/sbin/wayline-ctl tick >/dev/null 2>&1";
+const CRON_MARK: &[u8] = b"/usr/sbin/wayline-ctl tick";
+
+fn crontab(existing: &[u8], lifecycle: Lifecycle) -> Vec<u8> {
+    let body = existing.strip_suffix(b"\n").unwrap_or(existing);
+    let mut updated = Vec::with_capacity(existing.len() + CRON_ENTRY.len() + 1);
+    if !body.is_empty() {
+        for line in body.split(|&byte| byte == b'\n') {
+            if !line
+                .windows(CRON_MARK.len())
+                .any(|window| window == CRON_MARK)
+            {
+                updated.extend_from_slice(line);
+                updated.push(b'\n');
+            }
+        }
+    }
+    if lifecycle == Lifecycle::Enable {
+        updated.extend_from_slice(CRON_ENTRY);
+        updated.push(b'\n');
+    }
+    updated
+}
+
+fn schedule(cron: &Path, lifecycle: Lifecycle) -> Result<()> {
+    let (existing, current) = match fs::read(cron) {
+        Ok(data) => {
+            let target = fs::canonicalize(cron)?;
+            let mode = fs::metadata(&target)?.permissions().mode() & 0o7777;
+            (data, Some((target, mode)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::ensure!(
+                fs::symlink_metadata(cron).is_err(),
+                "The root crontab is a broken link."
+            );
+            (Vec::new(), None)
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context("Could not read the root crontab."));
+        }
+    };
+    let updated = crontab(&existing, lifecycle);
+    if current.is_some() && updated == existing {
+        return Ok(());
+    }
+    let (target, mode) = current.unwrap_or_else(|| (cron.to_path_buf(), 0o600));
+    let parent = target
+        .parent()
+        .context("The crontab needs a parent directory.")?;
+    fs::create_dir_all(parent)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(&updated)?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(mode))?;
+    file.as_file().sync_all()?;
+    file.persist(&target)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 pub fn lifecycle(lifecycle: Lifecycle) -> Result<()> {
     let cron = Path::new("/etc/crontabs/root");
-    let mut lines: Vec<_> = fs::read_to_string(cron)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| !line.contains("/usr/sbin/wayline-ctl tick"))
-        .map(str::to_owned)
-        .collect();
     let startup = Path::new("/etc/rc.d/S95wayline");
     if lifecycle == Lifecycle::Enable {
-        lines.push("* * * * * /usr/sbin/wayline-ctl tick >/dev/null 2>&1".into());
         if !startup.exists() {
             unix_fs::symlink("/usr/sbin/wayline-ctl", startup)?;
         }
@@ -148,12 +204,11 @@ pub fn lifecycle(lifecycle: Lifecycle) -> Result<()> {
         let _ = fs::remove_file(startup);
         let _ = delete();
     }
-    fs::create_dir_all("/etc/crontabs")?;
-    wayline_support::atomic(cron, format!("{}\n", lines.join("\n")).as_bytes())?;
+    schedule(cron, lifecycle)?;
     let _ = wayline_support::text("/etc/init.d/cron", &["reload"], 8192, 10);
     if lifecycle == Lifecycle::Enable {
         let _ = delete();
-        reconcile()?;
+        runtime::writing("reconcile", reconcile_inner)?;
     }
     Ok(())
 }
@@ -175,14 +230,18 @@ fn routine() -> Result<()> {
         None => (None, None),
     };
     let monitored = inventory.as_ref().filter(|_| native::supported());
-    if let Some(inventory) = monitored.filter(|_| config.enabled) {
-        let hosts = router::hosts(&config, inventory);
-        let mut resolved = Resolved::read();
-        if resolved.stale(&hosts) {
-            resolved.refresh(&hosts)?;
-        }
-    }
-    if failure.is_none()
+    let resolved = monitored
+        .filter(|_| config.enabled)
+        .map_or(Ok(()), |inventory| {
+            let hosts = router::hosts(&config, inventory);
+            let mut resolved = Resolved::read();
+            if resolved.stale(&hosts) {
+                resolved.refresh(&hosts)
+            } else {
+                Ok(())
+            }
+        });
+    let applied = if failure.is_none()
         && !inventory
             .as_ref()
             .is_some_and(|inventory| inventory.partial)
@@ -193,8 +252,10 @@ fn routine() -> Result<()> {
             } else {
                 Ok(())
             }
-        })?;
-    }
+        })
+    } else {
+        Ok(())
+    };
     let refreshed = monitored.map_or(Ok(()), |inventory| {
         egress::Cache::refresh(&config, inventory)
     });
@@ -205,24 +266,133 @@ fn routine() -> Result<()> {
         .as_ref()
         .filter(|_| config.monitoring())
         .map_or(Ok(()), |inventory| dimensions::record(&config, inventory));
-    refreshed?;
-    let collected = format!("{RUNTIME}/last-collect");
-    let last = fs::read_to_string(&collected)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    let now = runtime::now();
-    let interval = if config.monitoring() && troubled(&config) {
-        60
+    let collected = if config.monitoring() {
+        let interval = if troubled(&config) { 60 } else { 300 };
+        collect_due(
+            Path::new(&format!("{RUNTIME}/last-collect")),
+            runtime::now(),
+            interval,
+            || history::collect(&config),
+        )
     } else {
-        300
+        Ok(())
     };
-    if config.monitoring() && (now.saturating_sub(last) >= interval || now < last) {
-        let result = history::collect(&config);
-        wayline_support::atomic(Path::new(&collected), now.to_string().as_bytes())?;
-        result?;
-    }
     let _ = auto::step(&config);
-    let outcome = recorded.and(described);
+    let outcome = resolved
+        .and(applied)
+        .and(refreshed)
+        .and(collected)
+        .and(recorded)
+        .and(described);
     failure.map_or(outcome, Err)
+}
+
+fn collect_due(
+    stamp: &Path,
+    now: u64,
+    interval: u64,
+    collect: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let last = fs::read_to_string(stamp)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if now >= last && now.saturating_sub(last) < interval {
+        return Ok(());
+    }
+    collect()?;
+    wayline_support::atomic(stamp, now.to_string().as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Lifecycle, collect_due, crontab, schedule};
+    use anyhow::{Result, bail, ensure};
+    use std::cell::Cell;
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    const ENTRY: &str = "* * * * * /usr/sbin/wayline-ctl tick >/dev/null 2>&1\n";
+
+    #[test]
+    fn crontab_lines_are_filtered_as_bytes() {
+        let existing =
+            b"0 4 * * * /sbin/reboot\n\xff\xfe odd\n* * * * * /usr/sbin/wayline-ctl tick\n";
+        let enabled = crontab(existing, Lifecycle::Enable);
+        let mut expected = b"0 4 * * * /sbin/reboot\n\xff\xfe odd\n".to_vec();
+        expected.extend_from_slice(ENTRY.as_bytes());
+        assert_eq!(enabled, expected);
+        assert_eq!(crontab(&enabled, Lifecycle::Enable), enabled);
+        assert_eq!(
+            crontab(&enabled, Lifecycle::Disable),
+            b"0 4 * * * /sbin/reboot\n\xff\xfe odd\n"
+        );
+        assert_eq!(crontab(b"", Lifecycle::Enable), ENTRY.as_bytes());
+        assert_eq!(crontab(b"", Lifecycle::Disable), b"");
+        assert_eq!(crontab(b"a\n\nb", Lifecycle::Disable), b"a\n\nb\n");
+    }
+
+    #[test]
+    fn scheduling_keeps_mode_link_and_other_jobs() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let real = folder.path().join("real");
+        fs::write(&real, b"0 4 * * * /sbin/reboot\n\xff odd\n")?;
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o640))?;
+        let cron = folder.path().join("root");
+        symlink(&real, &cron)?;
+        schedule(&cron, Lifecycle::Enable)?;
+        ensure!(fs::symlink_metadata(&cron)?.file_type().is_symlink());
+        ensure!(fs::metadata(&real)?.permissions().mode() & 0o7777 == 0o640);
+        let mut expected = b"0 4 * * * /sbin/reboot\n\xff odd\n".to_vec();
+        expected.extend_from_slice(ENTRY.as_bytes());
+        ensure!(fs::read(&real)? == expected);
+        schedule(&cron, Lifecycle::Disable)?;
+        ensure!(fs::read(&real)? == b"0 4 * * * /sbin/reboot\n\xff odd\n");
+        let fresh = folder.path().join("crontabs").join("root");
+        schedule(&fresh, Lifecycle::Enable)?;
+        ensure!(fs::read(&fresh)? == ENTRY.as_bytes());
+        ensure!(fs::metadata(&fresh)?.permissions().mode() & 0o7777 == 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unreadable_crontab_is_left_alone() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let cron = folder.path().join("root");
+        fs::create_dir(&cron)?;
+        ensure!(schedule(&cron, Lifecycle::Enable).is_err());
+        ensure!(fs::metadata(&cron)?.is_dir());
+        let dangling = folder.path().join("dangling");
+        symlink(folder.path().join("missing"), &dangling)?;
+        ensure!(schedule(&dangling, Lifecycle::Enable).is_err());
+        ensure!(fs::symlink_metadata(&dangling)?.file_type().is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_collection_is_retried_on_the_next_tick() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let stamp = folder.path().join("last-collect");
+        let runs = Cell::new(0);
+        let fail = || -> Result<()> {
+            runs.set(runs.get() + 1);
+            bail!("The store is busy.")
+        };
+        ensure!(collect_due(&stamp, 1000, 300, fail).is_err());
+        ensure!(!stamp.exists());
+        ensure!(collect_due(&stamp, 1060, 300, fail).is_err());
+        ensure!(runs.get() == 2);
+        let succeed = || -> Result<()> {
+            runs.set(runs.get() + 1);
+            Ok(())
+        };
+        collect_due(&stamp, 1120, 300, succeed)?;
+        ensure!(fs::read_to_string(&stamp)? == "1120");
+        collect_due(&stamp, 1180, 300, succeed)?;
+        ensure!(runs.get() == 3);
+        collect_due(&stamp, 1420, 300, succeed)?;
+        collect_due(&stamp, 100, 300, succeed)?;
+        ensure!(runs.get() == 5);
+        Ok(())
+    }
 }

@@ -100,6 +100,7 @@ export interface EgressPath {
   ip?: string | null;
   location?: string | null;
   error?: string | null;
+  verified?: boolean;
 }
 
 export interface Tier {

@@ -41,8 +41,11 @@ Parquet at rest, Arrow in motion.
 
   `kind=event` and `kind=incident` hold individual records, one file per UTC
   day, and are not rolled up. Events have `ts`, `seq`, `subject`, `kind` and
-  `text`; incidents have `ts` (start), `end` (null while ongoing), `series`
-  and `kind`. Both are kept as long as the longest metric tier, so every view
+  `text`; incidents have `ts` (start), `end` (null while ongoing), `series`,
+  `kind` and `seen` (end of the last lost bucket seen so far). An ongoing
+  incident is closed at `seen` once nothing has extended it for two buckets,
+  for example after a restart emptied the live ring, and it only absorbs a
+  later run that starts within one bucket of `seen`. Both are kept as long as the longest metric tier, so every view
   covers the same range.
 
   Each chunk is named by its UTC start. Columns: `series` (UTF-8, dictionary
@@ -85,14 +88,24 @@ Parquet at rest, Arrow in motion.
 
 Each chunk's `wayline.span_seconds` records the period it covers.
 
-Every 5 minutes wayline-ctl merges new 15-second rows into the open chunk,
-recomputes the affected coarser periods, and rewrites each changed file
-atomically (write, fsync, rename). Only the chunks of the current period
-change; older files are immutable, which keeps incremental copies cheap.
-Retention deletes whole files, so data can outlive the nominal period by up to
-one chunk. A file that cannot be read is renamed to `.broken` and logged in
-Recent changes; only that chunk is lost. Storage is capped at 96 MB on flash
-and 8 MB in memory, oldest chunks first.
+Every 5 minutes wayline-ctl merges new 15-second rows into the open chunk and
+rewrites it atomically (write, fsync, rename). A coarser period is written
+once its period has closed, and again only if late rows change it; the open
+period of a coarser tier is rolled up from 15-second rows at query time. Older
+files are immutable, which keeps incremental copies cheap. Retention deletes
+whole files, so data can outlive the nominal period by up to one chunk. A file
+that does not decode is renamed to `.broken`, logged in Recent changes, and
+deleted after 3 days; only that chunk is lost. A file that cannot be read
+(an I/O error or one above the size limit) is reported as an error and left in
+place. Storage is capped at 96 MB on flash and 8 MB in memory. The cap counts
+every history file (chunks, event and incident tables, dimensions, staged and
+damaged files); when it is exceeded, damaged files go first, then the oldest
+chunks, and the removal is logged in Recent changes.
+
+Switching retention between memory only and flash deletes the store the old
+setting used and logs that history starts fresh: flash history does not fit
+the 8 MB memory cap, and memory history covers at most a day. Doctor and the
+Health tab report the unused store if it is still there.
 
 Measured for one week of eleven latency series, all tiers:
 
@@ -123,8 +136,10 @@ GROUP BY ALL ORDER BY hour;
 The time-ranged join gives each row the name the path had when it was
 measured. Join on `(table, series)` with `valid_to IS NULL` for today's names.
 
-`latency.sqlite` from earlier versions is left in place and no longer read.
-Purge history deletes it.
+The SQLite store of 0.1.0-alpha.24 and earlier (`latency.sqlite` with its
+journal files, `telemetry.sqlite` and `series.json`) is renamed once to
+`<name>.legacy`, logged in Recent changes, and not shown or counted toward the
+cap. Purge history deletes it.
 
 ### Planned: export and off-router views
 
@@ -159,7 +174,15 @@ later, or never on a captive network.
   15 s, and stored. Buckets already within 30 s of that time are left as they are.
 - Staged files from earlier boots that never synced are stored with the
   timestamps they have, and logged in Recent changes. Staging is capped at
-  16 MB.
+  16 MB per boot; data dropped at the cap, and staged lines that do not parse,
+  are logged in Recent changes when the file is stored. A file that fails does
+  not stop the others.
+- Trust from connectivity alone is provisional. If the wall clock later steps
+  more than 60 s against the offset it was trusted at, the source becomes
+  `step`, buckets still in the live ring are re-timed, and Recent changes notes
+  that history saved earlier in that boot may be at the wrong time.
+- Change events (Recent changes) are not recorded until the clock is synced.
+  Changes that happen before that are noticed on the first tick after sync.
 - `get_state.clock` reports `synced`, the `source` (`ntp`, `step` or
   `connectivity`) and whether staged data is waiting.
 
@@ -177,6 +200,9 @@ later, or never on a captive network.
   and 150 ms. The open last bin is bounded by the period's max.
 - **Loss**: probes without a matching reply within the timeout (2 s) divided by
   probes sent. The page shows the destination and the probe count beside it.
+  A probe slot that cannot be sent because the interface is missing or down,
+  the route is missing or points elsewhere, or the socket or send fails counts
+  as sent and lost, so an absent tunnel shows as loss rather than a gap.
 - **Jitter**: mean absolute difference between consecutive successful RTTs on
   the same path, `J = Σ|RTTᵢ − RTTᵢ₋₁| / n`. A lost probe breaks the chain.
   Buckets keep the sum and count, so rollups stay exact. This is the

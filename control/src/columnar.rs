@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use wayline_protocol::BUCKET_SECONDS;
 
 const SPANS: [u64; 4] = [240, 360, 288, 168];
@@ -26,6 +27,8 @@ const CHUNK_LIMIT: usize = 16 * 1024 * 1024;
 const EXTENSION: &str = "parquet";
 const ZSTD_LEVEL: i32 = 3;
 const DAMAGED: &str = "A history chunk was damaged and was reset.";
+const BROKEN: &str = ".broken";
+const BROKEN_GRACE: Duration = Duration::from_hours(72);
 
 pub use wayline_protocol::schema::{Fold, Kind};
 
@@ -312,10 +315,7 @@ fn decode(kind: &Kind, step: u64, bytes: Vec<u8>) -> Result<Chunk> {
     Ok(chunk)
 }
 
-fn damaged(root: &Path, path: &Path) -> Result<()> {
-    let mut broken = path.as_os_str().to_owned();
-    broken.push(".broken");
-    fs::rename(path, broken)?;
+pub fn note(root: &Path, text: &str) -> Result<()> {
     changes::append(
         root,
         [Event {
@@ -323,21 +323,33 @@ fn damaged(root: &Path, path: &Path) -> Result<()> {
             seq: 0,
             subject: "history".into(),
             kind: "history".into(),
-            text: DAMAGED.into(),
+            text: text.into(),
         }],
     )
+}
+
+pub fn set_aside(path: &Path) -> Result<()> {
+    let mut broken = path.as_os_str().to_owned();
+    broken.push(BROKEN);
+    fs::rename(path, &broken)?;
+    fs::File::options()
+        .write(true)
+        .open(&broken)?
+        .set_modified(SystemTime::now())?;
+    Ok(())
 }
 
 fn load(root: &Path, kind: &Kind, step: u64, path: &Path) -> Result<Chunk> {
     if !path.exists() {
         return Ok(Chunk::new());
     }
-    if let Ok(chunk) =
-        wayline_support::read(path, CHUNK_LIMIT).and_then(|bytes| decode(kind, step, bytes))
-    {
+    let bytes = wayline_support::read(path, CHUNK_LIMIT)
+        .with_context(|| format!("Cannot read history chunk {}.", path.display()))?;
+    if let Ok(chunk) = decode(kind, step, bytes) {
         return Ok(chunk);
     }
-    damaged(root, path)?;
+    set_aside(path)?;
+    note(root, DAMAGED)?;
     Ok(Chunk::new())
 }
 
@@ -463,15 +475,46 @@ fn coarsen(kind: &Kind, rows: &Chunk, ratio: u64, keep: Option<&BTreeSet<u64>>) 
         .collect()
 }
 
+fn latest(root: &Path, kind: &Kind, tier: &Tier) -> Result<Option<u64>> {
+    let dir = tier_dir(root, kind, tier.step);
+    let Some(&start) = starts(&dir, tier.step).last() else {
+        return Ok(None);
+    };
+    Ok(
+        load(root, kind, tier.step, &chunk_path(&dir, start, tier.step))?
+            .keys()
+            .map(|(_, period)| *period)
+            .max(),
+    )
+}
+
+struct Window {
+    days: u32,
+    now: u64,
+}
+
 fn rollup(
     root: &Path,
     kind: &Kind,
-    child: &Tier,
-    parent: &Tier,
+    (child, parent): (&Tier, &Tier),
     periods: &BTreeSet<u64>,
+    window: &Window,
 ) -> Result<BTreeSet<u64>> {
     let ratio = parent.step / child.step;
-    let parents: BTreeSet<u64> = periods.iter().map(|period| period / ratio).collect();
+    let Some(closed) = (window.now / parent.step).checked_sub(1) else {
+        return Ok(BTreeSet::new());
+    };
+    let mut parents: BTreeSet<u64> = periods
+        .iter()
+        .map(|period| period / ratio)
+        .filter(|period| *period <= closed)
+        .collect();
+    let floor = window
+        .now
+        .saturating_sub(history::retained(window.days, child.step))
+        / parent.step;
+    let from = latest(root, kind, parent)?.map_or(floor, |period| (period + 1).max(floor));
+    parents.extend(from..=closed);
     let (Some(&low), Some(&high)) = (parents.first(), parents.last()) else {
         return Ok(parents);
     };
@@ -533,21 +576,87 @@ pub fn cap(root: &Path) -> u64 {
     }
 }
 
+fn walk(dir: &Path, found: &mut Vec<(PathBuf, fs::Metadata)>) {
+    for entry in fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            walk(&path, found);
+        } else if meta.is_file() {
+            found.push((path, meta));
+        }
+    }
+}
+
+fn counted(root: &Path) -> Vec<(PathBuf, fs::Metadata)> {
+    let mut found = Vec::new();
+    walk(root, &mut found);
+    found.retain(|(path, _)| !history::legacy(path));
+    found
+}
+
 pub fn bytes(root: &Path) -> u64 {
-    files(root).iter().map(|(_, bytes, _)| bytes).sum()
+    counted(root).iter().map(|(_, meta)| meta.len()).sum()
+}
+
+fn broken(path: &Path) -> bool {
+    path.to_string_lossy().ends_with(BROKEN)
+}
+
+fn sweep(root: &Path, now: SystemTime) -> Result<()> {
+    for (path, meta) in counted(root) {
+        let old = meta
+            .modified()
+            .is_ok_and(|modified| modified + BROKEN_GRACE <= now);
+        if broken(&path) && old {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 fn enforce(root: &Path) -> Result<()> {
-    let found = files(root);
-    let mut total: u64 = found.iter().map(|(_, bytes, _)| bytes).sum();
-    for (_, bytes, path) in found {
-        if total <= cap(root) {
+    let limit = cap(root);
+    let mut total = bytes(root);
+    if total <= limit {
+        return Ok(());
+    }
+    for (path, meta) in counted(root) {
+        if total > limit && broken(&path) {
+            fs::remove_file(&path)?;
+            total = total.saturating_sub(meta.len());
+        }
+    }
+    let mut evicted = false;
+    for (_, bytes, path) in files(root) {
+        if total <= limit {
             break;
         }
         fs::remove_file(path)?;
         total = total.saturating_sub(bytes);
+        evicted = true;
+    }
+    if evicted {
+        note(
+            root,
+            &format!(
+                "History storage reached its {} MiB cap, so the oldest history was removed.",
+                limit / 1024 / 1024
+            ),
+        )?;
     }
     Ok(())
+}
+
+pub fn tidy(root: &Path) -> Result<()> {
+    sweep(root, SystemTime::now())?;
+    enforce(root)
 }
 
 pub fn store(root: &Path, days: u32, kind: &Kind, entries: &[Entry], now: u64) -> Result<()> {
@@ -569,6 +678,7 @@ pub fn store(root: &Path, days: u32, kind: &Kind, entries: &[Entry], now: u64) -
     }
     let all: Vec<Tier> = tiers().collect();
     merge(root, kind, &all[0], fresh, false)?;
+    let window = Window { days, now };
     for pair in all.windows(2) {
         let [child, parent] = pair else {
             continue;
@@ -576,10 +686,15 @@ pub fn store(root: &Path, days: u32, kind: &Kind, entries: &[Entry], now: u64) -
         if history::retained(days, parent.step) == 0 {
             break;
         }
-        periods = rollup(root, kind, child, parent, &periods)?;
+        periods = rollup(root, kind, (child, parent), &periods, &window)?;
     }
-    expire(root, kind, days, now)?;
-    enforce(root)
+    expire(root, kind, days, now)
+}
+
+fn widen(bounds: Option<(u64, u64)>, (low, high): (u64, u64)) -> (u64, u64) {
+    bounds.map_or((low, high), |(left, right)| {
+        (left.min(low), right.max(high))
+    })
 }
 
 pub fn series(
@@ -593,9 +708,20 @@ pub fn series(
     for ((series, period), row) in rows_in(root, kind, &tier(step), (first, last))? {
         found.entry(series).or_default().insert(period, row);
     }
+    let ratio = step / BUCKET_SECONDS;
     let periods = live.iter().map(|entry| entry.at / BUCKET_SECONDS);
-    if let (Some(low), Some(high)) = (periods.clone().min(), periods.max()) {
-        let bounds = history::aligned((low, high), step / BUCKET_SECONDS);
+    let mut bounds = periods
+        .clone()
+        .min()
+        .zip(periods.max())
+        .map(|range| history::aligned(range, ratio));
+    if ratio > 1 {
+        let open = latest(root, kind, &tier(step))?.map_or(first, |period| (period + 1).max(first));
+        if open <= last {
+            bounds = Some(widen(bounds, (open * ratio, (last + 1) * ratio - 1)));
+        }
+    }
+    if let Some(bounds) = bounds {
         let mut fine = rows_in(root, kind, &tier(LEVELS[0].0), bounds)?;
         for entry in live {
             fine.insert(
@@ -677,11 +803,30 @@ pub fn inventory(root: &Path) -> Vec<TierFiles> {
 pub fn report(root: &Path) -> Vec<String> {
     let found = files(root);
     let total: u64 = found.iter().map(|(_, bytes, _)| bytes).sum();
-    let mut lines = vec![format!(
-        "history chunks: {} Parquet files, {total} bytes of {} bytes cap",
-        found.len(),
-        cap(root)
-    )];
+    let everything = counted(root);
+    let all: u64 = everything.iter().map(|(_, meta)| meta.len()).sum();
+    let damaged: Vec<&PathBuf> = everything
+        .iter()
+        .map(|(path, _)| path)
+        .filter(|path| broken(path))
+        .collect();
+    let mut lines = vec![
+        format!(
+            "history chunks: {} Parquet files, {total} bytes",
+            found.len()
+        ),
+        format!(
+            "history total: {all} bytes of {} bytes cap, including tables, staged and damaged files",
+            cap(root)
+        ),
+    ];
+    if !damaged.is_empty() {
+        lines.push(format!(
+            "history damaged files: {} set aside, removed after {} days",
+            damaged.len(),
+            BROKEN_GRACE.as_secs() / 86_400
+        ));
+    }
     let mut per: BTreeMap<String, (usize, u64)> = BTreeMap::new();
     for (_, bytes, path) in &found {
         let label = path
@@ -940,6 +1085,129 @@ mod tests {
         ensure!(events.iter().any(|event| event.text.contains("damaged")));
         store(root, 7, &TEST, &[entry("a", at, 3)], now)?;
         ensure!(!series(root, &TEST, 15, (at / 15, at / 15), &[])?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_chunks_are_errors_not_damage() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let now = runtime::now();
+        let at = now / 15 * 15 - 600;
+        let dir = root.join("kind=test").join("step=15");
+        let name = stamp(at / 15 / 240 * 240 * 15);
+        fs::create_dir_all(dir.join(format!("{name}.parquet")))?;
+        ensure!(
+            series(root, &TEST, 15, (at / 15, at / 15), &[]).is_err(),
+            "An unreadable chunk was read as empty."
+        );
+        ensure!(!dir.join(format!("{name}.parquet.broken")).exists());
+        ensure!(!root.join("kind=event").exists(), "No damage was reported.");
+        Ok(())
+    }
+
+    #[test]
+    fn every_history_file_counts_toward_the_cap() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let now = runtime::now();
+        let at = now / 15 * 15 - 600;
+        store(root, 7, &TEST, &[entry("a", at, 3)], now)?;
+        let chunks = super::bytes(root);
+        fs::create_dir_all(root.join("pending"))?;
+        fs::write(root.join("pending/boot.ndjson"), [0; 100])?;
+        fs::write(root.join("dimensions.parquet"), [0; 10])?;
+        fs::write(root.join("latency.sqlite.legacy"), [0; 1_000])?;
+        let old = root.join("kind=test/step=15/old.parquet.broken");
+        let recent = root.join("kind=test/step=15/recent.parquet.broken");
+        fs::write(&old, [0; 7])?;
+        fs::write(&recent, [0; 3])?;
+        fs::File::options()
+            .write(true)
+            .open(&old)?
+            .set_modified(std::time::SystemTime::now() - super::BROKEN_GRACE)?;
+        ensure!(
+            super::bytes(root) == chunks + 120,
+            "Total {} is not {} plus the extra files.",
+            super::bytes(root),
+            chunks
+        );
+        super::tidy(root)?;
+        ensure!(!old.exists(), "An old damaged file was kept.");
+        ensure!(recent.exists(), "A recent damaged file was removed.");
+        ensure!(root.join("latency.sqlite.legacy").exists());
+        fs::File::create(root.join("pending/big.ndjson"))?.set_len(super::FLASH_CAP)?;
+        super::tidy(root)?;
+        ensure!(super::files(root).is_empty(), "The cap kept chunks.");
+        ensure!(!recent.exists(), "Damaged files outlived the cap.");
+        let events: Vec<crate::changes::Event> = crate::journal::all(root)?;
+        ensure!(
+            events.iter().any(|event| event.text.contains("cap")),
+            "Eviction was not recorded."
+        );
+        Ok(())
+    }
+
+    fn parent_inodes(root: &std::path::Path) -> Result<Vec<u64>> {
+        use std::os::unix::fs::MetadataExt as _;
+        [60, 300]
+            .iter()
+            .map(|step| {
+                let path = fs::read_dir(root.join(format!("kind=test/step={step}")))?
+                    .next()
+                    .context("No parent chunk.")??
+                    .path();
+                Ok(fs::metadata(path)?.ino())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parents_roll_up_only_after_their_period_closes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let hour = runtime::now() / HOUR * HOUR - 4 * HOUR;
+        let now = hour + 30 * 60 + 5;
+        let entries: Vec<Entry> = (0..120)
+            .map(|index| entry("a", hour + index * 15, 2))
+            .collect();
+        store(root, 30, &TEST, &entries, now)?;
+        let stored = |step: u64, period: u64| -> Result<bool> {
+            Ok(
+                super::rows_in(root, &TEST, &super::tier(step), (period, period))?
+                    .contains_key(&("a".to_owned(), period)),
+            )
+        };
+        ensure!(
+            stored(60, hour / 60 + 29)?,
+            "A closed minute was not rolled up."
+        );
+        ensure!(
+            stored(300, hour / 300 + 5)?,
+            "A closed five minutes were not rolled up."
+        );
+        ensure!(!stored(3_600, hour / HOUR)?, "The open hour was written.");
+        let shown = series(root, &TEST, 3_600, (hour / HOUR, hour / HOUR), &[])?;
+        let row = shown
+            .get("a")
+            .and_then(|rows| rows.get(&(hour / HOUR)))
+            .cloned()
+            .unwrap_or_default();
+        ensure!(row[0] == Some(120), "The open hour shows {row:?}.");
+        let files = parent_inodes(root)?;
+        store(root, 30, &TEST, &entries, now)?;
+        let again = parent_inodes(root)?;
+        ensure!(files == again, "Unchanged parents were rewritten.");
+        let later = hour + 2 * HOUR + 30;
+        store(root, 30, &TEST, &[entry("a", hour + 2 * HOUR, 2)], later)?;
+        ensure!(
+            stored(3_600, hour / HOUR)?,
+            "The closed hour was not caught up."
+        );
+        let row = super::rows_in(root, &TEST, &super::tier(3_600), (hour / HOUR, hour / HOUR))?
+            .remove(&("a".to_owned(), hour / HOUR))
+            .unwrap_or_default();
+        ensure!(row[0] == Some(120), "The caught-up hour holds {row:?}.");
         Ok(())
     }
 }

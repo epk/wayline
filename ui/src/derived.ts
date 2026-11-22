@@ -3,20 +3,33 @@ import { finite } from './format.ts';
 import { score, type Score } from './mos.ts';
 import { latencyLine, sum, times, type LatencyLine } from './series.ts';
 import { exitTunnel, latencyData, primary, state, wifiData } from './store.ts';
-import type { EgressPath, Incident, Num, Tunnel, Uplink } from './types.ts';
+import type { EgressPath, Incident, LatencyDoc, Num, Tunnel, Uplink } from './types.ts';
 
 export const endpointPrefix = 'endpoint:';
 export const uplinkPrefix = 'uplink:';
 
-export const latencyX = computed(() => {
-  const doc = latencyData.value.doc;
-  return doc ? times(doc) : [];
-});
+// Any store write invalidates every computed value. Rebuilding these only
+// when the history document changes keeps their arrays stable, so charts
+// skip redrawing on unrelated writes such as the 5-second state poll.
+const perDoc = <T>(make: (doc: LatencyDoc) => T, empty: T) => {
+  let seen: LatencyDoc | null = null;
+  let out = empty;
+  return computed(() => {
+    const doc = latencyData.value.doc;
+    if (doc !== seen) {
+      seen = doc;
+      out = doc ? make(doc) : empty;
+    }
+    return out;
+  });
+};
 
-export const latencyLines = computed<LatencyLine[]>(() => {
-  const doc = latencyData.value.doc;
-  return doc ? doc.series.map((s) => latencyLine(doc, s)) : [];
-});
+export const latencyX = perDoc<ArrayLike<number>>(times, []);
+
+export const latencyLines = perDoc<LatencyLine[]>(
+  (doc) => doc.series.map((s) => latencyLine(doc, s)),
+  [],
+);
 
 export const lineFor = (id: string): LatencyLine | null =>
   latencyLines.value.find((l) => l.id === id) || null;
@@ -129,7 +142,8 @@ const pathTone = (p: PathHealth): [HealthTone, string] => {
   if (p.down) return ['down', p.down.detail || 'Every probe lost'];
   if (!finite(p.median)) return ['unknown', 'No recent measurement'];
   if (finite(p.loss.pct) && p.loss.pct >= 1) return ['degraded', p.loss.pct.toFixed(1) + ' % loss'];
-  if (p.score && p.score.band === 'poor') return ['degraded', 'MOS ' + p.score.mos.toFixed(2)];
+  if (p.score && p.score.band === 'poor')
+    return ['degraded', 'Call quality ' + p.score.mos.toFixed(1) + ' of 5'];
   return ['ok', p.median.toFixed(2) + ' ms'];
 };
 
@@ -176,7 +190,7 @@ export const health = computed<Health[]>(() => {
       label: 'Internet',
       tone: 'unknown',
       text: 'Unavailable',
-      reason: s.wan.reason || 'Direct WAN is unavailable.',
+      reason: s.wan.reason || 'The direct internet connection is unavailable.',
     });
   else {
     const [tone, text] = pathTone(net);
@@ -247,7 +261,7 @@ export const health = computed<Health[]>(() => {
     const bad: string[] = [];
     if (finite(l.signal) && wifiLevel.signal(l.signal) === 'poor')
       bad.push('signal ' + l.signal + ' dBm');
-    if (finite(snr) && wifiLevel.snr(snr) === 'poor') bad.push('SNR ' + snr + ' dB');
+    if (finite(snr) && wifiLevel.snr(snr) === 'poor') bad.push('weak signal over noise');
     if (finite(busy) && wifiLevel.busy(busy) === 'poor')
       bad.push('channel ' + busy.toFixed(0) + ' % busy');
     items.push({
@@ -279,7 +293,7 @@ export const health = computed<Health[]>(() => {
     const bad: string[] = [];
     const mem = memUsed(sys);
     if (finite(sys.cpu) && sys.cpu >= routerLimits.cpu)
-      bad.push('CPU ' + sys.cpu.toFixed(0) + ' %');
+      bad.push('processor ' + sys.cpu.toFixed(0) + ' %');
     if (finite(mem) && mem >= routerLimits.mem) bad.push('memory ' + mem.toFixed(0) + ' %');
     if (
       finite(sys.conntrack) &&
@@ -287,14 +301,16 @@ export const health = computed<Health[]>(() => {
       sys.conntrackMax > 0 &&
       (sys.conntrack / sys.conntrackMax) * 100 >= routerLimits.conntrack
     )
-      bad.push('conntrack ' + ((sys.conntrack / sys.conntrackMax) * 100).toFixed(0) + ' %');
+      bad.push(
+        'connection table ' + ((sys.conntrack / sys.conntrackMax) * 100).toFixed(0) + ' % full',
+      );
     if (finite(sys.temperature) && sys.temperature >= routerLimits.temperature)
       bad.push(sys.temperature.toFixed(0) + ' °C');
     items.push({
       id: 'router',
       label: 'Router',
       tone: bad.length ? 'degraded' : 'ok',
-      text: bad.length ? bad[0] : finite(sys.cpu) ? 'CPU ' + sys.cpu.toFixed(0) + ' %' : 'OK',
+      text: bad.length ? bad[0] : finite(sys.cpu) ? 'Processor ' + sys.cpu.toFixed(0) + ' %' : 'OK',
       reason: bad.join(', ') || 'Below the warning limits.',
     });
   }

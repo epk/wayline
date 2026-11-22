@@ -1,4 +1,11 @@
-import { useState, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react';
+import {
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
+  type ReactNode,
+} from 'react';
 import { ago, dateTime, resolution, stamp } from './format.ts';
 import { bandLabel, formula, type Score } from './mos.ts';
 import { lossLabels, runs, uptime as uptimeOf } from './series.ts';
@@ -115,10 +122,37 @@ export function MosExplain(props: { inputs?: string }) {
 }
 
 // A tooltip that works on hover, keyboard focus and tap, unlike title, which
-// touch screens never show and some browsers delay or hide.
+// touch screens never show and some browsers delay or hide. A click or tap
+// toggles it; Escape, blur or a tap elsewhere closes it.
 export function Tip(props: { text: string; children: ReactNode }) {
+  const [open, setOpen] = useState<boolean | null>(null);
+  const ref = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const away = (e: PointerEvent) => {
+      if (!ref.current?.contains(e.target as Node)) setOpen(null);
+    };
+    document.addEventListener('pointerdown', away);
+    return () => document.removeEventListener('pointerdown', away);
+  }, [open]);
   return (
-    <button type="button" className="wl-tip" data-tip={props.text}>
+    <button
+      ref={ref}
+      type="button"
+      className="wl-tip"
+      data-tip={props.text}
+      data-open={open === null ? undefined : String(open)}
+      onClick={() => setOpen(!open)}
+      onBlur={() => setOpen(null)}
+      onMouseLeave={() => open === false && setOpen(null)}
+      onKeyDown={(e) => {
+        if (e.key !== 'Escape' || open === false) return;
+        // Keep the Escape from also closing a surrounding dialog.
+        e.preventDefault();
+        e.stopPropagation();
+        setOpen(false);
+      }}
+    >
       {props.children}
       <span className="wl-sr">. {props.text}</span>
     </button>

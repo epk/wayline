@@ -124,4 +124,8 @@ export class GlinetRpcSource implements DataSource {
   installUpdate() {
     return this.call<UpdateReply>('install_update');
   }
+
+  clearUpdate() {
+    return this.call<UpdateReply>('clear_update');
+  }
 }

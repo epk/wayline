@@ -279,7 +279,7 @@ export function SettingsDrawer() {
               Probes bypass the VPN. Where a probe cannot, the monitor says so.
             </p>
             <Check
-              label="VPN servers, over WAN"
+              label="VPN servers, outside the tunnel"
               checked={d.endpointDiagnostics}
               onChange={(endpointDiagnostics) => updateDraft({ endpointDiagnostics })}
             />
@@ -302,8 +302,8 @@ export function SettingsDrawer() {
               onChange={(telemetry) => updateDraft({ telemetry })}
             />
             <p className="wl-muted">
-              CPU, memory, temperature, tracked connections, per-interface throughput, WireGuard
-              handshakes. Sampled every 5 seconds and kept like latency.
+              Processor, memory, temperature, tracked connections, per-interface throughput,
+              WireGuard handshakes. Sampled every 5 seconds and kept like latency.
             </p>
           </section>
           <section className="wl-set" aria-labelledby="wl-set-exit">

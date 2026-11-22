@@ -159,7 +159,7 @@ fn history(report: &mut Report, settings: &Result<Settings>) {
     report.info(
         "history storage",
         format!(
-            "{} bytes of {} bytes cap (Parquet chunks, zstd)",
+            "{} bytes of {} bytes cap (all history files, Parquet with zstd)",
             stored.bytes, stored.cap
         ),
     );

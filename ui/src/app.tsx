@@ -143,8 +143,31 @@ function Notice() {
   );
 }
 
-const chunk = (name: ChunkName, exported: string) =>
-  lazy(() => loadChunk(name).then((module) => ({ default: module[exported] as ComponentType })));
+// React keeps a failed lazy() rejected forever. After a failure, the next
+// render following the view boundary's Try again builds a fresh one, which
+// downloads the chunk again.
+let attempt = 0;
+const chunk = (name: ChunkName, exported: string): ComponentType => {
+  let Current: ComponentType | null = null;
+  let made = 0;
+  let failed = false;
+  return () => {
+    if (!Current || (failed && made !== attempt)) {
+      made = attempt;
+      failed = false;
+      Current = lazy(() =>
+        loadChunk(name).then(
+          (module) => ({ default: module[exported] as ComponentType }),
+          (error: unknown) => {
+            failed = true;
+            throw error;
+          },
+        ),
+      );
+    }
+    return <Current />;
+  };
+};
 
 const screens: Record<ViewId, ComponentType> = {
   overview: OverviewView,
@@ -169,9 +192,20 @@ class ViewBoundary extends Component<{ children: ReactNode }, { failure: string 
       <div className="wl-panel wl-fail" role="alert">
         <h2>This view could not be loaded.</h2>
         <p className="wl-fail-text">{this.state.failure}</p>
-        <Button className="wl-button" onClick={reloadPage}>
-          Reload page
-        </Button>
+        <div className="wl-actions">
+          <Button
+            className="wl-button"
+            onClick={() => {
+              attempt++;
+              this.setState({ failure: '' });
+            }}
+          >
+            Try again
+          </Button>
+          <Button className="wl-button" onClick={reloadPage}>
+            Reload page
+          </Button>
+        </div>
       </div>
     );
   }

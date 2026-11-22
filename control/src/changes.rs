@@ -4,7 +4,7 @@ use crate::journal::{self, Cell, Field, Record, Type, millis};
 use crate::router::{Inventory, PathInfo};
 use crate::runtime;
 use crate::settings::Settings;
-use crate::wifi;
+use crate::{clock, wifi};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -239,7 +239,15 @@ pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
     runtime::writing("history", || record_inner(config, inventory))
 }
 
+pub fn ready(clock: Option<&clock::Clock>, now: u64) -> bool {
+    now >= history::MIN_CLOCK && clock.is_none_or(|clock| clock.synced)
+}
+
 fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
+    let parts = runtime::current();
+    if !ready(clock::of(&parts)?.as_ref(), runtime::now()) {
+        return Ok(());
+    }
     let root = history::root(config);
     let facts_path = root.join("facts.json");
     runtime::directory(facts_path.parent().context("Invalid history directory.")?)?;
@@ -262,7 +270,7 @@ fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
         ))
     }));
     if config.upstream_wifi
-        && let Some(status) = runtime::current().wifi
+        && let Some(status) = parts.wifi
         && let Some(link) = status.link
     {
         let network = if link.ssid.is_empty() {
@@ -456,5 +464,22 @@ mod tests {
         ensure!(events.len() == 1 && events[0].kind == "uplink");
         ensure!(events[0].text == "Direct WAN moved from wan to wwan.");
         Ok(())
+    }
+
+    #[test]
+    fn events_wait_for_a_synced_clock() {
+        let clock = |synced: bool| crate::clock::Clock {
+            boot: "b".into(),
+            synced,
+            source: None,
+            offset_ms: 0,
+            moved_ms: None,
+        };
+        let now = crate::history::MIN_CLOCK + 60;
+        assert!(!super::ready(Some(&clock(false)), now));
+        assert!(super::ready(Some(&clock(true)), now));
+        assert!(super::ready(None, now));
+        assert!(!super::ready(None, 1_000));
+        assert!(!super::ready(Some(&clock(true)), 1_000));
     }
 }
