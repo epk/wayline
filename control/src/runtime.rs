@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rustix::fs::{Mode, OFlags};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wayline_protocol::{MAX_STATUS, Series, Status, TelemetryStatus, WifiStatus};
 
 pub const RUNTIME: &str = "/var/run/wayline";
@@ -40,15 +40,47 @@ pub fn version() -> String {
         .into()
 }
 
-pub fn locked<T>(name: &str, action: impl FnOnce() -> Result<T>) -> Result<T> {
-    let lock = fs::OpenOptions::new()
+fn lock_file(name: &str) -> Result<fs::File> {
+    Ok(fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(format!("{RUNTIME}/{name}.lock"))?;
+        .open(format!("{RUNTIME}/{name}.lock"))?)
+}
+
+pub fn locked<T>(name: &str, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock = lock_file(name)?;
     lock.try_lock().context("Another operation is active.")?;
     action()
+}
+
+const STORE_WAIT: Duration = Duration::from_secs(5);
+
+pub fn reading<T>(name: &str, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock = lock_file(name)?;
+    wait_for(|| lock.try_lock_shared())?;
+    action()
+}
+
+pub fn writing<T>(name: &str, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock = lock_file(name)?;
+    wait_for(|| lock.try_lock())?;
+    action()
+}
+
+fn wait_for(mut attempt: impl FnMut() -> Result<(), fs::TryLockError>) -> Result<()> {
+    let deadline = Instant::now() + STORE_WAIT;
+    loop {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(fs::TryLockError::WouldBlock) => bail!("Another operation is active."),
+            Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
 }
 
 pub fn directory(path: &Path) -> Result<()> {
@@ -136,7 +168,7 @@ pub fn milliseconds(micros: u32) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{fetch, private, status};
+    use super::{fetch, private, status, wait_for};
     use anyhow::{Result, ensure};
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
@@ -145,6 +177,36 @@ mod tests {
     use std::thread;
 
     const REPLY: &str = r#"{"schema":1,"run_id":"r","target":"1.1.1.1","uptime_ms":0,"interval_ms":5000,"tunnels":[]}"#;
+
+    #[test]
+    fn store_readers_share_and_wait_for_a_writer() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("history.lock");
+        let open = || {
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+        };
+        let (first, second, writer) = (open()?, open()?, open()?);
+        wait_for(|| first.try_lock_shared())?;
+        wait_for(|| second.try_lock_shared())?;
+        first.unlock()?;
+        second.unlock()?;
+        writer.lock()?;
+        let release = thread::spawn(move || -> Result<()> {
+            thread::sleep(std::time::Duration::from_millis(100));
+            writer.unlock()?;
+            Ok(())
+        });
+        let reader = open()?;
+        wait_for(|| reader.try_lock_shared())?;
+        release
+            .join()
+            .map_err(|_| anyhow::anyhow!("Writer thread panicked."))??;
+        Ok(())
+    }
 
     #[test]
     fn status_requests_use_the_daemon_line_protocol() -> Result<()> {

@@ -431,6 +431,14 @@ fn settled(previous: Option<&Status>) -> bool {
     previous.is_none_or(|status| status.phase != Phase::Installing && !status.needs_attention)
 }
 
+fn automatic_wait(previous: Option<&Status>) -> u64 {
+    if previous.is_some_and(|status| status.failed && !status.needs_attention) {
+        3_600
+    } else {
+        86_400
+    }
+}
+
 fn space(path: &Path, minimum: u64) -> Result<()> {
     let capacity = rustix::fs::statvfs(path)?;
     ensure!(
@@ -500,7 +508,8 @@ pub fn scheduled(config: &Settings) -> Result<()> {
         );
         let checked_at = previous.as_ref().map_or(0, |status| status.checked_at);
         if requested.is_empty()
-            && (!config.auto_updates || runtime::now().saturating_sub(checked_at) < 86_400)
+            && (!config.auto_updates
+                || runtime::now().saturating_sub(checked_at) < automatic_wait(previous.as_ref()))
         {
             return Ok(());
         }
@@ -520,7 +529,7 @@ pub fn scheduled(config: &Settings) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Phase, Release, Status, effective, newest};
+    use super::{Phase, Release, Status, automatic_wait, effective, newest};
     use anyhow::{Result, ensure};
     use semver::Version;
 
@@ -626,6 +635,24 @@ mod tests {
         ensure!(effective(at(Phase::Done, 0), 100).phase == Phase::Done);
         ensure!(effective(at(Phase::Done, 0), 10_000).phase == Phase::Idle);
         ensure!(effective(at(Phase::Idle, 0), 10_000).phase == Phase::Idle);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_automatic_check_retries_after_an_hour() -> Result<()> {
+        let failed = Status {
+            failed: true,
+            ..Status::default()
+        };
+        ensure!(automatic_wait(Some(&failed)) == 3_600);
+        let stuck = Status {
+            failed: true,
+            needs_attention: true,
+            ..Status::default()
+        };
+        ensure!(automatic_wait(Some(&stuck)) == 86_400);
+        ensure!(automatic_wait(Some(&Status::default())) == 86_400);
+        ensure!(automatic_wait(None) == 86_400);
         Ok(())
     }
 }

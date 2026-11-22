@@ -72,9 +72,17 @@ export interface ChartProps {
 
 type Theme = Record<string, string>;
 
-const tokens = ['text', 'muted', 'border', 'brand', 'danger', 'warning', 'good', 'event'].concat(
-  Array.from({ length: 8 }, (_, i) => 'series-' + (i + 1)),
-);
+const tokens = [
+  'text',
+  'muted',
+  'border',
+  'card',
+  'brand',
+  'danger',
+  'warning',
+  'good',
+  'event',
+].concat(Array.from({ length: 8 }, (_, i) => 'series-' + (i + 1)));
 
 let parser: CanvasRenderingContext2D | null = null;
 export const withAlpha = (color: string, alpha: number): string => {
@@ -262,6 +270,13 @@ export function Chart(props: ChartProps) {
       ctx.stroke();
       ctx.font = 11 * ratio + 'px sans-serif';
       ctx.textAlign = 'right';
+      // A halo in the card color keeps the label readable where a series crosses it.
+      ctx.setLineDash([]);
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = 3 * ratio;
+      ctx.strokeStyle = t.card || '#fff';
+      ctx.strokeText(h.label, right - 4 * ratio, y - 4 * ratio);
+      ctx.lineWidth = ratio;
       ctx.fillText(h.label, right - 4 * ratio, y - 4 * ratio);
     });
     ctx.setLineDash([3 * ratio, 3 * ratio]);

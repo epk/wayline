@@ -77,6 +77,68 @@
 .wl [hidden] {
   display: none !important;
 }
+/*
+ * The GL.iNet admin panel styles bare elements for the whole document
+ * (`* { margin: 0; padding: 0; overflow-wrap: break-word }`,
+ * `table { table-layout: fixed }`, borderless buttons and inputs, nowrap links
+ * and more). Those rules are unlayered, so they also beat every rule in the UI
+ * SDK layer. Roll them back inside the page so the SDK layer and the browser
+ * defaults apply, as in the standalone preview. The page's own element rules
+ * below share this specificity and come later, so they still win.
+ */
+.wl :where(*) {
+  margin: revert-layer;
+  padding: revert-layer;
+  overflow-wrap: revert-layer;
+  word-break: revert-layer;
+}
+.wl :where(a) {
+  display: revert-layer;
+  white-space: revert-layer;
+  font-weight: revert-layer;
+  cursor: revert-layer;
+  text-decoration: revert-layer;
+}
+.wl :where(h1, h2, h3, h4, h5, h6) {
+  font-weight: revert-layer;
+  text-decoration: revert-layer;
+}
+.wl :where(button, input, optgroup, option, select, textarea) {
+  border: revert-layer;
+  outline: revert-layer;
+}
+.wl :where(input, textarea) {
+  background-color: revert-layer;
+}
+.wl :where(ol, ul) {
+  list-style: revert-layer;
+}
+.wl :where(p) {
+  line-height: revert-layer;
+}
+.wl :where(pre) {
+  white-space: revert-layer;
+}
+.wl :where(i) {
+  font-style: revert-layer;
+}
+.wl :where(img) {
+  vertical-align: revert-layer;
+}
+.wl :where(table) {
+  table-layout: revert-layer;
+  min-width: revert-layer;
+  text-indent: revert-layer;
+  border-spacing: revert-layer;
+}
+.wl :where(thead) {
+  height: revert-layer;
+  color: revert-layer;
+  border-bottom: revert-layer;
+}
+.wl :where(td, th) {
+  text-align: revert-layer;
+}
 .wl-probe {
   color-scheme: light dark;
   position: absolute;
@@ -85,25 +147,25 @@
   overflow: hidden;
   background: var(--wl-card);
 }
-:where(.wl) h1 {
+.wl :where(h1) {
   font-size: 24px;
   font-weight: 600;
   line-height: 1.25;
   margin: 0 0 4px;
   overflow-wrap: anywhere;
 }
-:where(.wl) h2 {
+.wl :where(h2) {
   font-size: 16px;
   font-weight: 600;
   margin: 0;
 }
-:where(.wl) h3,
+.wl :where(h3),
 .wl .wl-h3 {
   font-size: 13px;
   font-weight: 600;
   margin: 0;
 }
-:where(.wl) p {
+.wl :where(p) {
   margin: 4px 0 10px;
 }
 .wl code,
@@ -119,23 +181,23 @@
   overflow-x: auto;
   margin: 6px 0;
 }
-:where(.wl) button,
-:where(.wl) input,
-:where(.wl) select {
+.wl :where(button),
+.wl :where(input),
+.wl :where(select) {
   font: inherit;
   color: inherit;
 }
-:where(.wl) button {
+.wl :where(button) {
   cursor: pointer;
   white-space: nowrap;
 }
-:where(.wl) button:disabled,
-:where(.wl) input:disabled,
-:where(.wl) select:disabled {
+.wl :where(button:disabled),
+.wl :where(input:disabled),
+.wl :where(select:disabled) {
   cursor: not-allowed;
   opacity: 0.55;
 }
-:where(.wl) a {
+.wl :where(a) {
   color: var(--wl-brand-text);
 }
 .wl :focus-visible {
@@ -151,7 +213,7 @@
   white-space: nowrap;
 }
 .wl-muted,
-:where(.wl) small {
+.wl :where(small) {
   color: var(--wl-muted);
 }
 .wl-small {
@@ -770,6 +832,8 @@
 .wl-scroll {
   overflow-x: auto;
   max-width: 100%;
+  /* Contain visually hidden labels and inputs, or they widen the admin page. */
+  position: relative;
 }
 .wl-table-wrap {
   background: var(--wl-card);
@@ -851,7 +915,13 @@
   color: var(--wl-good-text);
 }
 .wl-action {
-  white-space: nowrap;
+  min-width: 132px;
+}
+/* Long tunnel names make these labels wide; let them wrap so the column stays narrow. */
+.wl-action .wl-button,
+.wl-action .wl-switch {
+  white-space: normal;
+  text-align: left;
 }
 .wl-switch {
   display: inline-flex;
@@ -891,6 +961,9 @@
 }
 .wl-series tbody th {
   white-space: nowrap;
+}
+.wl-series tbody th .wl-tag {
+  margin-left: 6px;
 }
 .wl-swatch {
   margin-right: 6px;
@@ -1033,7 +1106,7 @@ th[aria-sort='descending'] .wl-sort::after {
 }
 .wl-strip-row {
   display: grid;
-  grid-template-columns: 10em minmax(0, 1fr) 64px;
+  grid-template-columns: minmax(0, 12em) minmax(0, 1fr) 64px;
   gap: 4px 10px;
   align-items: center;
   margin: 4px 0;
@@ -1113,6 +1186,7 @@ th[aria-sort='descending'] .wl-sort::after {
   background: var(--wl-card);
   color: var(--wl-text);
   box-shadow: -6px 0 24px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
   overscroll-behavior: contain;
 }
 .wl-drawer::backdrop,
@@ -1153,6 +1227,8 @@ th[aria-sort='descending'] .wl-sort::after {
 }
 .wl-drawer-body {
   flex: 1;
+  /* Without this the body grows to its content and the whole drawer scrolls. */
+  min-height: 0;
   overflow-y: auto;
   padding: 4px 16px 16px;
 }
@@ -1298,7 +1374,13 @@ th[aria-sort='descending'] .wl-sort::after {
     font-size: 22px;
   }
   .wl-strip-row {
-    grid-template-columns: minmax(60px, 96px) minmax(0, 1fr) 58px;
+    grid-template-columns: minmax(0, 12em) minmax(0, 1fr) 58px;
+  }
+}
+/* The admin panel's phone layout gives the page no side margin. */
+@media (max-width: 767px) {
+  .wl {
+    padding-inline: 12px;
   }
 }
 @media (pointer: coarse) {

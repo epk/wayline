@@ -125,6 +125,16 @@ in
       env.WAYLINE_LAB_PATH = lib.mkForce "";
     };
   };
+  # Builds run offline. Say so on entry when a lockfile needs packages that
+  # are not downloaded yet, rather than letting cargo fail with "no matching package".
+  enterShell = ''
+    if ! cargo metadata --locked --offline --format-version 1 >/dev/null 2>&1; then
+      echo "wayline: Cargo.lock needs crates that are not downloaded yet. Run wayline-deps." >&2
+    fi
+    if [ ! -e ui/node_modules/.modules.yaml ] || [ ui/pnpm-lock.yaml -nt ui/node_modules/.modules.yaml ]; then
+      echo "wayline: ui/pnpm-lock.yaml changed since the last install. Run wayline-deps." >&2
+    fi
+  '';
   scripts.wayline-deps.exec = "exec cargo run --locked --package xtask -- deps";
   scripts.wayline-check.exec = "exec cargo run --locked --offline --package xtask -- check";
   scripts.wayline-lint.exec = "exec cargo run --locked --offline --package xtask -- lint";

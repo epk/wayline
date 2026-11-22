@@ -636,7 +636,7 @@ fn discard_before(samples: &mut [Series], cutoff: u64) {
 }
 
 pub fn purge() -> Result<()> {
-    runtime::locked("history", || {
+    runtime::writing("history", || {
         let roots = [
             PathBuf::from("/etc/wayline/history"),
             Path::new(RUNTIME).join("history"),
@@ -832,7 +832,7 @@ fn collect_at(root: &Path, days: u32, ring: &[Series]) -> Result<()> {
 }
 
 pub fn collect(config: &Settings) -> Result<()> {
-    runtime::locked("history", || collect_inner(config))
+    runtime::writing("history", || collect_inner(config))
 }
 
 fn collect_inner(config: &Settings) -> Result<()> {
@@ -1088,7 +1088,7 @@ fn lines(
 }
 
 pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {
-    runtime::locked("history", || query_inner(config, inventory, query))
+    runtime::reading("history", || query_inner(config, inventory, query))
 }
 
 fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {

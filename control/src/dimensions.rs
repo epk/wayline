@@ -328,7 +328,7 @@ pub fn path(config: &Settings) -> PathBuf {
 }
 
 pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
-    runtime::locked("history", || {
+    runtime::writing("history", || {
         let path = path(config);
         let previous = if path.exists() {
             read(&path).unwrap_or_default()

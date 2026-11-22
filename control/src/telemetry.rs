@@ -403,7 +403,7 @@ fn interface_columns(
 }
 
 pub fn query(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {
-    runtime::locked("history", || query_inner(config, inventory, query))
+    runtime::reading("history", || query_inner(config, inventory, query))
 }
 
 fn query_inner(config: &Settings, inventory: &Inventory, query: &Query) -> Result<Response> {

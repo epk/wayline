@@ -190,6 +190,7 @@ const luminance = (color: string): number => {
 
 const motion = (): boolean =>
   typeof document.startViewTransition === 'function' &&
+  !document.hidden &&
   !matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 function switchView(next: ViewId): void {
@@ -198,10 +199,13 @@ function switchView(next: ViewId): void {
     setView(next);
     return;
   }
-  document.startViewTransition(() => {
+  const transition = document.startViewTransition(() => {
     setView(next);
     return new Promise<void>((resolve) => setTimeout(resolve, 0));
   });
+  // The browser skips the animation when the page hides or another switch
+  // interrupts it. The view still changes, so the rejection needs no action.
+  transition.ready.catch(() => {});
 }
 
 function Dashboard() {

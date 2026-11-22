@@ -165,7 +165,7 @@ pub fn diff(at: u64, stored: &mut BTreeMap<String, String>, facts: &[Fact]) -> (
 }
 
 pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
-    runtime::locked("history", || record_inner(config, inventory))
+    runtime::writing("history", || record_inner(config, inventory))
 }
 
 fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {

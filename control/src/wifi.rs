@@ -371,7 +371,7 @@ fn periods(
 }
 
 pub fn query(config: &Settings, query: &Query) -> Result<Response> {
-    runtime::locked("history", || query_inner(config, query))
+    runtime::reading("history", || query_inner(config, query))
 }
 
 fn query_inner(config: &Settings, query: &Query) -> Result<Response> {
