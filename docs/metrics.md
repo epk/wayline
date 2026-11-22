@@ -177,6 +177,9 @@ later, or never on a captive network.
   and 150 ms. The open last bin is bounded by the period's max.
 - **Loss**: probes without a matching reply within the timeout (2 s) divided by
   probes sent. The page shows the destination and the probe count beside it.
+  A probe slot that cannot be sent because the interface is missing or down,
+  the route is missing or points elsewhere, or the socket or send fails counts
+  as sent and lost, so an absent tunnel shows as loss rather than a gap.
 - **Jitter**: mean absolute difference between consecutive successful RTTs on
   the same path, `J = Σ|RTTᵢ − RTTᵢ₋₁| / n`. A lost probe breaks the chain.
   Buckets keep the sum and count, so rollups stay exact. This is the

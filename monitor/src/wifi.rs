@@ -697,12 +697,16 @@ impl Record {
         self.candidates = candidates.to_vec();
         let previous = self.previous.take();
         let reading = match observation {
-            Observation::QueryFailed | Observation::NoClientInterface => {
-                self.state = if matches!(observation, Observation::QueryFailed) {
-                    WifiState::QueryFailed
-                } else {
-                    WifiState::NoClientInterface
-                };
+            Observation::QueryFailed => {
+                self.state = WifiState::QueryFailed;
+                self.interface = None;
+                self.link = None;
+                self.previous = previous;
+                self.close(wall_ms);
+                return;
+            }
+            Observation::NoClientInterface => {
+                self.state = WifiState::NoClientInterface;
                 self.interface = None;
                 self.link = None;
                 if previous.is_some() {
@@ -1033,6 +1037,46 @@ mod tests {
             sampler.observe(start + Duration::from_secs(31)),
             Observation::NoClientInterface
         ));
+    }
+
+    #[test]
+    fn failed_queries_are_neither_samples_nor_disconnects() {
+        let start = Instant::now();
+        let base = 1_800_000_000_000;
+        let mut record = Record::new();
+        let mut sampler = Sampler::new(fake());
+        let apply = |record: &mut Record, observation: Observation, offset: u64| {
+            record.apply(
+                start + Duration::from_millis(offset),
+                base + offset,
+                observation,
+                &[],
+            );
+        };
+        apply(&mut record, sampler.observe(start), 0);
+        apply(&mut record, Observation::QueryFailed, 2_000);
+        apply(&mut record, Observation::QueryFailed, 4_000);
+        assert!(record.status(start, None).state == WifiState::QueryFailed);
+        apply(
+            &mut record,
+            sampler.observe(start + Duration::from_secs(6)),
+            6_000,
+        );
+        apply(&mut record, Observation::QueryFailed, 8_000);
+        apply(
+            &mut record,
+            Observation::Disconnected {
+                interface: "apclix0".into(),
+            },
+            10_000,
+        );
+        apply(&mut record, Observation::QueryFailed, 40_000);
+        let status = record.status(start + Duration::from_secs(40), Some(0));
+        assert_eq!(status.buckets.len(), 1);
+        let bucket = status.buckets[0];
+        assert_eq!(bucket.samples, 3);
+        assert_eq!(bucket.connected, 2);
+        assert_eq!(bucket.disconnects, 1);
     }
 
     #[test]

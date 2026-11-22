@@ -245,6 +245,8 @@ pub struct Record {
     previous_cpu: Option<Cpu>,
     system: Option<System>,
     open: Option<SystemBucket>,
+    load_sum: u64,
+    load_n: u32,
     closed: VecDeque<SystemBucket>,
     tracks: Vec<Track>,
 }
@@ -278,6 +280,14 @@ const fn delta(after: u64, before: u64) -> Option<u64> {
     after.checked_sub(before)
 }
 
+fn spread_load(sum: u64, readings: u32, samples: u32) -> u64 {
+    let readings = u64::from(readings);
+    sum.saturating_mul(u64::from(samples))
+        .saturating_add(readings / 2)
+        .checked_div(readings)
+        .unwrap_or(0)
+}
+
 impl Record {
     pub fn new(counters: &[Counter]) -> Self {
         Self {
@@ -285,6 +295,8 @@ impl Record {
             previous_cpu: None,
             system: None,
             open: None,
+            load_sum: 0,
+            load_n: 0,
             closed: VecDeque::new(),
             tracks: counters
                 .iter()
@@ -308,8 +320,11 @@ impl Record {
     }
 
     fn close(&mut self, wall_ms: u64) {
-        if let Some(bucket) = self.open.filter(|bucket| due(bucket.at, wall_ms)) {
+        if let Some(mut bucket) = self.open.filter(|bucket| due(bucket.at, wall_ms)) {
             self.open = None;
+            bucket.load_sum = spread_load(self.load_sum, self.load_n, bucket.samples);
+            self.load_sum = 0;
+            self.load_n = 0;
             if bucket.samples > 0 {
                 push(&mut self.closed, bucket);
             }
@@ -362,7 +377,10 @@ impl Record {
             bucket.cpu_sum += u64::from(cpu);
             bucket.cpu_max = Some(bucket.cpu_max.map_or(cpu, |high| high.max(cpu)));
         }
-        bucket.load_sum += u64::from(system.load_centi[0]);
+        if let Some([load, ..]) = observation.load {
+            self.load_n += 1;
+            self.load_sum += u64::from(load);
+        }
         if let Some(used) = (mem_total.saturating_sub(mem_available) * 1000).checked_div(mem_total)
         {
             bucket.mem_n += 1;
@@ -632,6 +650,49 @@ mod tests {
         assert_eq!(wg.latest, Some(1_700_000_000));
         assert_eq!(wg.endpoint.as_deref(), Some("198.51.100.1:51820"));
         assert!(!format!("{found:?}").contains("PRIVATE"));
+    }
+
+    #[test]
+    fn missing_load_readings_do_not_pull_the_mean_down() {
+        let start = Instant::now();
+        let wall = 1_800_000_000_000;
+        let mut record = Record::new(&counters());
+        let mut sampler = Sampler::new(host(1_000, 1_000), counters());
+        record.apply(start, wall, sampler.observe());
+        sampler.host.files.remove("/proc/loadavg");
+        record.apply(
+            start + Duration::from_secs(5),
+            wall + 5_000,
+            sampler.observe(),
+        );
+        sampler
+            .host
+            .files
+            .insert("/proc/loadavg".into(), "0.30 0.5 1.25 1/123 4567\n".into());
+        record.apply(
+            start + Duration::from_secs(10),
+            wall + 10_000,
+            sampler.observe(),
+        );
+        sampler.host.files.remove("/proc/loadavg");
+        record.apply(
+            start + Duration::from_secs(20),
+            wall + 20_000,
+            sampler.observe(),
+        );
+        record.apply(
+            start + Duration::from_secs(35),
+            wall + 35_000,
+            sampler.observe(),
+        );
+        let history = record.status(start + Duration::from_secs(35), Some(0));
+        assert_eq!(history.system_buckets.len(), 2);
+        let first = history.system_buckets[0];
+        assert_eq!(first.samples, 3);
+        assert_eq!(first.load_sum, 77);
+        let second = history.system_buckets[1];
+        assert_eq!(second.samples, 1);
+        assert_eq!(second.load_sum, 0);
     }
 
     #[test]
