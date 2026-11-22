@@ -56,8 +56,11 @@
   --ui-font-mono: var(--wl-mono);
   /* Smallest control size: 24px for a mouse, 44px for a finger (raised below). */
   --wl-target: 24px;
-  /* Panel side padding; panel footers and edge-to-edge lists bleed by this much. */
+  /* Panel padding (side, top and bottom); panel footers and edge-to-edge
+     lists bleed by this much. Narrow containers lower it on .wl-panel, since a
+     container query cannot style the container itself. */
   --wl-pad: 16px;
+  --wl-pad-block: 14px;
   color: var(--wl-text);
   font: 14px/1.5 var(--wl-font);
   width: 100%;
@@ -290,7 +293,7 @@
   border: 1px solid var(--wl-border);
   border-radius: 7px;
   margin: 12px 0;
-  padding: 14px var(--wl-pad);
+  padding: var(--wl-pad-block) var(--wl-pad);
   min-width: 0;
 }
 .wl-panel-head {
@@ -1166,13 +1169,8 @@ th[aria-sort='descending'] .wl-sort::after {
   overflow: hidden;
   overscroll-behavior: contain;
 }
-.wl-drawer::backdrop,
-.wl-backdrop {
+.wl-drawer::backdrop {
   background: rgba(0, 0, 0, 0.4);
-}
-.wl-backdrop {
-  position: fixed;
-  inset: 0;
 }
 .wl-drawer-form {
   display: flex;
@@ -1347,11 +1345,9 @@ th[aria-sort='descending'] .wl-sort::after {
   .wl-controls > .wl-button {
     margin-left: 0;
   }
-  .wl {
-    --wl-pad: 12px;
-  }
   .wl-panel {
-    padding-block: 12px;
+    --wl-pad: 12px;
+    --wl-pad-block: 12px;
   }
   .wl-timeline li {
     grid-template-columns: minmax(0, 1fr);
@@ -1730,7 +1726,7 @@ th[aria-sort='descending'] .wl-sort::after {
   color: var(--wl-muted);
 }
 .wl-panel-foot {
-  margin: 12px calc(-1 * var(--wl-pad)) -14px;
+  margin: 12px calc(-1 * var(--wl-pad)) calc(-1 * var(--wl-pad-block));
   padding: 10px var(--wl-pad);
   border-top: 1px solid var(--wl-border);
   border-radius: 0 0 7px 7px;
@@ -1786,12 +1782,9 @@ th[aria-sort='descending'] .wl-sort::after {
   color: var(--wl-text);
 }
 /* Explained labels: dotted underline, and the explanation on hover, focus or tap. */
-.wl-tip,
-.wl th[data-tip] {
+.wl-tip {
   position: relative;
   cursor: help;
-}
-.wl-tip {
   display: inline;
   margin: 0;
   padding: 0;
@@ -1810,8 +1803,7 @@ th[aria-sort='descending'] .wl-sort::after {
   outline: 2px solid var(--wl-focus);
   outline-offset: 2px;
 }
-.wl-tip::after,
-.wl th[data-tip]::after {
+.wl-tip::after {
   content: attr(data-tip);
   position: absolute;
   left: 0;
@@ -1832,14 +1824,22 @@ th[aria-sort='descending'] .wl-sort::after {
   display: none;
   pointer-events: none;
 }
-.wl th[data-tip]::after {
+/* In a table header the explanation opens below, so the scrolling table
+   does not clip it, and lines up with the right-aligned column. */
+.wl th .wl-tip {
+  margin-left: 4px;
+}
+.wl th .wl-tip::after {
   left: auto;
   right: 0;
+  bottom: auto;
+  top: calc(100% + 6px);
 }
-.wl-tip:hover::after,
-.wl-tip:focus::after,
-.wl th[data-tip]:hover::after {
+.wl-tip:is(:hover, :focus-visible, [data-open='true'])::after {
   display: block;
+}
+.wl-tip[data-open='false']::after {
+  display: none;
 }
 .wl-now-head {
   display: flex;
@@ -2062,17 +2062,37 @@ th[aria-sort='descending'] .wl-sort::after {
   }
 }
 
-/* Wide tables: tighter cells on a tablet; on a phone each row becomes a card
-   with its column names as labels, instead of a table that scrolls sideways. */
+/* Wide tables: tighter cells on a small laptop; on a tablet or phone each row
+   becomes a card with its column names as labels, instead of a table that
+   scrolls sideways. Cards have no header to sort by, so a Sort by control
+   appears instead. */
 .wl-stack {
   container: table / inline-size;
 }
-@container table (max-width: 760px) {
+.wl-sort-by {
+  display: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+.wl-sort-by select {
+  min-height: max(30px, var(--wl-target));
+  padding: 2px 6px;
+  border: 1px solid var(--wl-control-border);
+  border-radius: 5px;
+  background: var(--wl-card);
+}
+@container table (max-width: 900px) {
   .wl-stack .wl-table :is(th, td) {
     padding-inline: 6px;
   }
 }
-@container table (max-width: 540px) {
+@container table (max-width: 760px) {
+  .wl-sort-by {
+    display: flex;
+  }
   .wl-stack .wl-table,
   .wl-stack .wl-table tbody,
   .wl-stack .wl-table tr,

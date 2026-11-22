@@ -20,13 +20,20 @@ import { busy, can, enableSetting, range, state, wifiData } from '../store.ts';
 import type { Column, Rate, WifiKey } from '../types.ts';
 import { Badge, Explain, Panel, scaleNote, Tip, type Tone } from '../ui.tsx';
 
+const generation: Record<string, string> = {
+  EHT: 'Wi-Fi 7',
+  HE: 'Wi-Fi 6',
+  VHT: 'Wi-Fi 5',
+  HT: 'Wi-Fi 4',
+};
+
 const rateDetail = (rate: Rate): string => {
   if (!rate || !rate.mode) return '';
-  const parts = [rate.mode];
-  if (finite(rate.mcs)) parts[0] += ' MCS ' + rate.mcs;
+  const parts = [generation[rate.mode] || rate.mode];
+  if (finite(rate.mcs)) parts.push('rate index ' + rate.mcs);
   if (finite(rate.nss)) parts.push(rate.nss + (rate.nss === 1 ? ' stream' : ' streams'));
   if (finite(rate.mhz)) parts.push(rate.mhz + ' MHz');
-  if (rate.short_gi) parts.push('short GI');
+  if (rate.short_gi) parts.push('short guard interval');
   return parts.join(' · ');
 };
 
@@ -161,7 +168,7 @@ export function WifiView() {
   const sub =
     'Sampled every ' +
     (w.interval || 5) +
-    ' s from iwinfo.' +
+    ' s.' +
     (finite(age) ? ' Last sample ' + Math.round(age / 1000) + ' s ago.' : '');
   const sum = doc?.summary || {};
   const hasData = !!built && some(built.samples, (v) => finite(v) && v > 0);

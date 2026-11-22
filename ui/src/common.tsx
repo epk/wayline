@@ -30,7 +30,7 @@ export const tunnelName = (id: string): string => {
 };
 
 export const subjectName = (subject: string): string => {
-  if (subject === 'wan') return 'Direct WAN';
+  if (subject === 'wan') return 'Direct internet';
   if (subject === 'wifi') return 'Upstream Wi-Fi';
   if (subject === 'router') return 'Router';
   if (subject === 'history') return 'History storage';

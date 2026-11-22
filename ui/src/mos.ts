@@ -35,13 +35,6 @@ export function score(
   return { el, r, mos, band: band(mos) };
 }
 
-export function scoreColumn(median: Num[], jitter: Num[], loss: Num[]): Num[] {
-  return median.map((value, i) => {
-    const s = score(value, jitter[i], loss[i]);
-    return s ? s.mos : null;
-  });
-}
-
 export const formula = [
   'EL = latency_ms + 2 × jitter_ms + 10',
   'R  = 93.2 − EL / 40            if EL < 160',

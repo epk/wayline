@@ -87,11 +87,61 @@ const prune = (text) =>
     })
     .join('\n');
 
+// Split declarations on semicolons outside quotes and parentheses.
+const declarations = (body) => {
+  const out = [];
+  let depth = 0;
+  let quote = '';
+  let start = 0;
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (quote) quote = c === quote ? '' : quote;
+    else if (c === '"' || c === "'") quote = c;
+    else if (c === '(') depth++;
+    else if (c === ')') depth--;
+    else if (c === ';' && depth === 0) {
+      out.push(body.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(body.slice(start));
+  return out.filter((d) => d.trim());
+};
+
+// The page's .wl rule sets some SDK tokens itself, and unlayered rules beat
+// the SDK layer, so the SDK's defaults for those never apply. Drop them, and
+// any token nothing reads, such as icons for parts the page does not use.
+const pageCss = readFileSync(root + 'src/styles.css', 'utf8');
+const pageTokens = new Set(
+  [...pageCss.slice(0, pageCss.indexOf('}')).matchAll(/(--ui-[\w-]+)\s*:/g)].map((m) => m[1]),
+);
+const dropDeadTokens = (css) => {
+  const all = blocks(css);
+  const at = all.findIndex((block) => block.slice(0, block.indexOf('{')).trim() === '&');
+  if (at < 0) return css;
+  const head = all[at].slice(0, all[at].indexOf('{') + 1);
+  const rest = pageCss + all.filter((_, i) => i !== at).join('\n');
+  let kept = declarations(all[at].slice(head.length, -1));
+  for (let size = -1; size !== kept.length;) {
+    size = kept.length;
+    const text = rest + kept.join(';');
+    kept = kept.filter((d) => {
+      const name = d.slice(0, d.indexOf(':')).trim();
+      if (!name.startsWith('--ui-')) return true;
+      return !pageTokens.has(name) && text.includes('var(' + name);
+    });
+  }
+  all[at] = head + kept.join(';') + '}';
+  return all.join('\n');
+};
+
 const scopeWebCss = (code) => {
   const bare = code.replace(/\/\*[\s\S]*?\*\//g, '');
   const inner = bare.slice(bare.indexOf('{') + 1, bare.lastIndexOf('}'));
   return (
-    '@layer ui-sdk { :where(.wl) {' + prune(inner.replace(':where(:root, :host)', '&')) + '} }'
+    '@layer ui-sdk { :where(.wl) {' +
+    dropDeadTokens(prune(inner.replace(':where(:root, :host)', '&'))) +
+    '} }'
   );
 };
 
