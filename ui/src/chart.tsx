@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, type KeyboardEvent, type ReactNode } from 'react';
 import uPlot from 'uplot';
 import './uplot.css';
-import { finite, kept, resolution, stamp } from './format.ts';
+import { finite, resolution, stamp } from './format.ts';
 import {
   goNow,
   range,
@@ -9,7 +9,6 @@ import {
   shift,
   step,
   themeKey,
-  tier,
   windowEnd,
   windowStart,
   zoom,
@@ -137,11 +136,7 @@ const applyShow = (u: uPlot | null, visible: boolean[] | undefined): void => {
   });
 };
 
-export const scaleLabel = (): string => {
-  const t = tier.value;
-  const r = resolution(step.value) + ' buckets';
-  return t ? r + ' · kept ' + kept(t.keptSeconds) : r;
-};
+export const scaleLabel = (): string => resolution(step.value) + ' buckets';
 
 export function Chart(props: ChartProps) {
   const box = useRef<HTMLDivElement>(null);

@@ -9,7 +9,7 @@ import { Switch, SwitchThumb } from '@ui-sdk/react/switch';
 import { Toggle } from '@ui-sdk/react/toggle';
 import { useMemo, useState } from 'react';
 import { Chart, type Band, type Line, type Marker } from '../chart.tsx';
-import { changeFor, IncidentList, rangeIncidents, tunnelName } from '../common.tsx';
+import { changeFor, IncidentList, rangeIncidents, subjectName, tunnelName } from '../common.tsx';
 import {
   egressFor,
   endpointPrefix,
@@ -322,6 +322,7 @@ function TunnelTable() {
                       <Button
                         className="wl-button"
                         focusableWhenDisabled
+                        aria-label={'Use ' + t.name + ' as exit'}
                         title={
                           !can.value.select
                             ? selectReason.value
@@ -340,7 +341,7 @@ function TunnelTable() {
                       >
                         {busyTunnel.value === t.id && busyAction.value === 'select'
                           ? 'Applying…'
-                          : 'Use ' + t.name + ' as exit'}
+                          : 'Use as exit'}
                       </Button>
                     )}
                     {busyTunnel.value === t.id && busyAction.value === 'toggle' ? (
@@ -359,6 +360,7 @@ function TunnelTable() {
                         }
                       >
                         <Switch
+                          aria-label={'Run ' + t.name}
                           checked={t.enabled}
                           disabled={busy.value || !t.controllable || !can.value.control}
                           data-agent-confirm={
@@ -373,7 +375,7 @@ function TunnelTable() {
                         >
                           <SwitchThumb />
                         </Switch>
-                        <span>Run {t.name}</span>
+                        <span aria-hidden="true">{t.enabled ? 'Running' : 'Stopped'}</span>
                       </label>
                     )}
                   </div>
@@ -582,7 +584,7 @@ function History() {
       ...(doc?.incidents || []).map((i) => ({
         at: i.start,
         tone: 'danger' as const,
-        text: (i.name || i.subject) + ': ' + (i.detail || 'all probes lost'),
+        text: (i.name || subjectName(i.subject)) + ': ' + (i.detail || 'all probes lost'),
       })),
     ],
     [doc],

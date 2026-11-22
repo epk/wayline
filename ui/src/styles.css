@@ -181,11 +181,16 @@
   overflow-x: auto;
   margin: 6px 0;
 }
-.wl :where(button),
-.wl :where(input),
-.wl :where(select) {
+.wl :where(button:not([data-slot]), input:not([data-slot]), select:not([data-slot])) {
   font: inherit;
   color: inherit;
+}
+/* UI SDK parts set their own colour and font in the SDK layer (a checked
+   checkbox draws its tick in the primary foreground). Undo GL.iNet's unlayered
+   button and input rules for them instead of forcing inherit. */
+.wl :where([data-slot]:is(button, input, select, textarea)) {
+  font: revert-layer;
+  color: revert-layer;
 }
 .wl :where(button) {
   cursor: pointer;
@@ -335,6 +340,9 @@
 }
 .wl-chip:hover {
   border-color: var(--wl-control-border);
+}
+.wl-chip .wl-badge {
+  border-radius: 999px;
 }
 .wl-chip-text {
   font-variant-numeric: tabular-nums;
@@ -914,14 +922,14 @@
 .wl-note-faster {
   color: var(--wl-good-text);
 }
-.wl-action {
-  min-width: 132px;
+.wl-action .wl-actions {
+  flex-direction: column;
+  align-items: flex-end;
+  flex-wrap: nowrap;
+  gap: 6px;
 }
-/* Long tunnel names make these labels wide; let them wrap so the column stays narrow. */
-.wl-action .wl-button,
-.wl-action .wl-switch {
-  white-space: normal;
-  text-align: left;
+.wl-action .wl-button {
+  white-space: nowrap;
 }
 .wl-switch {
   display: inline-flex;

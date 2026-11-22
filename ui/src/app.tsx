@@ -188,6 +188,17 @@ const luminance = (color: string): number => {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 };
 
+// The page sits on the host's background, so its text must suit that
+// background, not the OS preference. The first opaque ancestor decides.
+const hostBackground = (from: Element): string => {
+  for (let node = from.closest('.wl')?.parentElement; node; node = node.parentElement) {
+    const color = getComputedStyle(node).backgroundColor;
+    const alpha = (color.match(/[\d.]+/g) || []).map(Number)[3];
+    if (color && color !== 'transparent' && alpha !== 0) return color;
+  }
+  return '';
+};
+
 const motion = (): boolean =>
   typeof document.startViewTransition === 'function' &&
   !document.hidden &&
@@ -227,13 +238,25 @@ function Dashboard() {
   useEffect(() => {
     const detect = () => {
       if (!probe.current) return;
-      const color = getComputedStyle(probe.current).backgroundColor;
+      const color =
+        hostBackground(probe.current) || getComputedStyle(probe.current).backgroundColor;
       themeKey.value = luminance(color) < 0.2 ? 'dark' : 'light';
     };
     detect();
     const media = matchMedia('(prefers-color-scheme: dark)');
     media.addEventListener('change', detect);
-    return () => media.removeEventListener('change', detect);
+    // GL.iNet switches its theme by changing classes or styles on the root
+    // elements, without touching the OS preference.
+    const watcher = new MutationObserver(detect);
+    for (const node of [document.documentElement, document.body])
+      watcher.observe(node, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme'],
+      });
+    return () => {
+      media.removeEventListener('change', detect);
+      watcher.disconnect();
+    };
   }, []);
   const s = state.value;
   const active = ready.value && level.value !== 'unsupported';

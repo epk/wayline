@@ -1,8 +1,8 @@
 import { useState, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react';
-import { ago, dateTime, kept, resolution, stamp } from './format.ts';
+import { ago, dateTime, resolution, stamp } from './format.ts';
 import { bandLabel, formula, type Score } from './mos.ts';
 import { lossLabels, runs, uptime as uptimeOf } from './series.ts';
-import { range, step, tier, windowStart } from './store.ts';
+import { range, step, windowStart } from './store.ts';
 import type { Column } from './types.ts';
 
 export type Tone =
@@ -139,11 +139,7 @@ export function Panel(props: {
   );
 }
 
-export const scaleNote = (what = 'buckets'): string => {
-  const t = tier.value;
-  const r = resolution(step.value) + ' ' + what;
-  return t ? r + ', kept ' + kept(t.keptSeconds) : r;
-};
+export const scaleNote = (what = 'buckets'): string => resolution(step.value) + ' ' + what;
 
 export function Strip(props: {
   name: string;

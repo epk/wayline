@@ -1,5 +1,5 @@
 import { Pick } from '../kit.tsx';
-import { subjectName } from '../common.tsx';
+import { subjectKey, subjectName } from '../common.tsx';
 import { incidents } from '../derived.ts';
 import { dateTime, span } from '../format.ts';
 import { clock, eventSubject, latencyData, state, wifiData } from '../store.ts';
@@ -17,7 +17,8 @@ interface Item {
 export function EventsView() {
   const seen = new Set<string>();
   const items: Item[] = [];
-  const push = (item: Item) => {
+  const push = (raw: Item) => {
+    const item = { ...raw, subject: subjectKey(raw.subject) };
     const key = item.at + '|' + item.subject + '|' + item.text;
     if (seen.has(key)) return;
     seen.add(key);

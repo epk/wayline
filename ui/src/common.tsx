@@ -19,6 +19,11 @@ export const changeFor = (subject: string): ChangeEvent | null => {
   );
 };
 
+// Change events name a tunnel by its monitor id (vpn:7013) while incidents
+// use its config id (cfg0392bd). Both mean one tunnel, so fold them together.
+export const subjectKey = (subject: string): string =>
+  state.value.tunnels.find((x) => x.monitorId === subject)?.id || subject;
+
 export const tunnelName = (id: string): string => {
   const t = state.value.tunnels.find((x) => x.id === id || x.monitorId === id || x.name === id);
   return t ? t.name : id;
@@ -28,6 +33,7 @@ export const subjectName = (subject: string): string => {
   if (subject === 'wan') return 'Direct WAN';
   if (subject === 'wifi') return 'Upstream Wi-Fi';
   if (subject === 'router') return 'Router';
+  if (subject === 'history') return 'History storage';
   if (subject.startsWith('uplink:')) return subject.slice(7) + ' uplink';
   if (subject.startsWith('endpoint:')) return tunnelName(subject.slice(9)) + ' server';
   return tunnelName(subject);
