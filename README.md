@@ -42,9 +42,15 @@ Run this command in an SSH session on the router:
 curl -fsSL https://raw.githubusercontent.com/epk/wayline/main/install.sh | sh
 ```
 
-The installer downloads the newest published release, including prereleases. It checks the signing key fingerprint, manifest signature, and package hash before installation.
+The installer downloads the newest published release, including prereleases. Before installation it checks the signing key fingerprint and the manifest signature. It then checks that the signed manifest names the `wayline` package, the requested version, the package file name and architecture, and the file's exact size and SHA-256. The script runs only after it has downloaded completely.
 
-To install a specific version, download `install.sh`. Run `WAYLINE_VERSION=0.1.0-alpha.25 sh install.sh`.
+To install a specific version, set `WAYLINE_VERSION`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/epk/wayline/main/install.sh | WAYLINE_VERSION=0.1.0-alpha.25 sh
+```
+
+This pins the package but still runs the installer from `main`. Releases newer than 0.1.0-alpha.25 also attach the `install.sh` they were built with. To pin the installer as well, download it from the release instead of `main`, for example `https://github.com/epk/wayline/releases/download/v<version>/install.sh`, and run it with the same `WAYLINE_VERSION`.
 
 Create your VPN profiles in the factory dashboard first. Open **VPN → Wayline → Settings**. Choose the tunnels and destinations to monitor, then enable monitoring.
 
@@ -141,7 +147,9 @@ The page is React 19 with UI SDK components in TypeScript under `ui/src`. rolldo
 - `ui/dist/size-report.json`: first-load and total sizes. The build fails over the first-load or total budget.
 - `cargo xtask lab` runs the isolated closed-box checks.
 
-CI uses separate lint, build, and test jobs on native ARM64 runners. Tests use the binaries and package from the build job. A version change on `main` publishes those same artifacts after all checks pass. Other branches do not publish releases.
+CI uses separate lint, build, and test jobs on native ARM64 runners. Tests use the binaries and package from the build job. When the version in `monitor/Cargo.toml` on `main` has no `v<version>` tag yet, CI publishes those same artifacts after all checks pass, so a fixed follow-up commit still releases a version whose first run failed. A run publishes only while its commit is the tip of `main`, the version cannot decrease, and an existing release is never replaced. Other branches do not publish releases. Keep `control/Cargo.toml` and the version this README describes equal to `monitor/Cargo.toml`; `cargo xtask lint` checks both.
+
+`cargo xtask lab` runs the native firmware checks (package install and removal, the authenticated RPC bridge, settings writes, purge, and native tunnel control) only when an extracted firmware root is available. Prepare one with `cargo xtask lab-native <extracted-root>`, or set `WAYLINE_FIRMWARE_ROOT`. Without one, the lab prints that the native checks were skipped and records `"status": "skipped"` in `artifacts/local/current/native-package.json` and under `native_firmware` in `scenarios.json`. CI has no firmware root, so the native checks are always skipped there; CI keeps both files as the `wayline-lab-evidence` artifact. Run the native lab locally before a release.
 
 The macOS lab uses a minimal Colima VM with network namespaces and WireGuard interfaces. It starts no containers. Keep fault injection, tunnel changes, and package installation off routers that provide your working Internet connection.
 

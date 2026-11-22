@@ -256,15 +256,16 @@ fn delay(index: u32, args: &[&str]) -> Result<()> {
 
 fn scenarios() -> Result<()> {
     topology()?;
-    crate::native::check()?;
+    let native = crate::native::check()?;
     let mut child = start_monitor(&configuration(1000, 500, false))?;
-    let result = failures(&mut child);
+    let result = failures(&mut child, native);
     stop_child(&mut child);
     result
 }
 
-fn failures(child: &mut Child) -> Result<()> {
+fn failures(child: &mut Child, native: Value) -> Result<()> {
     let mut results = serde_json::Map::new();
+    results.insert("native_firmware".into(), native);
     let baseline = after(3)?;
     ensure!(
         baseline["tunnels"].as_array().is_some_and(|items| items
