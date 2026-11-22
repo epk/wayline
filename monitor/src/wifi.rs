@@ -336,8 +336,23 @@ pub enum Observation {
     Connected(Box<Reading>),
 }
 
-const fn connected(info: &Info) -> bool {
-    !info.link.bssid.is_empty()
+fn connected<S: Source>(source: &mut S, device: &str, info: &Info) -> bool {
+    let link = &info.link;
+    if link.bssid.is_empty() {
+        return false;
+    }
+    if link.signal.is_some() || link.quality.is_some() || !link.ssid.is_empty() {
+        return true;
+    }
+    source
+        .call("assoclist", device)
+        .and_then(|value| {
+            value
+                .get("results")?
+                .as_array()
+                .map(|list| !list.is_empty())
+        })
+        .unwrap_or(false)
 }
 
 fn read<S: Source>(source: &mut S, interface: &str, info: Info) -> Reading {
@@ -410,7 +425,8 @@ impl<S: Source> Sampler<S> {
             .into_iter()
             .filter_map(|device| {
                 let info = parse_info(&self.source.call("info", &device)?);
-                info.client.then(|| (connected(&info), device))
+                info.client
+                    .then(|| (connected(&mut self.source, &device, &info), device))
             })
             .collect();
         found.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
@@ -455,7 +471,7 @@ impl<S: Source> Sampler<S> {
             if !info.client {
                 continue;
             }
-            if connected(&info) {
+            if connected(&mut self.source, &interface, &info) {
                 self.connected = true;
                 return Observation::Connected(Box::new(read(&mut self.source, &interface, info)));
             }
@@ -958,6 +974,41 @@ mod tests {
             Sampler::new(failed).observe(Instant::now()),
             Observation::QueryFailed
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_bssid_on_an_idle_radio_is_not_a_connection() -> Result<(), &'static str> {
+        let mut source = fake();
+        source.devices = Some(vec!["apcli0".into(), "apclii0".into()]);
+        source.replies.insert(
+            ("info".into(), "apcli0".into()),
+            json!({"mode": "Client", "bssid": "A4:4D:12:02:8E:80", "channel": 10, "frequency": 2457, "noise": -89, "quality_max": 70}),
+        );
+        source.replies.insert(
+            ("assoclist".into(), "apcli0".into()),
+            json!({"results": []}),
+        );
+        let linked = source
+            .replies
+            .remove(&("info".to_owned(), "apclix0".to_owned()))
+            .ok_or("missing fixture")?;
+        source
+            .replies
+            .insert(("info".into(), "apclii0".into()), linked);
+        let station = source
+            .replies
+            .remove(&("assoclist".to_owned(), "apclix0".to_owned()))
+            .ok_or("missing fixture")?;
+        source
+            .replies
+            .insert(("assoclist".into(), "apclii0".into()), station);
+        let mut sampler = Sampler::new(source);
+        let Observation::Connected(reading) = sampler.observe(Instant::now()) else {
+            return Err("expected the 5 GHz link");
+        };
+        assert_eq!(reading.interface, "apclii0");
+        assert_eq!(sampler.candidates(), ["apclii0", "apcli0"]);
         Ok(())
     }
 
