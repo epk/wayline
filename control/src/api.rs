@@ -731,12 +731,14 @@ pub fn set_config(request: SetConfig) -> Result<Value> {
                 };
                 auto::Record::touch(attention)?;
                 runtime::store(SETTINGS, &config)?;
+                let relocated = history::relocate(&previous, &config);
                 let hosts = router::hosts(&config, &inventory);
                 let mut resolved = Resolved::read();
                 if resolved.stale(&hosts) {
                     resolved.refresh(&hosts)?;
                 }
                 service::reconcile()?;
+                relocated?;
             }
             Ok(json!({"applied":true}))
         })

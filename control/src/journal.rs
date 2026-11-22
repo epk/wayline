@@ -228,12 +228,12 @@ fn load<R: Record>(path: &Path) -> Result<Vec<R>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    if let Ok(rows) = wayline_support::read(path, LIMIT).and_then(decode::<R>) {
+    let bytes = wayline_support::read(path, LIMIT)
+        .with_context(|| format!("Cannot read history table {}.", path.display()))?;
+    if let Ok(rows) = decode::<R>(bytes) {
         return Ok(rows);
     }
-    let mut broken = path.as_os_str().to_owned();
-    broken.push(".broken");
-    fs::rename(path, broken)?;
+    columnar::set_aside(path)?;
     Ok(Vec::new())
 }
 
@@ -483,6 +483,18 @@ mod tests {
         let rows: Vec<Note> = all(root)?;
         ensure!(rows.is_empty());
         ensure!(file.with_extension("parquet.broken").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_files_are_errors_and_stay() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        append(root, vec![note(20_000 * DAY, "one")])?;
+        let file = root.join("kind=note").join("20241005.parquet");
+        std::fs::create_dir(&file)?;
+        ensure!(all::<Note>(root).is_err(), "An unreadable day was ignored.");
+        ensure!(file.is_dir() && !file.with_extension("parquet.broken").exists());
         Ok(())
     }
 }

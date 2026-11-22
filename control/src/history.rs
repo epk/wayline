@@ -37,8 +37,23 @@ const LEGACY: [&str; 9] = [
     "telemetry.sqlite.broken",
     "series.json",
 ];
+const KEPT: &str = ".legacy";
+const KEPT_NOTE: &str =
+    "History from before the Parquet format was kept as a file but is not shown.";
+const FLASH: &str = "/etc/wayline/history";
+const STAGED_FULL: &str = "History staged before the clock was set reached its 16 MiB limit, so later data from that boot was dropped.";
 
 pub use wayline_protocol::schema::LATENCY;
+
+pub fn legacy(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(KEPT) || LEGACY.contains(&name))
+}
+
+fn kept(name: &str) -> String {
+    format!("{name}{KEPT}")
+}
 
 #[derive(Deserialize)]
 #[expect(
@@ -245,6 +260,44 @@ impl encoding::Document for Response {
     }
 }
 
+struct Span {
+    start: u64,
+    end: Option<u64>,
+    seen: u64,
+}
+
+fn spans(
+    start: u64,
+    step: u64,
+    down: impl IntoIterator<Item = Option<bool>>,
+    now: u64,
+) -> Vec<Span> {
+    let mut found: Vec<Span> = Vec::new();
+    let mut open: Option<Span> = None;
+    for (index, state) in down.into_iter().enumerate() {
+        let at = start + u64::try_from(index).unwrap_or(u64::MAX) * step * 1_000;
+        let end = at + step * 1_000;
+        if state == Some(true) {
+            open.get_or_insert(Span {
+                start: at,
+                end: None,
+                seen: end,
+            })
+            .seen = end;
+        } else if let Some(mut span) = open.take() {
+            span.end = Some(span.seen);
+            found.push(span);
+        }
+    }
+    if let Some(mut span) = open {
+        if span.seen + 2 * step * 1_000 < now {
+            span.end = Some(span.seen);
+        }
+        found.push(span);
+    }
+    found
+}
+
 pub fn outages(
     subject: &str,
     name: &str,
@@ -254,40 +307,17 @@ pub fn outages(
     down: impl IntoIterator<Item = Option<bool>>,
     now: u64,
 ) -> Vec<Incident> {
-    let mut found: Vec<Incident> = Vec::new();
-    let mut open: Option<usize> = None;
-    let mut last_end = start;
-    for (index, state) in down.into_iter().enumerate() {
-        let at = start + u64::try_from(index).unwrap_or(u64::MAX) * step * 1_000;
-        let end = at + step * 1_000;
-        match state {
-            Some(true) => {
-                if open.is_none() {
-                    found.push(Incident {
-                        subject: subject.into(),
-                        name: name.into(),
-                        kind: "loss".into(),
-                        start: at,
-                        end: None,
-                        detail: detail.into(),
-                    });
-                    open = Some(found.len() - 1);
-                }
-                last_end = end;
-            }
-            Some(false) | None => {
-                if let Some(index) = open.take() {
-                    found[index].end = Some(last_end);
-                }
-            }
-        }
-    }
-    if let Some(index) = open
-        && last_end + 2 * step * 1_000 < now
-    {
-        found[index].end = Some(last_end);
-    }
-    found
+    spans(start, step, down, now)
+        .into_iter()
+        .map(|span| Incident {
+            subject: subject.into(),
+            name: name.into(),
+            kind: "loss".into(),
+            start: span.start,
+            end: span.end,
+            detail: detail.into(),
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -320,7 +350,7 @@ pub fn root(config: &Settings) -> PathBuf {
     if config.history_days == 0 {
         Path::new(RUNTIME).join("history")
     } else {
-        PathBuf::from("/etc/wayline/history")
+        PathBuf::from(FLASH)
     }
 }
 
@@ -382,19 +412,7 @@ fn restamp_all(staged: &mut Staged, offset_ms: i64) {
 fn snapshot() -> Result<Snapshot> {
     let cutoff = cutoff()?;
     let parts = runtime::ring();
-    let clock = if parts.boot_id.is_empty() {
-        None
-    } else {
-        Some(clock::observe(&clock::Observation {
-            boot: &parts.boot_id,
-            boot_ms: parts.boot_ms,
-            wall_ms: parts.wall_ms,
-            reachable: parts
-                .series
-                .iter()
-                .any(|series| series.state.live() && series.received > 0),
-        })?)
-    };
+    let clock = clock::of(&parts)?;
     let mut staged = Staged {
         series: parts.series,
         wifi: parts.wifi.map(|wifi| wifi.buckets).unwrap_or_default(),
@@ -432,17 +450,21 @@ fn pending_dir(root: &Path) -> PathBuf {
     root.join("pending")
 }
 
-pub fn pending(config: &Settings) -> bool {
-    fs::read_dir(pending_dir(&root(config)))
+fn staged_files(root: &Path) -> Vec<PathBuf> {
+    fs::read_dir(pending_dir(root))
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
-        .any(|entry| {
-            entry
-                .path()
-                .extension()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
                 .is_some_and(|extension| extension == "ndjson")
         })
+        .collect()
+}
+
+pub fn pending(config: &Settings) -> bool {
+    !staged_files(&root(config)).is_empty()
 }
 
 fn stage(root: &Path, boot: &str, snapshot: &Snapshot) -> Result<()> {
@@ -525,10 +547,8 @@ fn stage(root: &Path, boot: &str, snapshot: &Snapshot) -> Result<()> {
     let Some(latest) = latest else {
         return Ok(());
     };
-    let directory = pending_dir(root);
-    fs::create_dir_all(&directory)?;
-    let path = directory.join(format!("{boot}.ndjson"));
-    if fs::metadata(&path).is_ok_and(|meta| meta.len() > PENDING_LIMIT) {
+    let path = pending_dir(root).join(format!("{boot}.ndjson"));
+    if full(&path)? {
         return Ok(());
     }
     let mut line = serde_json::to_vec(&staged)?;
@@ -549,74 +569,107 @@ fn stage(root: &Path, boot: &str, snapshot: &Snapshot) -> Result<()> {
 }
 
 fn flush_pending(root: &Path, days: u32, now: u64, clock: Option<&clock::Clock>) -> Result<()> {
-    let directory = pending_dir(root);
-    let files: Vec<PathBuf> = fs::read_dir(&directory)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "ndjson")
-        })
-        .collect();
-    for path in files {
-        let boot = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or_default()
-            .to_owned();
-        let text =
-            String::from_utf8_lossy(&wayline_support::read(&path, PENDING_READ)?).into_owned();
-        let mut staged = Staged::default();
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let Ok(part) = serde_json::from_str::<Staged>(line) else {
-                continue;
-            };
-            staged.series.extend(part.series);
-            staged.wifi.extend(part.wifi);
-            if let Some(telemetry) = part.telemetry {
-                let target = staged
-                    .telemetry
-                    .get_or_insert_with(TelemetryStatus::default);
-                target.system_buckets.extend(telemetry.system_buckets);
-                for link in telemetry.link_buckets {
-                    match target
-                        .link_buckets
-                        .iter_mut()
-                        .find(|known| known.id == link.id)
-                    {
-                        Some(known) => known.buckets.extend(link.buckets),
-                        None => target.link_buckets.push(link),
-                    }
+    let mut failed = None;
+    for path in staged_files(root) {
+        if let Err(error) = flush_file(root, days, now, clock, &path) {
+            failed.get_or_insert(error);
+        }
+    }
+    failed.map_or(Ok(()), Err)
+}
+
+fn full_marker(path: &Path) -> PathBuf {
+    path.with_extension("full")
+}
+
+fn full(path: &Path) -> Result<bool> {
+    if !fs::metadata(path).is_ok_and(|meta| meta.len() > PENDING_LIMIT) {
+        return Ok(false);
+    }
+    let marker = full_marker(path);
+    if !marker.exists() {
+        fs::write(marker, b"")?;
+    }
+    Ok(true)
+}
+
+fn flush_file(
+    root: &Path,
+    days: u32,
+    now: u64,
+    clock: Option<&clock::Clock>,
+    path: &Path,
+) -> Result<()> {
+    let boot = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    let text = String::from_utf8_lossy(
+        &wayline_support::read(path, PENDING_READ)
+            .with_context(|| format!("Cannot read staged history {}.", path.display()))?,
+    )
+    .into_owned();
+    let mut staged = Staged::default();
+    let mut skipped = 0_usize;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(part) = serde_json::from_str::<Staged>(line) else {
+            skipped += 1;
+            continue;
+        };
+        staged.series.extend(part.series);
+        staged.wifi.extend(part.wifi);
+        if let Some(telemetry) = part.telemetry {
+            let target = staged
+                .telemetry
+                .get_or_insert_with(TelemetryStatus::default);
+            target.system_buckets.extend(telemetry.system_buckets);
+            for link in telemetry.link_buckets {
+                match target
+                    .link_buckets
+                    .iter_mut()
+                    .find(|known| known.id == link.id)
+                {
+                    Some(known) => known.buckets.extend(link.buckets),
+                    None => target.link_buckets.push(link),
                 }
             }
         }
-        match clock.filter(|clock| clock.boot == boot) {
-            Some(clock) => restamp_all(&mut staged, clock.offset_ms),
-            None => changes::append(
-                root,
-                [Event {
-                    at: now * 1_000,
-                    seq: 0,
-                    subject: "history".into(),
-                    kind: "clock".into(),
-                    text: "History from a boot that never set its clock was saved with the router's unsynchronized time.".into(),
-                }],
-            )?,
-        }
-        let series = merge_series(staged.series);
-        persist(
-            root,
-            days,
-            now,
-            &series,
-            &staged.wifi,
-            staged.telemetry.as_ref(),
-        )?;
-        fs::remove_file(&path)?;
     }
-    Ok(())
+    let event = |kind: &str, text: String| Event {
+        at: now * 1_000,
+        seq: 0,
+        subject: "history".into(),
+        kind: kind.into(),
+        text,
+    };
+    let mut notes = Vec::new();
+    match clock.filter(|clock| clock.boot == boot) {
+            Some(clock) => restamp_all(&mut staged, clock.offset_ms),
+            None => notes.push(event("clock", "History from a boot that never set its clock was saved with the router's unsynchronized time.".into())),
+        }
+    let marker = full_marker(path);
+    if marker.exists() {
+        notes.push(event("history", STAGED_FULL.into()));
+    }
+    if skipped > 0 {
+        notes.push(event(
+            "history",
+            format!("{skipped} damaged line(s) of staged history were skipped."),
+        ));
+    }
+    let series = merge_series(staged.series);
+    persist(
+        root,
+        days,
+        now,
+        &series,
+        &staged.wifi,
+        staged.telemetry.as_ref(),
+    )?;
+    changes::append(root, notes)?;
+    fs::remove_file(path)?;
+    remove(&marker)
 }
 
 fn merge_series(items: Vec<Series>) -> Vec<Series> {
@@ -636,13 +689,69 @@ fn discard_before(samples: &mut [Series], cutoff: u64) {
     }
 }
 
+fn roots() -> [PathBuf; 2] {
+    [PathBuf::from(FLASH), Path::new(RUNTIME).join("history")]
+}
+
+fn other_root(config: &Settings) -> PathBuf {
+    let current = root(config);
+    roots()
+        .into_iter()
+        .find(|root| *root != current)
+        .unwrap_or(current)
+}
+
+fn clear(root: &Path) -> Result<bool> {
+    let mut removed = false;
+    for entry in fs::read_dir(root).into_iter().flatten() {
+        let path = entry?.path();
+        if legacy(&path) {
+            continue;
+        }
+        if fs::symlink_metadata(&path)?.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        }
+        .with_context(|| format!("Cannot remove history {}.", path.display()))?;
+        removed = true;
+    }
+    if root.exists() && fs::read_dir(root)?.next().is_none() {
+        fs::remove_dir(root)?;
+    }
+    Ok(removed)
+}
+
+pub fn relocate(previous: &Settings, config: &Settings) -> Result<()> {
+    let (old, new) = (root(previous), root(config));
+    if old == new {
+        return Ok(());
+    }
+    runtime::writing("history", || {
+        let removed = clear(&old)?;
+        remove(&known_cache())?;
+        if !removed {
+            return Ok(());
+        }
+        runtime::directory(&new)?;
+        let place = if config.history_days == 0 {
+            "from flash to memory"
+        } else {
+            "from memory to flash"
+        };
+        columnar::note(
+            &new,
+            &format!(
+                "History storage moved {place}. Earlier history was deleted, so history starts fresh."
+            ),
+        )
+    })
+}
+
 pub fn purge() -> Result<()> {
     runtime::writing("history", || {
-        let roots = [
-            PathBuf::from("/etc/wayline/history"),
-            Path::new(RUNTIME).join("history"),
-        ];
-        for root in &roots {
+        let all = roots();
+        for root in &all {
             if root.try_exists()? {
                 runtime::directory(root)?;
             }
@@ -651,7 +760,7 @@ pub fn purge() -> Result<()> {
             &Path::new(RUNTIME).join("history-cutoff"),
             runtime::now().to_string().as_bytes(),
         )?;
-        for root in roots {
+        for root in all {
             for directory in columnar::kinds(&root) {
                 match fs::remove_dir_all(&directory) {
                     Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
@@ -671,11 +780,11 @@ pub fn purge() -> Result<()> {
             ]) {
                 remove(&root.join(name))?;
             }
+            for name in LEGACY {
+                remove(&root.join(kept(name)))?;
+            }
         }
-        for root in [
-            PathBuf::from("/etc/wayline/history"),
-            Path::new(RUNTIME).join("history"),
-        ] {
+        for root in roots() {
             match fs::remove_dir_all(pending_dir(&root)) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                     return Err(error).context("Cannot remove staged history.");
@@ -848,6 +957,12 @@ fn collect_inner(config: &Settings) -> Result<()> {
         return Ok(());
     }
     let days = config.history_days;
+    if let Some(clock) = snapshot.clock.as_ref()
+        && let Some(moved) = clock.moved_ms
+    {
+        columnar::note(&root, &clock::moved_note(moved))?;
+        clock::announce()?;
+    }
     let migrated = migrate(&root);
     let flushed = flush_pending(&root, days, now, snapshot.clock.as_ref());
     let prefixes = persist(
@@ -881,8 +996,17 @@ fn migrate(root: &Path) -> Result<()> {
         journal::update::<Logged>(root, |stored| merge_incidents(stored, old))?;
         remove(&incidents)?;
     }
+    let mut moved = false;
     for name in LEGACY {
-        remove(&root.join(name))?;
+        let path = root.join(name);
+        if path.exists() {
+            fs::rename(&path, root.join(kept(name)))
+                .with_context(|| format!("Cannot keep legacy history {}.", path.display()))?;
+            moved = true;
+        }
+    }
+    if moved {
+        columnar::note(root, KEPT_NOTE)?;
     }
     Ok(())
 }
@@ -914,12 +1038,13 @@ fn persist(
             now,
         )
     });
-    let logged = record_incidents(root, ring, buckets);
+    let logged = record_incidents(root, ring, buckets, now * 1_000);
     let prefixes = store(root, days, now, ring)?;
     let kept = longest(days);
     let expired = journal::expire::<Event>(root, kept, now)
         .and_then(|()| journal::expire::<Logged>(root, kept, now));
     wifi.and(system).and(links).and(logged).and(expired)?;
+    columnar::tidy(root)?;
     Ok(prefixes)
 }
 
@@ -929,6 +1054,8 @@ pub struct Logged {
     pub kind: String,
     pub start: u64,
     pub end: Option<u64>,
+    #[serde(default)]
+    pub seen: Option<u64>,
 }
 
 impl Record for Logged {
@@ -955,6 +1082,11 @@ impl Record for Logged {
             kind: Type::Text,
             description: "loss or wifi",
         },
+        Field {
+            name: "seen",
+            kind: Type::OptionalTime,
+            description: "UTC end of the last affected bucket seen so far; null in tables written before this column",
+        },
     ];
 
     fn at(&self) -> u64 {
@@ -967,6 +1099,7 @@ impl Record for Logged {
             Cell::Number(self.end.and_then(|end| i64::try_from(end).ok())),
             Cell::Text(self.series.clone()),
             Cell::Text(self.kind.clone()),
+            Cell::Number(self.seen.and_then(|seen| i64::try_from(seen).ok())),
         ]
     }
 
@@ -977,6 +1110,7 @@ impl Record for Logged {
             end: cells.next()?.millis(),
             series: cells.next()?.text()?,
             kind: cells.next()?.text()?,
+            seen: cells.next().and_then(Cell::millis),
         })
     }
 }
@@ -998,13 +1132,14 @@ pub fn ring_incidents(ring: &[Series], wifi: &[WifiBucket], now: u64) -> Vec<Log
             expected = at + BUCKET_SECONDS;
         }
         found.extend(
-            outages(series, "", "", first * 1_000, BUCKET_SECONDS, timeline, now)
+            spans(first * 1_000, BUCKET_SECONDS, timeline, now)
                 .into_iter()
-                .map(|incident| Logged {
+                .map(|span| Logged {
                     series: series.into(),
                     kind: kind.into(),
-                    start: incident.start,
-                    end: incident.end,
+                    start: span.start,
+                    end: span.end,
+                    seen: Some(span.seen),
                 }),
         );
     };
@@ -1028,13 +1163,25 @@ pub fn ring_incidents(ring: &[Series], wifi: &[WifiBucket], now: u64) -> Vec<Log
     found
 }
 
+const BUCKET_MS: u64 = BUCKET_SECONDS * 1_000;
+
+fn evidence(logged: &Logged) -> u64 {
+    logged
+        .end
+        .or(logged.seen)
+        .unwrap_or(logged.start + BUCKET_MS)
+}
+
 pub fn merge_incidents(stored: &mut Vec<Logged>, fresh: Vec<Logged>) {
     for incident in fresh {
         let overlapping = stored.iter_mut().find(|known| {
             known.series == incident.series
                 && known.kind == incident.kind
                 && known.start <= incident.start
-                && known.end.is_none_or(|end| end >= incident.start)
+                && match known.end {
+                    Some(end) => end >= incident.start,
+                    None => incident.start <= evidence(known) + BUCKET_MS,
+                }
         });
         match overlapping {
             Some(known) => {
@@ -1043,6 +1190,7 @@ pub fn merge_incidents(stored: &mut Vec<Logged>, fresh: Vec<Logged>) {
                     (Some(left), Some(right)) => Some(left.max(right)),
                     (None, Some(right)) => Some(right),
                 };
+                known.seen = known.seen.max(incident.seen);
             }
             None => stored.push(incident),
         }
@@ -1050,16 +1198,25 @@ pub fn merge_incidents(stored: &mut Vec<Logged>, fresh: Vec<Logged>) {
     stored.sort_by_key(|incident| incident.start);
 }
 
+pub fn settle(stored: &mut [Logged], now: u64) {
+    for logged in stored.iter_mut().filter(|logged| logged.end.is_none()) {
+        let last = evidence(logged);
+        if last + 2 * BUCKET_MS < now {
+            logged.end = Some(last);
+        }
+    }
+}
+
 fn incidents_path(root: &Path) -> PathBuf {
     root.join("incidents.json")
 }
 
-fn record_incidents(root: &Path, ring: &[Series], wifi: &[WifiBucket]) -> Result<()> {
-    let fresh = ring_incidents(ring, wifi, runtime::now() * 1_000);
-    if fresh.is_empty() {
-        return Ok(());
-    }
-    journal::update::<Logged>(root, |stored| merge_incidents(stored, fresh))
+fn record_incidents(root: &Path, ring: &[Series], wifi: &[WifiBucket], now: u64) -> Result<()> {
+    let fresh = ring_incidents(ring, wifi, now);
+    journal::update::<Logged>(root, |stored| {
+        merge_incidents(stored, fresh);
+        settle(stored, now);
+    })
 }
 
 fn overlapping(logged: &Logged, (start, end): (u64, u64)) -> bool {
@@ -1072,11 +1229,10 @@ pub fn logged_incidents(
     wifi: &[WifiBucket],
     range: (u64, u64),
 ) -> Vec<Logged> {
+    let now = runtime::now() * 1_000;
     let mut stored: Vec<Logged> = journal::read(&root(config), range).unwrap_or_default();
-    merge_incidents(
-        &mut stored,
-        ring_incidents(ring, wifi, runtime::now() * 1_000),
-    );
+    merge_incidents(&mut stored, ring_incidents(ring, wifi, now));
+    settle(&mut stored, now);
     stored.retain(|logged| overlapping(logged, range));
     stored
 }
@@ -1096,16 +1252,41 @@ pub struct Storage {
     legacy: Vec<String>,
     pending: usize,
     last_collect: Option<u64>,
+    other: Option<Other>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Other {
+    root: String,
+    bytes: u64,
+}
+
+fn other(config: &Settings) -> Option<Other> {
+    let path = other_root(config);
+    path.is_dir().then(|| Other {
+        root: path.display().to_string(),
+        bytes: columnar::bytes(&path),
+    })
+}
+
+fn legacy_files(root: &Path) -> Vec<String> {
+    LEGACY
+        .iter()
+        .map(|name| kept(name))
+        .chain(
+            LEGACY
+                .iter()
+                .chain(&["events.json", "incidents.json"])
+                .map(|name| (*name).to_owned()),
+        )
+        .filter(|name| root.join(name).exists())
+        .collect()
 }
 
 pub fn storage(config: &Settings) -> Storage {
     let root = root(config);
-    let legacy = LEGACY
-        .iter()
-        .chain(&["events.json", "incidents.json"])
-        .filter(|name| root.join(name).exists())
-        .map(|name| (*name).to_owned())
-        .collect();
+    let legacy = legacy_files(&root);
     Storage {
         in_memory: root.starts_with(RUNTIME),
         root: root.display().to_string(),
@@ -1122,11 +1303,12 @@ pub fn storage(config: &Settings) -> Storage {
             .ok()
             .map(|meta| meta.len()),
         legacy,
-        pending: fs::read_dir(pending_dir(&root)).map_or(0, Iterator::count),
+        pending: staged_files(&root).len(),
         last_collect: fs::read_to_string(Path::new(RUNTIME).join("last-collect"))
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .map(|seconds| seconds * 1_000),
+        other: other(config),
     }
 }
 
@@ -1135,16 +1317,17 @@ pub fn report(config: &Settings) -> Report {
     let mut lines = columnar::report(&root);
     lines.push(journal::report::<Event>(&root));
     lines.push(journal::report::<Logged>(&root));
-    let legacy: Vec<&str> = LEGACY
-        .iter()
-        .chain(&["events.json", "incidents.json"])
-        .filter(|name| root.join(name).exists())
-        .copied()
-        .collect();
+    let legacy = legacy_files(&root);
     if !legacy.is_empty() {
         lines.push(format!(
-            "history legacy files awaiting removal: {}",
+            "history legacy files kept but not shown: {}",
             legacy.join(", ")
+        ));
+    }
+    if let Some(other) = other(config) {
+        lines.push(format!(
+            "history unused store: {} holds {} bytes for the other retention setting",
+            other.root, other.bytes
         ));
     }
     Report {
@@ -1265,6 +1448,7 @@ fn add_logged(
 ) {
     let mut merged: Vec<Logged> = Vec::new();
     merge_incidents(&mut merged, logged);
+    settle(&mut merged, runtime::now() * 1_000);
     for logged in merged {
         let Some((id, name)) = identities.get(&logged.series) else {
             continue;
@@ -1444,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn json_logs_move_into_parquet_and_legacy_files_go() -> Result<()> {
+    fn json_logs_move_into_parquet_and_legacy_files_are_kept() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let root = directory.path();
         let now = runtime::now() * 1_000;
@@ -1464,10 +1648,12 @@ mod tests {
             kind: "loss".into(),
             start: now - 60_000,
             end: Some(now - 30_000),
+            seen: None,
         };
         runtime::store(root.join("incidents.json"), &vec![incident.clone()])?;
         std::fs::write(root.join("latency.sqlite"), b"old")?;
         std::fs::write(root.join("latency.sqlite-journal"), b"old")?;
+        std::fs::write(root.join("series.json"), b"{}")?;
         crate::changes::append(root, [event(0, "three")])?;
         migrate(root)?;
         for name in [
@@ -1475,20 +1661,250 @@ mod tests {
             "incidents.json",
             "latency.sqlite",
             "latency.sqlite-journal",
+            "series.json",
         ] {
             ensure!(!root.join(name).exists(), "{name} was left behind.");
         }
+        for name in ["latency.sqlite", "latency.sqlite-journal", "series.json"] {
+            ensure!(
+                root.join(format!("{name}.legacy")).exists(),
+                "{name} was not kept."
+            );
+        }
+        ensure!(
+            super::legacy_files(root).len() == 3,
+            "{:?}",
+            super::legacy_files(root)
+        );
+        let counted = columnar::bytes(root);
+        std::fs::write(root.join("series.json.legacy"), vec![0; 4_096])?;
+        ensure!(
+            columnar::bytes(root) == counted,
+            "Kept legacy files count toward the cap."
+        );
         let events: Vec<crate::changes::Event> = crate::journal::all(root)?;
         ensure!(
-            events.len() == 3,
-            "Expected 3 events, found {}.",
+            events.len() == 4,
+            "Expected 4 events, found {}.",
             events.len()
+        );
+        ensure!(
+            events.iter().any(|event| event.text == super::KEPT_NOTE),
+            "The kept legacy history was not noted."
         );
         let logged: Vec<Logged> = crate::journal::all(root)?;
         ensure!(logged == vec![incident], "Incidents did not migrate.");
         migrate(root)?;
         let again: Vec<crate::changes::Event> = crate::journal::all(root)?;
-        ensure!(again.len() == 3, "A second run duplicated events.");
+        ensure!(again.len() == 4, "A second run duplicated events.");
+        Ok(())
+    }
+
+    fn logged(start: u64, end: Option<u64>, seen: Option<u64>) -> Logged {
+        Logged {
+            series: "t:a".into(),
+            kind: "loss".into(),
+            start,
+            end,
+            seen,
+        }
+    }
+
+    #[test]
+    fn open_incidents_close_when_the_ring_loses_them() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let now = runtime::now() * 1_000;
+        let start = now - 3_600_000;
+        crate::journal::append(root, vec![logged(start, None, Some(start + 60_000))])?;
+        super::record_incidents(root, &[], &[], start + 70_000)?;
+        let kept: Vec<Logged> = crate::journal::all(root)?;
+        ensure!(
+            kept[0].end.is_none(),
+            "A fresh open incident was closed early."
+        );
+        super::record_incidents(root, &[], &[], now)?;
+        let closed: Vec<Logged> = crate::journal::all(root)?;
+        ensure!(
+            closed == vec![logged(start, Some(start + 60_000), Some(start + 60_000))],
+            "Unexpected incidents {closed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_incidents_absorb_only_adjacent_outages() {
+        let start = 1_800_000_000_000;
+        let seen = start + 60_000;
+        let mut stored = vec![logged(start, None, Some(seen))];
+        let later = logged(
+            start + 3_600_000,
+            Some(start + 3_630_000),
+            Some(start + 3_630_000),
+        );
+        super::merge_incidents(&mut stored, vec![later.clone()]);
+        assert_eq!(
+            stored.len(),
+            2,
+            "A later outage was merged into an old one."
+        );
+        assert_eq!(stored[1], later);
+        let mut stored = vec![logged(start, None, Some(seen))];
+        super::merge_incidents(
+            &mut stored,
+            vec![logged(seen + 15_000, None, Some(seen + 45_000))],
+        );
+        assert_eq!(stored, vec![logged(start, None, Some(seen + 45_000))]);
+        let mut stored = vec![logged(start, None, None)];
+        super::settle(&mut stored, start + 60_000);
+        assert_eq!(stored[0].end, Some(start + 15_000));
+    }
+
+    #[test]
+    fn incident_tables_without_seen_stay_readable() -> Result<()> {
+        use crate::journal::{Cell, Field, Record, Type, millis};
+        #[derive(Clone, PartialEq)]
+        struct Before(u64);
+        impl Record for Before {
+            const KIND: &'static str = "incident";
+            const DESCRIPTION: &'static str = "Incidents before the seen column";
+            const FIELDS: &'static [Field] = &[
+                Field {
+                    name: "ts",
+                    kind: Type::Time,
+                    description: "Start",
+                },
+                Field {
+                    name: "end",
+                    kind: Type::OptionalTime,
+                    description: "End",
+                },
+                Field {
+                    name: "series",
+                    kind: Type::Text,
+                    description: "Series",
+                },
+                Field {
+                    name: "kind",
+                    kind: Type::Text,
+                    description: "Kind",
+                },
+            ];
+            fn at(&self) -> u64 {
+                self.0
+            }
+            fn cells(&self) -> Vec<Cell> {
+                vec![
+                    millis(self.0),
+                    Cell::Number(None),
+                    Cell::Text("t:a".into()),
+                    Cell::Text("loss".into()),
+                ]
+            }
+            fn from_cells(cells: Vec<Cell>) -> Option<Self> {
+                cells.into_iter().next()?.millis().map(Self)
+            }
+        }
+        let directory = tempfile::tempdir()?;
+        let start = 1_800_000_000_000;
+        crate::journal::append(directory.path(), vec![Before(start)])?;
+        let read: Vec<Logged> = crate::journal::all(directory.path())?;
+        ensure!(read == vec![logged(start, None, None)], "{read:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn switching_stores_clears_the_old_one_but_keeps_legacy_files() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let old = directory.path().join("history");
+        std::fs::create_dir_all(old.join("kind=latency/step=15"))?;
+        std::fs::write(old.join("kind=latency/step=15/x.parquet"), b"x")?;
+        std::fs::write(old.join("facts.json"), b"{}")?;
+        ensure!(super::clear(&old)?, "Nothing was removed.");
+        ensure!(!old.exists(), "An empty old store was left behind.");
+        std::fs::create_dir_all(&old)?;
+        std::fs::write(old.join("index.json"), b"{}")?;
+        std::fs::write(old.join("latency.sqlite.legacy"), b"old")?;
+        ensure!(super::clear(&old)?);
+        ensure!(old.join("latency.sqlite.legacy").exists() && !old.join("index.json").exists());
+        ensure!(!super::clear(&old)?, "A second clear removed something.");
+        ensure!(!super::clear(&directory.path().join("missing"))?);
+        Ok(())
+    }
+
+    #[test]
+    fn staged_files_flush_independently_and_report_losses() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let pending = root.join("pending");
+        std::fs::create_dir_all(&pending)?;
+        std::fs::write(pending.join("cursor.json"), b"{}")?;
+        std::fs::create_dir(pending.join("a.ndjson"))?;
+        let at = runtime::now() / 15 * 15 - 600;
+        let staged = super::Staged {
+            series: vec![series(&identity(1), vec![bucket(at, 20_000, 0)])],
+            ..super::Staged::default()
+        };
+        let text = format!("{}\nnot json\n", serde_json::to_string(&staged)?);
+        std::fs::write(pending.join("b.ndjson"), text)?;
+        std::fs::write(pending.join("b.full"), b"")?;
+        ensure!(
+            super::staged_files(root).len() == 2,
+            "cursor.json was counted."
+        );
+        ensure!(
+            super::flush_pending(root, 7, runtime::now(), None).is_err(),
+            "The unreadable file did not report an error."
+        );
+        ensure!(
+            !pending.join("b.ndjson").exists(),
+            "The good file was not flushed."
+        );
+        ensure!(
+            !pending.join("b.full").exists(),
+            "The limit marker remains."
+        );
+        ensure!(super::staged_files(root).len() == 1);
+        let stored = columnar::series(root, &LATENCY, 15, (at / 15, at / 15), &[])?;
+        ensure!(
+            !stored.is_empty(),
+            "The good file's buckets were not stored."
+        );
+        let events: Vec<crate::changes::Event> = crate::journal::all(root)?;
+        ensure!(events.iter().any(|event| event.text == super::STAGED_FULL));
+        ensure!(
+            events
+                .iter()
+                .any(|event| event.text.starts_with("1 damaged line"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staging_marks_a_full_file() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let pending = root.join("pending");
+        std::fs::create_dir_all(&pending)?;
+        std::fs::File::create(pending.join("boot1.ndjson"))?.set_len(super::PENDING_LIMIT + 1)?;
+        let snapshot = super::Snapshot {
+            series: vec![series(
+                &identity(1),
+                vec![Bucket {
+                    uptime_ms: 60_000,
+                    ..bucket(1_000, 20_000, 0)
+                }],
+            )],
+            wifi: Vec::new(),
+            telemetry: None,
+            clock: None,
+        };
+        super::stage(root, "boot1", &snapshot)?;
+        ensure!(
+            pending.join("boot1.full").exists(),
+            "The drop was not marked."
+        );
+        ensure!(std::fs::metadata(pending.join("boot1.ndjson"))?.len() == super::PENDING_LIMIT + 1);
         Ok(())
     }
 
@@ -1696,6 +2112,7 @@ mod tests {
             synced: true,
             source: Some(crate::clock::Source::Ntp),
             offset_ms,
+            moved_ms: None,
         };
         super::flush_pending(root, 7, runtime::now(), Some(&synced))?;
         ensure!(
