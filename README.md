@@ -2,7 +2,7 @@
 
 Wayline compares VPN tunnels on GL.iNet routers. The **VPN → Wayline** page shows latency, loss, history, and exit addresses. It provides native tunnel Start and Stop controls and manual exit selection. It also records the quality of the upstream Wi-Fi link when the router joins a network as a repeater.
 
-Wayline is experimental. This README describes **0.1.0-alpha.25**, which keeps change events and incidents in Parquet with the rest of history, follows the repeater interface that is actually connected, adds a Health tab for Wayline's own components and storage, and reworks the page for phone, tablet and desktop. alpha.24 fixed automatic updates, and alpha.22 and alpha.23 added support for firmware 4.11 and its APK package manager. Install signed packages from [GitHub Releases](https://github.com/epk/wayline/releases).
+Wayline is experimental. This README describes **0.1.0-alpha.26**, which records outages when an interface or route disappears, keeps old history files instead of deleting them on upgrade, writes far less to flash, and lets a stuck update be cleared from the page. alpha.25 moved change events and incidents into Parquet, added the Health tab and reworked the page for phone, tablet and desktop. alpha.24 fixed automatic updates, and alpha.22 and alpha.23 added support for firmware 4.11 and its APK package manager. Install signed packages from [GitHub Releases](https://github.com/epk/wayline/releases).
 
 The screenshots use synthetic data. They contain no live router addresses, endpoints, locations, or tunnel names.
 
@@ -47,7 +47,7 @@ The installer downloads the newest published release, including prereleases. Bef
 To install a specific version, set `WAYLINE_VERSION`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/epk/wayline/main/install.sh | WAYLINE_VERSION=0.1.0-alpha.25 sh
+curl -fsSL https://raw.githubusercontent.com/epk/wayline/main/install.sh | WAYLINE_VERSION=0.1.0-alpha.26 sh
 ```
 
 This pins the package but still runs the installer from `main`. Releases newer than 0.1.0-alpha.25 also attach the `install.sh` they were built with. To pin the installer as well, download it from the release instead of `main`, for example `https://github.com/epk/wayline/releases/download/v<version>/install.sh`, and run it with the same `WAYLINE_VERSION`.

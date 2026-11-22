@@ -19,7 +19,7 @@ const level = ['monitoring', 'unsupported', 'newer'].includes(query.get('compat'
 const wanDown = query.get('wan') === 'unavailable';
 const updateLatched = query.get('update') === 'latched';
 const updateFailed = updateLatched || query.get('update') === 'failed';
-const release = '0.1.0-alpha.25';
+const release = '0.1.0-alpha.26';
 const installed = query.get('stale') === '1' ? '0.0.0' : release;
 const directExit = query.get('exit') === 'direct';
 const telemetryOn = query.get('telemetry') !== 'off';
