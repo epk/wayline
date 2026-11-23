@@ -183,6 +183,13 @@ fn wifi_status(
     let Ok(config) = settings else {
         return;
     };
+    if !crate::wifi::radio_present() {
+        report.info(
+            "upstream Wi-Fi monitoring",
+            "this router has no Wi-Fi radio",
+        );
+        return;
+    }
     if !config.upstream_wifi {
         report.info("upstream Wi-Fi monitoring", "off by setting");
         return;

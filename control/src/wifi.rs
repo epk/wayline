@@ -195,6 +195,7 @@ pub struct Response {
 #[serde(rename_all = "camelCase")]
 pub struct View {
     enabled: bool,
+    radio: bool,
     state: Option<WifiState>,
     reason: String,
     interface: Option<String>,
@@ -541,6 +542,27 @@ pub fn down(buckets: &[WifiBucket]) -> impl Iterator<Item = (u64, Option<bool>)>
         .map(|item| (item.at, (item.samples > 0).then_some(item.connected == 0)))
 }
 
+pub const OFF_CHANNEL: &str = "off_channel";
+
+pub fn off_channel(buckets: &[WifiBucket]) -> impl Iterator<Item = (u64, Option<bool>)> + '_ {
+    buckets.iter().map(|item| {
+        (
+            item.at,
+            (item.connected > 0).then_some(item.off_channel * 2 >= item.connected),
+        )
+    })
+}
+
+#[cfg(not(test))]
+pub fn radio_present() -> bool {
+    std::fs::read_dir("/sys/class/ieee80211").is_ok_and(|mut entries| entries.next().is_some())
+}
+
+#[cfg(test)]
+pub const fn radio_present() -> bool {
+    true
+}
+
 const fn band(frequency: u32) -> &'static str {
     match frequency {
         0..3_000 => "2.4 GHz",
@@ -571,7 +593,10 @@ pub fn channel_of(link: &wayline_protocol::WifiIdentity) -> String {
     }
 }
 
-fn reason(enabled: bool, status: Option<&WifiStatus>) -> String {
+fn reason(radio: bool, enabled: bool, status: Option<&WifiStatus>) -> String {
+    if !radio {
+        return "This router has no Wi-Fi radio.".into();
+    }
     if !enabled {
         return "Upstream Wi-Fi monitoring is off.".into();
     }
@@ -593,7 +618,8 @@ fn reason(enabled: bool, status: Option<&WifiStatus>) -> String {
 }
 
 pub fn view(config: &Settings, inventory: Option<&Inventory>, status: Option<WifiStatus>) -> View {
-    let enabled = config.upstream_wifi;
+    let radio = radio_present();
+    let enabled = config.upstream_wifi && radio;
     let status = status.filter(|_| enabled);
     let interface = status.as_ref().and_then(|status| status.interface.clone());
     let uplink = inventory.and_then(|inventory| {
@@ -609,7 +635,8 @@ pub fn view(config: &Settings, inventory: Option<&Inventory>, status: Option<Wif
             .is_some_and(|status| !status.buckets.is_empty());
     View {
         enabled,
-        reason: reason(enabled, status.as_ref()),
+        radio,
+        reason: reason(radio, enabled, status.as_ref()),
         state: status.as_ref().map(|status| status.state),
         candidates: status
             .as_ref()
@@ -628,6 +655,7 @@ pub fn view(config: &Settings, inventory: Option<&Inventory>, status: Option<Wif
 pub const fn disabled() -> View {
     View {
         enabled: false,
+        radio: false,
         state: None,
         reason: String::new(),
         interface: None,

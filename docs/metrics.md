@@ -89,9 +89,12 @@ Parquet at rest, Arrow in motion.
 Each chunk's `wayline.span_seconds` records the period it covers.
 
 Every 5 minutes wayline-ctl merges new 15-second rows into the open chunk and
-rewrites it atomically (write, fsync, rename). A coarser period is written
-once its period has closed, and again only if late rows change it; the open
-period of a coarser tier is rolled up from 15-second rows at query time. Older
+rewrites it atomically (write, fsync, rename). The coarser tiers are written
+once an hour, after the hour has closed, and again only if late rows change
+them; everything newer is rolled up from 15-second rows at query time. This
+keeps flash writes to the open 15-second chunk plus one coarser rewrite an
+hour, instead of rewriting the open 1-minute and 5-minute chunks at every
+collection. Older
 files are immutable, which keeps incremental copies cheap. Retention deletes
 whole files, so data can outlive the nominal period by up to one chunk. A file
 that does not decode is renamed to `.broken`, logged in Recent changes, and
@@ -217,7 +220,9 @@ later, or never on a captive network.
   it outlives the 15-second tier. History views add logged incidents that
   their coarser buckets no longer show.
   Upstream Wi-Fi incidents are runs of buckets in which the repeater was never
-  associated. History views derive incidents at the resolution they show.
+  associated (`wifi`), or in which the radio sat on another channel than the
+  access point for most connected samples (`off_channel`). History views derive
+  incidents at the resolution they show.
   Uptime for a range is `1 − (fully lost buckets / buckets with probes)`.
 
 ## Voice quality estimate (MOS)
@@ -258,6 +263,17 @@ at once when one arrives.
 - **Channel busy** = Δbusy time / Δactive time from the channel survey of the
   serving frequency. **Own airtime** = Δ(rx + tx time) / Δactive.
   **Others** = busy − own.
+- **Radio on another channel**: the survey marks the channel the radio is tuned
+  to. When it differs from the access point's channel (from `GET_SCAN`) for 60
+  seconds in a row, the link reports `radio_frequency`, the samples count as
+  off channel, and channel busy, airtime and noise come from the channel the
+  radio is on. The 60-second hold skips background scans. On a GL-MT3600BE the
+  MediaTek driver once left the radio on channel 36 for 30 minutes after a
+  reconnect to an access point on channel 40; the link stayed associated while
+  almost no traffic got through.
+- **Routers without Wi-Fi**: when `/sys/class/ieee80211` lists no radio, upstream
+  Wi-Fi monitoring cannot be turned on, the controller saves it as off, and the
+  page hides the Wi-Fi view.
 - **Access point**: the station the client interface is associated with, from
   `GET_STATION`. An interface counts as connected only while it has one, so an
   idle radio that keeps an old SSID or channel is not mistaken for a link.

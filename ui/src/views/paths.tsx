@@ -15,6 +15,7 @@ import {
   endpointPrefix,
   latencyLines,
   latencyX,
+  liveLoss,
   tunnelLoss,
   uplinkLoss,
   uplinkPrefix,
@@ -187,12 +188,20 @@ function TunnelTable() {
     const d = s.diagnostics[selectedTarget.value] || {};
     return finite(d[id]) ? d[id] : null;
   };
+  const primary = primarySelected.value;
+  const liveAt = (id: string) => ((s.live || {})[selectedTarget.value] || {})[id] || null;
+  const medianOf = (t: Tunnel) => {
+    if (primary) return finite(t.median) ? t.median : null;
+    const stat = liveAt(t.id);
+    return stat && finite(stat.median) ? stat.median : diag(t.id);
+  };
   const active = s.tunnels.find((t) => t.preferred);
-  const activeMedian = active && finite(active.median) ? active.median : null;
-  const comparable = s.tunnels.filter((t) => t.connected && finite(t.median)).length >= 2;
+  const activeMedian = active ? medianOf(active) : null;
+  const comparable = s.tunnels.filter((t) => t.connected && finite(medianOf(t))).length >= 2;
   const note = (t: Tunnel) => {
-    if (comparable && !t.preferred && activeMedian !== null && finite(t.median)) {
-      const diff = activeMedian - t.median;
+    const median = medianOf(t);
+    if (comparable && !t.preferred && activeMedian !== null && finite(median)) {
+      const diff = activeMedian - median;
       if (Math.abs(diff) <= 3)
         return { text: 'About the same as the active exit', cls: '', title: '' };
       if (diff > 0)
@@ -223,8 +232,6 @@ function TunnelTable() {
         : 'Direct internet';
   const unmeasurable = (u: Uplink) =>
     u.state === 'route_mismatch' || u.state === 'route_unavailable';
-  const primary = primarySelected.value;
-  const liveTitle = 'Live jitter, loss and call quality are measured to the primary destination.';
   const metric = (label: string, value: ReactNode, sub?: ReactNode, title?: string) => (
     <div>
       <dt>{title ? <Tip text={title}>{label}</Tip> : label}</dt>
@@ -235,9 +242,9 @@ function TunnelTable() {
     </div>
   );
   const lossValue = (loss: Loss) =>
-    primary && loss.sent ? <span className="wl-num">{percent(loss.pct)}</span> : dash;
+    loss.sent ? <span className="wl-num">{percent(loss.pct)}</span> : dash;
   const lossSub = (loss: Loss, unit: string) =>
-    primary && loss.sent ? loss.lost + ' of ' + loss.sent + ' ' + unit : undefined;
+    loss.sent ? loss.lost + ' of ' + loss.sent + ' ' + unit : undefined;
   return (
     <div
       className="wl-exits"
@@ -247,13 +254,16 @@ function TunnelTable() {
     >
       <ul className="wl-pathlist">
         {s.tunnels.map((t) => {
-          const n = primary ? note(t) : null;
+          const n = note(t);
           const id = egressFor(t.id);
           const exitIp = id && id.ip && !id.error ? id : null;
           const isExit = exitTunnel.value?.id === t.id;
           const change = changeFor(t.id);
-          const loss = tunnelLoss(t);
-          const jitter = finite(t.jitter) ? t.jitter : null;
+          const stat = primary ? null : liveAt(t.id);
+          const median = medianOf(t);
+          const loss = primary ? tunnelLoss(t) : liveLoss(stat);
+          const rawJitter = primary ? t.jitter : stat ? stat.jitter : null;
+          const jitter = finite(rawJitter) ? rawJitter : null;
           const server = endpoints.find((e) => e.tunnel === t.id) || null;
           const serverDiag =
             server && server.address ? (s.diagnostics[server.address] || {}).wan : null;
@@ -360,40 +370,28 @@ function TunnelTable() {
               <dl className="wl-metrics">
                 {metric(
                   'Latency',
-                  primary ? (
+                  median !== null ? (
                     <>
-                      <span className="wl-num wl-big">{fixed(t.median)}</span>
-                      {finite(t.median) && <small className="wl-unit"> ms</small>}
-                    </>
-                  ) : diag(t.id) !== null ? (
-                    <>
-                      <span className="wl-num wl-big">{fixed(diag(t.id))}</span>
+                      <span className="wl-num wl-big">{fixed(median)}</span>
                       <small className="wl-unit"> ms</small>
                     </>
+                  ) : primary ? (
+                    <span className="wl-num wl-big">{fixed(t.median)}</span>
                   ) : (
                     <span className="wl-muted">No data yet</span>
                   ),
                   n ? <span className={n.cls}>{n.text}</span> : undefined,
                 )}
-                {metric(
-                  'Jitter',
-                  <span className="wl-num">{primary ? ms(jitter) : dash}</span>,
-                  undefined,
-                  primary ? undefined : liveTitle,
-                )}
+                {metric('Jitter', <span className="wl-num">{ms(jitter)}</span>)}
                 {metric(
                   'Loss',
                   lossValue(loss),
                   lossSub(loss, 'probes lost'),
-                  primary ? loss.lost + ' of ' + loss.sent + ' probes lost' : liveTitle,
+                  loss.lost + ' of ' + loss.sent + ' probes lost',
                 )}
                 {metric(
                   'Call quality',
-                  primary ? (
-                    <Mos compact score={score(t.median, jitter, loss.pct)} />
-                  ) : (
-                    <span title={liveTitle}>{dash}</span>
-                  ),
+                  <Mos compact score={score(median, jitter, loss.pct)} />,
                   undefined,
                   CALL_QUALITY,
                 )}
@@ -416,9 +414,12 @@ function TunnelTable() {
         })}
         {uplinks.map((u) => {
           const change = changeFor(u.id);
-          const value = diag(u.active ? 'wan' : u.id);
-          const loss = uplinkLoss(u);
-          const jitter = finite(u.jitter) ? u.jitter : null;
+          const key = u.active ? 'wan' : u.id;
+          const stat = primary ? null : liveAt(key);
+          const value = stat && finite(stat.median) ? stat.median : diag(key);
+          const loss = primary ? uplinkLoss(u) : liveLoss(stat);
+          const rawJitter = primary ? u.jitter : stat ? stat.jitter : null;
+          const jitter = finite(rawJitter) ? rawJitter : null;
           return (
             <li key={u.id} className="wl-pathcard wl-uplink-row">
               <div className="wl-pathcard-head">
@@ -450,7 +451,7 @@ function TunnelTable() {
                     <span className="wl-muted">No data yet</span>
                   ),
                 )}
-                {metric('Jitter', <span className="wl-num">{primary ? ms(jitter) : dash}</span>)}
+                {metric('Jitter', <span className="wl-num">{ms(jitter)}</span>)}
                 {metric(
                   'Loss',
                   lossValue(loss),
@@ -459,7 +460,7 @@ function TunnelTable() {
                 )}
                 {metric(
                   'Call quality',
-                  primary ? <Mos compact score={score(value, jitter, loss.pct)} /> : dash,
+                  <Mos compact score={score(value, jitter, loss.pct)} />,
                   undefined,
                   CALL_QUALITY,
                 )}

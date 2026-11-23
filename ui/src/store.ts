@@ -88,6 +88,7 @@ const emptyState = (): State => ({
   config: defaults(),
   tunnels: [],
   diagnostics: {},
+  live: {},
   endpoints: [],
   wan: { available: true, interface: null, reason: '' },
   uplinks: [],
@@ -126,6 +127,7 @@ export const normalize = (raw: unknown): State => {
   next.incidents = list(next.incidents);
   next.resolved = next.resolved || {};
   next.diagnostics = next.diagnostics || {};
+  next.live = next.live || {};
   next.compat = next.compat || {};
   next.wan = Object.assign({ available: true, interface: null, reason: '' }, next.wan);
   next.wifi = Object.assign({ enabled: false }, next.wifi);
@@ -135,6 +137,9 @@ export const normalize = (raw: unknown): State => {
 };
 
 export const state = signal<State>(emptyState());
+export const shownViews = computed(() =>
+  views.filter((v) => v.id !== 'wifi' || state.value.wifi.radio !== false),
+);
 export const ready = signal(false);
 export const readError = signal('');
 export const loading = signal(false);

@@ -27,6 +27,7 @@ pub struct State {
     history: history::Availability,
     tunnels: Vec<Tunnel>,
     diagnostics: BTreeMap<String, BTreeMap<String, Option<f64>>>,
+    live: BTreeMap<String, BTreeMap<String, Live>>,
     endpoints: Vec<EndpointView>,
     wan: WanView,
     uplinks: Vec<UplinkView>,
@@ -46,6 +47,14 @@ pub struct State {
     incidents: Vec<history::Incident>,
     clock: ClockView,
     device: String,
+}
+
+#[derive(Serialize)]
+struct Live {
+    median: Option<f64>,
+    jitter: Option<f64>,
+    samples: usize,
+    lost: usize,
 }
 
 #[derive(Serialize)]
@@ -405,6 +414,38 @@ fn diagnostics(
     result
 }
 
+fn live(
+    config: &Settings,
+    inventory: &Inventory,
+    snapshot: &[Series],
+) -> BTreeMap<String, BTreeMap<String, Live>> {
+    config
+        .targets
+        .iter()
+        .map(|target| {
+            let values = inventory
+                .paths
+                .iter()
+                .chain(inventory.wan.iter())
+                .chain(inventory.standby_uplinks())
+                .filter_map(|path| {
+                    let item = measurement(snapshot, path, target)?;
+                    Some((
+                        path.id.clone(),
+                        Live {
+                            median: item.median_us.map(runtime::milliseconds),
+                            jitter: item.jitter_us.map(runtime::milliseconds),
+                            samples: item.history.len(),
+                            lost: item.lost(),
+                        },
+                    ))
+                })
+                .collect();
+            (target.to_string(), values)
+        })
+        .collect()
+}
+
 fn resolved(config: &Settings, inventory: &Inventory) -> BTreeMap<String, Option<Ipv4Addr>> {
     let hosts = router::hosts(config, inventory);
     if hosts.is_empty() {
@@ -498,7 +539,11 @@ fn incidents(
         history::logged_incidents(config, snapshot, buckets, (since, runtime::now() * 1_000))
             .into_iter()
             .filter_map(|logged| {
-                let (subject, name, detail) = names.get(&logged.series)?.clone();
+                let (subject, name, mut detail) = names.get(&logged.series)?.clone();
+                if logged.kind == wifi::OFF_CHANNEL {
+                    "The radio was tuned to a different channel than the access point"
+                        .clone_into(&mut detail);
+                }
                 Some(history::Incident {
                     subject,
                     name,
@@ -530,6 +575,7 @@ fn unsupported(compat: native::Compat) -> State {
         config,
         tunnels: Vec::new(),
         diagnostics: BTreeMap::new(),
+        live: BTreeMap::new(),
         endpoints: Vec::new(),
         wan: WanView {
             available: false,
@@ -613,6 +659,7 @@ pub fn state() -> Result<State> {
         version: runtime::version(),
         history: history::availability(&config),
         diagnostics: diagnostics(&config, &inventory, &snapshot),
+        live: live(&config, &inventory, &snapshot),
         resolved: resolved(&config, &inventory),
         endpoints: endpoint_views(&config, &inventory),
         wan: wan_view(&inventory),
@@ -713,6 +760,7 @@ pub fn set_config(request: SetConfig) -> Result<Value> {
             let mut config = request.config;
             let inventory = router::inventory()?;
             router::normalize(&mut config, &inventory);
+            config.upstream_wifi &= wifi::radio_present();
             config.validate()?;
             router::check_capacity(&config, &inventory)?;
             ensure!(

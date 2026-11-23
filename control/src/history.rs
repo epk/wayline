@@ -1160,6 +1160,7 @@ pub fn ring_incidents(ring: &[Series], wifi: &[WifiBucket], now: u64) -> Vec<Log
         );
     }
     runs("wifi", "wifi", wifi::down(wifi).collect());
+    runs("wifi", wifi::OFF_CHANNEL, wifi::off_channel(wifi).collect());
     found
 }
 

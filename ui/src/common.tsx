@@ -39,6 +39,13 @@ export const subjectName = (subject: string): string => {
   return tunnelName(subject);
 };
 
+export const incidentKind = (kind: string): string =>
+  kind === 'wifi'
+    ? 'Wi-Fi disconnected'
+    : kind === 'off_channel'
+      ? 'Radio off channel'
+      : 'Total loss';
+
 export const inWindow = (i: Incident): boolean =>
   i.start <= windowEnd.value && (i.end === null || i.end >= windowStart.value);
 
@@ -51,14 +58,12 @@ export function IncidentList(props: { items: Incident[]; empty?: ReactNode; limi
   return (
     <ol className="wl-incidents">
       {items.map((i) => (
-        <li key={i.subject + i.start} className={i.end === null ? 'wl-ongoing' : ''}>
+        <li key={i.subject + i.kind + i.start} className={i.end === null ? 'wl-ongoing' : ''}>
           <Badge tone={i.end === null ? 'down' : 'poor'}>
             {i.end === null ? 'Ongoing' : 'Resolved'}
           </Badge>
           <span className="wl-incident-name">{i.name || subjectName(i.subject)}</span>
-          <span className="wl-muted">
-            {i.kind === 'wifi' ? 'Wi-Fi disconnected' : 'Total loss'}
-          </span>
+          <span className="wl-muted">{incidentKind(i.kind)}</span>
           <span className="wl-num" title={dateTime(i.start)}>
             {stamp(i.start, long)}
             {i.end !== null ? ' – ' + stamp(i.end, long) : ' – now'}

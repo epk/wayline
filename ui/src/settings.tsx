@@ -289,12 +289,14 @@ export function SettingsDrawer() {
             </p>
             <Check
               label="Upstream Wi-Fi link (repeater)"
-              checked={d.upstreamWifi}
+              checked={d.upstreamWifi && s.wifi.radio !== false}
+              disabled={s.wifi.radio === false}
               onChange={(upstreamWifi) => updateDraft({ upstreamWifi })}
             />
             <p className="wl-muted">
-              Signal, noise, link rate, retries, and channel load of the network this router joins.
-              It works without VPN tunnels and keeps history like latency.
+              {s.wifi.radio === false
+                ? 'This router has no Wi-Fi radio.'
+                : 'Signal, noise, link rate, retries, and channel load of the network this router joins. It works without VPN tunnels and keeps history like latency.'}
             </p>
             <Check
               label="Router and interface telemetry"

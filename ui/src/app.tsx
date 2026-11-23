@@ -39,8 +39,8 @@ import {
   stop,
   settingsUsed,
   themeKey,
+  shownViews,
   view,
-  views,
   type ViewId,
 } from './store.ts';
 import type { DataSource } from './sources/source.ts';
@@ -340,20 +340,20 @@ function Dashboard() {
       {active && (
         <Tabs
           className="wl-tabs-root"
-          value={view.value}
+          value={shownViews.value.some((v) => v.id === view.value) ? view.value : 'overview'}
           onValueChange={(next) => {
             if (next) switchView(next as ViewId);
           }}
         >
           <TabsList className="wl-tabs" aria-label="Views">
-            {views.map((v) => (
+            {shownViews.value.map((v) => (
               <TabsTab key={v.id} value={v.id}>
                 {v.label}
               </TabsTab>
             ))}
             <TabsIndicator className="wl-tabs-indicator" />
           </TabsList>
-          {views.map((v) => {
+          {shownViews.value.map((v) => {
             const Screen = screens[v.id];
             return (
               <TabsPanel key={v.id} value={v.id} className="wl-view">
