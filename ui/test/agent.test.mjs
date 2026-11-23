@@ -218,6 +218,19 @@ test('an agent edits a setting in the settings dialog', async () => {
   const save = entries().find((entry) => entry.label === 'Save settings');
   assert.match(save.confirm, /probe interval 5 → 15/);
   assert.match(save.confirm, /router telemetry on → off/);
+  result = await run([
+    { ref: 'Adjust CAKE bandwidth automatically', action: 'setChecked', args: [true] },
+  ]);
+  assert.equal(result.ok, true, result.error?.message);
+  await until(
+    () => entries().some((entry) => entry.label === 'Delay threshold (ms)'),
+    'SQM fields',
+  );
+  result = await run([{ ref: 'Delay threshold (ms)', action: 'setValue', args: ['30'] }]);
+  assert.equal(result.ok, true, result.error?.message);
+  const saveSqm = entries().find((entry) => entry.label === 'Save settings');
+  assert.match(saveSqm.confirm, /adaptive SQM off → on/);
+  assert.match(saveSqm.confirm, /SQM delay threshold 20 → 30/);
 });
 
 test('purging history waits for a person', async () => {

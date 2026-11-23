@@ -140,6 +140,20 @@ pub fn current(config: &Settings, inventory: &Inventory) -> Vec<Dimension> {
             Some(&counter.device),
         ));
     }
+    if config.sqm_autorate && config.enabled {
+        for path in router::monitored(config, inventory) {
+            if path.interface.len() + 4 <= 15 {
+                found.push(row(
+                    crate::sqm::KIND.name,
+                    path.id.clone(),
+                    "sqm",
+                    (&path.id, &path.name),
+                    None,
+                    Some(&path.interface),
+                ));
+            }
+        }
+    }
     let mut seen = BTreeSet::new();
     found.retain(|item| seen.insert(item.key()));
     found

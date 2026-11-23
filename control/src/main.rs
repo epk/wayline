@@ -18,6 +18,7 @@ mod router;
 mod runtime;
 mod service;
 mod settings;
+mod sqm;
 mod telemetry;
 mod update;
 mod wifi;

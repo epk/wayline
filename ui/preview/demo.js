@@ -19,7 +19,7 @@ const level = ['monitoring', 'unsupported', 'newer'].includes(query.get('compat'
 const wanDown = query.get('wan') === 'unavailable';
 const updateLatched = query.get('update') === 'latched';
 const updateFailed = updateLatched || query.get('update') === 'failed';
-const release = '0.1.0-alpha.28';
+const release = '0.1.0-alpha.29';
 const installed = query.get('stale') === '1' ? '0.0.0' : release;
 const directExit = query.get('exit') === 'direct';
 const telemetryOn = query.get('telemetry') !== 'off';
@@ -111,6 +111,12 @@ const state = {
     endpointDiagnostics: true,
     upstreamWifi: wifiMode !== 'off',
     telemetry: telemetryOn,
+    sqmAutorate: false,
+    sqmDelayMs: 20,
+    sqmMinDlMbps: 5,
+    sqmMaxDlMbps: 500,
+    sqmMinUlMbps: 5,
+    sqmMaxUlMbps: 500,
   },
   egress: {
     checkedAt: nowSeconds() - 90,

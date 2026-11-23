@@ -415,7 +415,51 @@ pub static INTERFACE: Kind = Kind {
     ],
 };
 
-pub static KINDS: [&Kind; 4] = [&LATENCY, &WIFI, &SYSTEM, &INTERFACE];
+pub static SQM: Kind = Kind {
+    name: "sqm",
+    description: "CAKE autorate bandwidth shaping per interface, per bucket",
+    fields: &[
+        measure("samples", Sum, "samples", "Ticks in the bucket"),
+        measure(
+            "dl_kbps_sum",
+            Sum,
+            "kbit/s",
+            "Sum of download shaper rates; average = dl_kbps_sum / samples",
+        ),
+        measure("dl_kbps_min", Min, "kbit/s", "Lowest download shaper rate"),
+        measure("dl_kbps_max", Max, "kbit/s", "Highest download shaper rate"),
+        measure(
+            "ul_kbps_sum",
+            Sum,
+            "kbit/s",
+            "Sum of upload shaper rates; average = ul_kbps_sum / samples",
+        ),
+        measure("ul_kbps_min", Min, "kbit/s", "Lowest upload shaper rate"),
+        measure("ul_kbps_max", Max, "kbit/s", "Highest upload shaper rate"),
+        measure(
+            "baseline_us_n",
+            Sum,
+            "samples",
+            "Ticks with a baseline RTT estimate",
+        ),
+        measure(
+            "baseline_us_sum",
+            Sum,
+            "us",
+            "Sum of baseline RTT estimates; average = baseline_us_sum / baseline_us_n",
+        ),
+        measure(
+            "delta_us_max",
+            Max,
+            "us",
+            "Highest RTT delta above baseline",
+        ),
+        measure("increases", Sum, "events", "Bandwidth increase decisions"),
+        measure("decreases", Sum, "events", "Bandwidth decrease decisions"),
+    ],
+};
+
+pub static KINDS: [&Kind; 5] = [&LATENCY, &WIFI, &SYSTEM, &INTERFACE, &SQM];
 
 #[cfg(test)]
 mod tests {

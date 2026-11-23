@@ -25,6 +25,12 @@ export const defaults = (): Settings => ({
   endpointDiagnostics: false,
   upstreamWifi: false,
   telemetry: false,
+  sqmAutorate: false,
+  sqmDelayMs: 20,
+  sqmMinDlMbps: 5,
+  sqmMaxDlMbps: 500,
+  sqmMinUlMbps: 5,
+  sqmMaxUlMbps: 500,
 });
 
 export const settingsFrom = (source: Partial<Settings>): Settings => {
@@ -133,6 +139,8 @@ export const normalize = (raw: unknown): State => {
   next.wifi = Object.assign({ enabled: false }, next.wifi);
   next.telemetry = Object.assign({ enabled: false, system: null }, next.telemetry);
   next.telemetry.interfaces = list(next.telemetry.interfaces);
+  if (next.sqm && typeof next.sqm === 'object')
+    next.sqm = { ...next.sqm, links: list(next.sqm.links) };
   return next;
 };
 
@@ -614,6 +622,28 @@ export async function saveSettings(): Promise<void> {
   if (draft.value.autoExit && draft.value.autoTunnels.length < 2) {
     error.value = 'Choose at least two monitored tunnels for automatic switching.';
     return;
+  }
+  if (draft.value.sqmAutorate) {
+    const d = draft.value;
+    if (!d.enabled) {
+      error.value = 'Turn on latency measurement before enabling adaptive SQM.';
+      return;
+    }
+    const inRange = (v: number, lo: number, hi: number) => finite(v) && v >= lo && v <= hi;
+    if (
+      !inRange(d.sqmDelayMs, 5, 200) ||
+      !inRange(d.sqmMinDlMbps, 1, 2000) ||
+      !inRange(d.sqmMaxDlMbps, 1, 2000) ||
+      !inRange(d.sqmMinUlMbps, 1, 2000) ||
+      !inRange(d.sqmMaxUlMbps, 1, 2000)
+    ) {
+      error.value = 'Use valid SQM delay (5–200 ms) and bandwidth (1–2000 Mbps) limits.';
+      return;
+    }
+    if (d.sqmMinDlMbps > d.sqmMaxDlMbps || d.sqmMinUlMbps > d.sqmMaxUlMbps) {
+      error.value = 'SQM minimum bandwidth cannot exceed maximum bandwidth.';
+      return;
+    }
   }
   busy.value = true;
   busyAction.value = 'save';

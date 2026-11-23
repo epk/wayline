@@ -220,6 +220,14 @@ impl Probe {
         &self.tunnel.id
     }
 
+    pub fn interface(&self) -> &str {
+        &self.tunnel.interface
+    }
+
+    pub fn latest_us(&self) -> Option<u32> {
+        self.history.back().and_then(|sample| sample.us)
+    }
+
     pub fn retarget(&mut self, tunnel: Tunnel, default_target: Ipv4Addr) {
         let target = tunnel.target.unwrap_or(default_target);
         let moved = self.tunnel.interface != tunnel.interface

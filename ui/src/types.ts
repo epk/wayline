@@ -14,6 +14,12 @@ export interface Settings {
   endpointDiagnostics: boolean;
   upstreamWifi: boolean;
   telemetry: boolean;
+  sqmAutorate: boolean;
+  sqmDelayMs: number;
+  sqmMinDlMbps: number;
+  sqmMaxDlMbps: number;
+  sqmMinUlMbps: number;
+  sqmMaxUlMbps: number;
 }
 
 export interface Tunnel {
@@ -198,6 +204,29 @@ export interface Telemetry {
   interfaces: InterfaceSample[];
 }
 
+export interface SqmLink {
+  id: string;
+  name: string;
+  egressDevice: string;
+  ingressDevice: string;
+  dlKbps: number;
+  ulKbps: number;
+  rxKbps: number;
+  txKbps: number;
+  baselineMs: Num;
+  deltaMs: Num;
+  dlAction: string;
+  ulAction: string;
+  adjustments: number;
+  updatedAgeMs: Num;
+}
+
+export interface SqmView {
+  enabled: boolean;
+  active: boolean;
+  links: SqmLink[];
+}
+
 export interface State {
   version: string;
   config: Settings;
@@ -233,6 +262,7 @@ export interface State {
   probe?: { interval?: number; timeout?: number };
   wifi: WifiView;
   telemetry: Telemetry;
+  sqm?: SqmView;
   device?: string;
   clock?: { synced: boolean; source: string | null; pending: boolean };
 }

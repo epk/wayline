@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
-use wayline_protocol::{Config, MAX_SERIES, TelemetryConfig, Tunnel, WifiConfig};
+use wayline_protocol::{
+    Config, MAX_SERIES, SqmConfig, SqmInterface, TelemetryConfig, Tunnel, WifiConfig,
+};
 
 const VPN_PROTOCOLS: [&str; 4] = ["wgclient", "ovpnclient", "wireguard", "openvpn"];
 const NO_PEER: &str = "The tunnel has no active WireGuard peer endpoint yet.";
@@ -693,6 +695,38 @@ pub fn monitor<'a>(
         .address(settings.primary())
         .or_else(|| tunnels.first().and_then(|tunnel| tunnel.target))
         .unwrap_or(Ipv4Addr::new(1, 1, 1, 1));
+    let sqm = (settings.sqm_autorate && settings.enabled)
+        .then(|| {
+            let interfaces: Vec<SqmInterface> = monitored(settings, inventory)
+                .filter_map(|path| {
+                    let ingress_device = format!("ifb4{}", path.interface);
+                    (ingress_device.len() <= 15).then(|| SqmInterface {
+                        id: path.id.clone(),
+                        name: path.name.clone(),
+                        egress_device: path.interface.clone(),
+                        ingress_device,
+                    })
+                })
+                .collect();
+            let bounds = |min: u32, max: u32| {
+                let low = min * 1_000;
+                let high = max * 1_000;
+                (low, 40_000.clamp(low, high), high)
+            };
+            let download = bounds(settings.sqm_min_dl_mbps, settings.sqm_max_dl_mbps);
+            let upload = bounds(settings.sqm_min_ul_mbps, settings.sqm_max_ul_mbps);
+            (!interfaces.is_empty()).then_some(SqmConfig {
+                interfaces,
+                delay_threshold_ms: settings.sqm_delay_ms,
+                min_dl_kbps: download.0,
+                base_dl_kbps: download.1,
+                max_dl_kbps: download.2,
+                min_ul_kbps: upload.0,
+                base_ul_kbps: upload.1,
+                max_ul_kbps: upload.2,
+            })
+        })
+        .flatten();
     Config {
         target,
         interval_ms: u64::from(settings.interval) * 1000,
@@ -705,6 +739,7 @@ pub fn monitor<'a>(
             interval_ms: crate::telemetry::INTERVAL_MS,
             interfaces: crate::telemetry::counters(inventory),
         }),
+        sqm,
     }
 }
 
@@ -983,6 +1018,43 @@ mod tests {
         assert!(endpoint(&listing, "wg1").0.is_none());
         assert!(endpoint(&listing, "wg2").1.contains("IPv6"));
         assert!(endpoint(&listing, "wg3").0.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn monitor_populates_sqm_config_when_enabled() -> Result<()> {
+        let mut inv = inventory();
+        inv.paths.push(path("long", "very_long_ifname", None));
+        let mut settings = Settings {
+            enabled: true,
+            sqm_autorate: true,
+            sqm_delay_ms: 30,
+            sqm_min_dl_mbps: 60,
+            sqm_max_dl_mbps: 200,
+            sqm_min_ul_mbps: 10,
+            sqm_max_ul_mbps: 30,
+            tunnels: vec!["vpn:a".into(), "vpn:long".into()],
+            ..Settings::default()
+        };
+        let config = monitor(&settings, &inv, &resolved()?);
+        let sqm = config
+            .sqm
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing sqm"))?;
+        assert_eq!(sqm.interfaces.len(), 1);
+        assert_eq!(sqm.interfaces[0].id, "a");
+        assert_eq!(sqm.interfaces[0].egress_device, "wg1");
+        assert_eq!(sqm.interfaces[0].ingress_device, "ifb4wg1");
+        assert_eq!(sqm.delay_threshold_ms, 30);
+        assert_eq!(sqm.min_dl_kbps, 60_000);
+        assert_eq!(sqm.base_dl_kbps, 60_000);
+        assert_eq!(sqm.max_dl_kbps, 200_000);
+        assert_eq!(sqm.min_ul_kbps, 10_000);
+        assert_eq!(sqm.base_ul_kbps, 30_000);
+        assert_eq!(sqm.max_ul_kbps, 30_000);
+
+        settings.sqm_autorate = false;
+        assert!(monitor(&settings, &inv, &resolved()?).sqm.is_none());
         Ok(())
     }
 }

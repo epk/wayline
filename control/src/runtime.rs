@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use wayline_protocol::{MAX_STATUS, Series, Status, TelemetryStatus, WifiStatus};
+use wayline_protocol::{MAX_STATUS, Series, SqmStatus, Status, TelemetryStatus, WifiStatus};
 
 pub const RUNTIME: &str = "/var/run/wayline";
 pub const MONITOR_CONFIG: &str = "/var/run/wayline/monitor.json";
@@ -110,6 +110,7 @@ pub struct Parts {
     pub series: Vec<Series>,
     pub wifi: Option<WifiStatus>,
     pub telemetry: Option<TelemetryStatus>,
+    pub sqm: Option<SqmStatus>,
     pub boot_id: String,
     pub boot_ms: u64,
     pub wall_ms: u64,
@@ -128,6 +129,7 @@ fn parts(status: Option<Status>) -> Parts {
         series: status.tunnels,
         wifi: status.wifi,
         telemetry: status.telemetry,
+        sqm: status.sqm,
         boot_id: status.boot_id,
         boot_ms: status.boot_ms,
         wall_ms: status.wall_ms,

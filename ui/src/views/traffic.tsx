@@ -4,8 +4,8 @@ import { Chart, type Line } from '../chart.tsx';
 import { bits, bytes, dash, finite, span } from '../format.ts';
 import { column, some, times } from '../series.ts';
 import { busy, can, enableSetting, state, telemetryData } from '../store.ts';
-import type { Column } from '../types.ts';
-import { Badge, Explain, Panel } from '../ui.tsx';
+import type { Column, SqmView } from '../types.ts';
+import { Badge, Explain, Panel, type Tone } from '../ui.tsx';
 
 const palette = Array.from({ length: 8 }, (_, i) => 'series-' + (i + 1));
 export const handshakeLimit = 180;
@@ -58,6 +58,114 @@ const rateAxis = (v: number) => {
   return String(Math.round(v));
 };
 
+const sqmAction: Record<string, { tone: Tone; label: string }> = {
+  increase: { tone: 'good', label: 'Increase' },
+  decrease: { tone: 'fair', label: 'Decrease' },
+  hold: { tone: 'ok', label: 'Hold' },
+  idle: { tone: 'off', label: 'Idle' },
+  missing_qdisc: { tone: 'degraded', label: 'No CAKE' },
+  error: { tone: 'down', label: 'Error' },
+};
+
+const mbps = (kbps: number) => (kbps / 1000).toFixed(1) + ' Mbps';
+
+function SqmRate(props: {
+  label: string;
+  cap: number;
+  live: number;
+  liveTag: string;
+  action: string;
+}) {
+  const meta = sqmAction[props.action] || { tone: 'unknown' as Tone, label: props.action };
+  return (
+    <td className="wl-n wl-num" data-label={props.label}>
+      {mbps(props.cap)} <Badge tone={meta.tone}>{meta.label}</Badge>
+      <small className="wl-block wl-muted">
+        {props.liveTag} {mbps(props.live)}
+      </small>
+    </td>
+  );
+}
+
+export function SqmPanel(props: { sqm: SqmView }) {
+  const { sqm } = props;
+  return (
+    <Panel
+      id="wl-traffic-sqm"
+      title="Adaptive SQM (CAKE)"
+      sub={sqm.active ? 'Adjusting CAKE ceilings from RTT.' : 'Waiting for baseline RTT.'}
+    >
+      {sqm.links.length ? (
+        <div
+          className="wl-scroll wl-stack"
+          tabIndex={0}
+          role="region"
+          aria-label="Adaptive SQM table"
+        >
+          <table className="wl-table">
+            <thead>
+              <tr>
+                <th scope="col">Interface</th>
+                <th scope="col" className="wl-n">
+                  Download
+                </th>
+                <th scope="col" className="wl-n">
+                  Upload
+                </th>
+                <th scope="col" className="wl-n">
+                  Baseline / Delta RTT
+                </th>
+                <th scope="col" className="wl-n">
+                  Adjustments
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {sqm.links.map((l) => (
+                <tr key={l.id}>
+                  <th scope="row">
+                    {l.name}
+                    <small className="wl-block wl-muted">
+                      {l.egressDevice} / {l.ingressDevice}
+                    </small>
+                  </th>
+                  <SqmRate
+                    label="Download"
+                    cap={l.dlKbps}
+                    live={l.rxKbps}
+                    liveTag="RX"
+                    action={l.dlAction}
+                  />
+                  <SqmRate
+                    label="Upload"
+                    cap={l.ulKbps}
+                    live={l.txKbps}
+                    liveTag="TX"
+                    action={l.ulAction}
+                  />
+                  <td className="wl-n wl-num" data-label="Baseline / Delta RTT">
+                    {finite(l.baselineMs) ? l.baselineMs.toFixed(1) + ' ms' : dash}
+                    <small className="wl-block wl-muted">
+                      {finite(l.deltaMs)
+                        ? (l.deltaMs >= 0 ? '+' : '') + l.deltaMs.toFixed(1) + ' ms'
+                        : dash}
+                    </small>
+                  </td>
+                  <td className="wl-n wl-num" data-label="Adjustments">
+                    {l.adjustments}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="wl-muted">Waiting for CAKE shaper telemetry.</p>
+      )}
+    </Panel>
+  );
+}
+
 export function TrafficView() {
   const s = state.value;
   const t = s.telemetry;
@@ -90,10 +198,18 @@ export function TrafficView() {
     const wg = ifaces.filter((i) => i.kind === 'tunnel' && some(i.handshake, finite));
     return { x, ifaces, counters, counterYs, wg };
   }, [doc]);
-  if (!s.config.telemetry) return <TelemetryOff title="Traffic" />;
+  const sqm = s.sqm?.enabled ? <SqmPanel sqm={s.sqm} /> : null;
+  if (!s.config.telemetry)
+    return (
+      <>
+        {sqm}
+        <TelemetryOff title="Traffic" />
+      </>
+    );
   const age = t.sampleAgeMs;
   return (
     <>
+      {sqm}
       <Panel
         id="wl-traffic-live"
         title="Interfaces (live)"
