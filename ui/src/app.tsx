@@ -234,24 +234,10 @@ const hostBackground = (from: Element): string => {
   return '';
 };
 
-const motion = (): boolean =>
-  typeof document.startViewTransition === 'function' &&
-  !document.hidden &&
-  !matchMedia('(prefers-reduced-motion: reduce)').matches;
-
+// The new view fades in with CSS. A view transition here left iOS Safari
+// sending taps to the wrong place once the admin page was scrolled.
 function switchView(next: ViewId): void {
-  if (next === view.value) return;
-  if (!motion()) {
-    setView(next);
-    return;
-  }
-  const transition = document.startViewTransition(() => {
-    setView(next);
-    return new Promise<void>((resolve) => setTimeout(resolve, 0));
-  });
-  // The browser skips the animation when the page hides or another switch
-  // interrupts it. The view still changes, so the rejection needs no action.
-  transition.ready.catch(() => {});
+  if (next !== view.value) setView(next);
 }
 
 function Dashboard() {

@@ -48,16 +48,33 @@ const usedSlot = (slot) => usedSlots.some((used) => slot === used || slot.starts
 const slotsUsed = (text) =>
   [...text.matchAll(/data-slot="([a-z-]+)"/g)].every((m) => usedSlot(m[1]));
 
-const narrow = (selector) =>
-  selector.replace(/:(is|where)\(([^()]*)\)/g, (all, kind, list) => {
-    const kept = list.split(',').filter(slotsUsed);
-    return kept.length ? ':' + kind + '(' + kept.join(',') + ')' : ':is(#wl-unused)';
-  });
+const usable = (selector) => !selector.includes('#wl-unused') && slotsUsed(selector);
 
-const keepSelector = (selector) =>
-  !dropped.has(selector.trim()) &&
-  !narrow(selector).includes('#wl-unused') &&
-  slotsUsed(narrow(selector));
+// Drop unused parts from every :is() and :where() list, nested ones too. A
+// list that keeps one part for an unused part would otherwise drop its whole
+// rule, as it once dropped `position: relative` for switch labels and left
+// their touch-only tap area stretched over the page.
+const narrow = (selector) => {
+  let out = '';
+  let at = 0;
+  for (const match of selector.matchAll(/:(is|where)\(/g)) {
+    if (match.index < at) continue;
+    let depth = 1;
+    let end = match.index + match[0].length;
+    for (; end < selector.length && depth; end++) {
+      if (selector[end] === '(') depth++;
+      else if (selector[end] === ')') depth--;
+    }
+    const list = selector.slice(match.index + match[0].length, end - 1);
+    const kept = splitList(list).map(narrow).filter(usable);
+    out += selector.slice(at, match.index);
+    out += kept.length ? ':' + match[1] + '(' + kept.join(',') + ')' : ':is(#wl-unused)';
+    at = end;
+  }
+  return out + selector.slice(at);
+};
+
+const keepSelector = (selector) => !dropped.has(selector.trim()) && usable(narrow(selector));
 
 const splitList = (text) => {
   const parts = [];
