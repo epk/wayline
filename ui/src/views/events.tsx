@@ -1,5 +1,5 @@
 import { Pick } from '../kit.tsx';
-import { subjectKey, subjectName } from '../common.tsx';
+import { incidentKind, subjectKey, subjectName } from '../common.tsx';
 import { incidents } from '../derived.ts';
 import { dateTime, span } from '../format.ts';
 import { clock, eventSubject, latencyData, state, wifiData } from '../store.ts';
@@ -33,7 +33,7 @@ export function EventsView() {
     push({
       at: i.start,
       subject: i.subject,
-      kind: i.kind === 'wifi' ? 'Wi-Fi disconnected' : 'Total loss',
+      kind: incidentKind(i.kind),
       text: (i.name || subjectName(i.subject)) + ': ' + (i.detail || 'every probe lost'),
       end: i.end,
       incident: true,

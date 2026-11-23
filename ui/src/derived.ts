@@ -1,5 +1,5 @@
 import { computed } from './signal.ts';
-import { finite } from './format.ts';
+import { finite, offChannel } from './format.ts';
 import { score, type Score } from './mos.ts';
 import { latencyLine, sum, times, type LatencyLine } from './series.ts';
 import { exitTunnel, latencyData, primary, state, wifiData } from './store.ts';
@@ -75,6 +75,13 @@ const rangeLoss = (id: string): Loss => {
   const lost = line ? sum(line.lost) : 0;
   return { pct: sent ? (lost / sent) * 100 : null, lost, sent, source: 'range' };
 };
+
+export const liveLoss = (stat: { samples: number; lost: number } | null): Loss => ({
+  pct: stat && stat.samples ? (stat.lost / stat.samples) * 100 : null,
+  lost: stat ? stat.lost : 0,
+  sent: stat ? stat.samples : 0,
+  source: 'live',
+});
 
 export const tunnelLoss = (t: Tunnel): Loss => ({
   pct: t.samples ? (t.lost / t.samples) * 100 : null,
@@ -230,47 +237,57 @@ export const health = computed<Health[]>(() => {
     items.push({ id: 'vpn', label: 'VPN exit', tone, text, reason: text });
   }
   const w = s.wifi;
-  if (!w.enabled)
-    items.push({
-      id: 'wifi',
-      label: 'Wi-Fi',
-      tone: 'off',
-      text: 'Not monitored',
-      reason: 'Upstream Wi-Fi monitoring is off.',
-    });
-  else if (w.state === 'disconnected')
-    items.push({
-      id: 'wifi',
-      label: 'Wi-Fi',
-      tone: 'down',
-      text: 'Disconnected',
-      reason: w.reason || 'Disconnected.',
-    });
-  else if (!w.link)
-    items.push({
-      id: 'wifi',
-      label: 'Wi-Fi',
-      tone: 'unknown',
-      text: 'No link',
-      reason: w.reason || 'No link data.',
-    });
-  else {
-    const l = w.link;
-    const snr = finite(l.signal) && finite(l.noise) ? l.signal - l.noise : null;
-    const busy = finite(l.busy_permille) ? l.busy_permille / 10 : null;
-    const bad: string[] = [];
-    if (finite(l.signal) && wifiLevel.signal(l.signal) === 'poor')
-      bad.push('signal ' + l.signal + ' dBm');
-    if (finite(snr) && wifiLevel.snr(snr) === 'poor') bad.push('weak signal over noise');
-    if (finite(busy) && wifiLevel.busy(busy) === 'poor')
-      bad.push('channel ' + busy.toFixed(0) + ' % busy');
-    items.push({
-      id: 'wifi',
-      label: 'Wi-Fi',
-      tone: bad.length ? 'degraded' : 'ok',
-      text: bad.length ? bad[0] : finite(l.signal) ? l.signal + ' dBm' : 'Connected',
-      reason: bad.join(', ') || 'Within the good bands.',
-    });
+  if (w.radio !== false) {
+    if (!w.enabled)
+      items.push({
+        id: 'wifi',
+        label: 'Wi-Fi',
+        tone: 'off',
+        text: 'Not monitored',
+        reason: 'Upstream Wi-Fi monitoring is off.',
+      });
+    else if (w.state === 'disconnected')
+      items.push({
+        id: 'wifi',
+        label: 'Wi-Fi',
+        tone: 'down',
+        text: 'Disconnected',
+        reason: w.reason || 'Disconnected.',
+      });
+    else if (!w.link)
+      items.push({
+        id: 'wifi',
+        label: 'Wi-Fi',
+        tone: 'unknown',
+        text: 'No link',
+        reason: w.reason || 'No link data.',
+      });
+    else if (offChannel(w.link))
+      items.push({
+        id: 'wifi',
+        label: 'Wi-Fi',
+        tone: 'down',
+        text: 'Radio on the wrong channel',
+        reason: offChannel(w.link) || '',
+      });
+    else {
+      const l = w.link;
+      const snr = finite(l.signal) && finite(l.noise) ? l.signal - l.noise : null;
+      const busy = finite(l.busy_permille) ? l.busy_permille / 10 : null;
+      const bad: string[] = [];
+      if (finite(l.signal) && wifiLevel.signal(l.signal) === 'poor')
+        bad.push('signal ' + l.signal + ' dBm');
+      if (finite(snr) && wifiLevel.snr(snr) === 'poor') bad.push('weak signal over noise');
+      if (finite(busy) && wifiLevel.busy(busy) === 'poor')
+        bad.push('channel ' + busy.toFixed(0) + ' % busy');
+      items.push({
+        id: 'wifi',
+        label: 'Wi-Fi',
+        tone: bad.length ? 'degraded' : 'ok',
+        text: bad.length ? bad[0] : finite(l.signal) ? l.signal + ' dBm' : 'Connected',
+        reason: bad.join(', ') || 'Within the good bands.',
+      });
+    }
   }
   const sys = s.telemetry.system;
   if (!s.config.telemetry)

@@ -84,7 +84,13 @@ Unchanged v1 fields, plus:
 - `probe: { interval: seconds, timeout: ms }`.
 - `tunnels[].jitter`, `uplinks[].jitter`: `number | null`, milliseconds, mean
   absolute difference between consecutive successful RTTs in the recent window.
-- `wifi`: the v1 Wi-Fi view (see `control/src/wifi.rs` `View`).
+  These describe the primary destination.
+- `live`: the same recent-window figures for every destination, keyed by
+  destination and then path id (`tunnels[].id`, `wan`, or a standby uplink id):
+  `{ "8.8.8.8": { "wan": { "median": 3.7, "jitter": 0.32, "samples": 64, "lost": 0 } } }`.
+- `wifi`: the v1 Wi-Fi view (see `control/src/wifi.rs` `View`). `radio` is false
+  on a router without a Wi-Fi radio. `link.radio_frequency` is set while the radio
+  is tuned to another channel than the access point.
 - `telemetry`:
 
 ```json
@@ -119,8 +125,9 @@ sample. Rates are bits per second over the last sampling interval.
 { "subject": "wan", "name": "Direct WAN", "kind": "loss", "start": 1763700000000, "end": 1763700045000, "detail": "All probes to 1.1.1.1 lost" }
 ```
 
-`kind` is `loss` (every probe in consecutive 15-second periods lost) or `wifi`
-(the repeater was disconnected). `end` is `null` while ongoing.
+`kind` is `loss` (every probe in consecutive 15-second periods lost), `wifi`
+(the repeater was disconnected) or `off_channel` (the radio was tuned to another
+channel than the access point). `end` is `null` while ongoing.
 
 ## get_history
 

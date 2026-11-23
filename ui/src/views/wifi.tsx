@@ -10,6 +10,7 @@ import {
   finite,
   kbit,
   mbit,
+  offChannel,
   percent,
   span,
   stamp,
@@ -250,6 +251,11 @@ export function WifiView() {
         {w.reason && (
           <p className="wl-muted" role="status">
             {w.reason}
+          </p>
+        )}
+        {l && offChannel(l) && (
+          <p className="wl-note" role="alert">
+            {offChannel(l)}
           </p>
         )}
         {l && (

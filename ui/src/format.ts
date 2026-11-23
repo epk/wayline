@@ -97,6 +97,31 @@ export const band = (frequency: number): string => {
   return frequency < 5925 ? '5 GHz' : '6 GHz';
 };
 
+export const channelOf = (frequency: number): number => {
+  if (frequency === 2484) return 14;
+  if (frequency < 3000) return (frequency - 2407) / 5;
+  return frequency < 5925 ? (frequency - 5000) / 5 : (frequency - 5950) / 5;
+};
+
+export const offChannel = (link: {
+  channel?: number | null;
+  frequency?: number | null;
+  radio_frequency?: number | null;
+}): string | null => {
+  const radio = link.radio_frequency;
+  if (typeof radio !== 'number' || !Number.isFinite(radio)) return null;
+  const ap = link.channel ? 'channel ' + link.channel : 'another channel';
+  return (
+    'The radio is tuned to channel ' +
+    channelOf(radio) +
+    ' (' +
+    radio +
+    ' MHz), but the access point is on ' +
+    ap +
+    '. Traffic may not get through until the router reconnects. Airtime shows the channel the radio is on.'
+  );
+};
+
 export const validCountry = (code: unknown): code is string =>
   typeof code === 'string' && /^[A-Z]{2}$/.test(code) && code !== 'XX';
 

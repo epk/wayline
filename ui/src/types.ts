@@ -139,10 +139,19 @@ export interface WifiLink {
   connected_seconds?: Num;
   inactive_ms?: Num;
   busy_permille?: Num;
+  radio_frequency?: Num;
+}
+
+export interface LiveStat {
+  median: Num;
+  jitter: Num;
+  samples: number;
+  lost: number;
 }
 
 export interface WifiView {
   enabled: boolean;
+  radio?: boolean;
   state?: string | null;
   reason?: string;
   interface?: string | null;
@@ -195,6 +204,7 @@ export interface State {
   history?: { days?: number; tiers?: Tier[] };
   tunnels: Tunnel[];
   diagnostics: Record<string, Record<string, Num>>;
+  live?: Record<string, Record<string, LiveStat>>;
   endpoints: { tunnel: string; name: string; address: string | null; reason: string }[];
   wan: { available: boolean; interface: string | null; reason: string };
   uplinks: Uplink[];

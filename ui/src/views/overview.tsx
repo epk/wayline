@@ -19,6 +19,7 @@ import {
 } from '../derived.ts';
 import {
   band as bandName,
+  offChannel,
   bytes,
   dash,
   dbm,
@@ -406,6 +407,7 @@ function WifiCard(props: { item: Health }) {
         <p className="wl-muted">{w.reason || 'No Wi-Fi link data yet.'}</p>
       ) : (
         <>
+          {offChannel(l) && <p className="wl-note">{offChannel(l)}</p>}
           <p className="wl-card-sub">
             <strong>{l.ssid || 'Hidden network'}</strong>
             <span className="wl-muted wl-block">
@@ -546,7 +548,7 @@ export function OverviewView() {
       <div className="wl-cards">
         <InternetCard item={by('internet')} />
         <VpnCard item={by('vpn')} />
-        <WifiCard item={by('wifi')} />
+        {state.value.wifi.radio !== false && <WifiCard item={by('wifi')} />}
         <RouterCard item={by('router')} />
       </div>
       <Explain summary="How health states are decided">

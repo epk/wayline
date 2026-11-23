@@ -232,6 +232,8 @@ pub struct WifiLink {
     pub connected_seconds: Option<u64>,
     pub inactive_ms: Option<u64>,
     pub busy_permille: Option<u16>,
+    #[serde(default)]
+    pub radio_frequency: Option<u32>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -327,6 +329,8 @@ pub struct WifiBucket {
     pub uptime_ms: u64,
     #[serde(default)]
     pub ap: u64,
+    #[serde(default)]
+    pub off_channel: u32,
 }
 
 fn lower<T: Ord>(left: Option<T>, right: Option<T>) -> Option<T> {
@@ -376,6 +380,7 @@ impl WifiBucket {
             roams: 0,
             uptime_ms: 0,
             ap: 0,
+            off_channel: 0,
         }
     }
 
@@ -406,6 +411,7 @@ impl WifiBucket {
         self.tx_ms = self.tx_ms.saturating_add(other.tx_ms);
         self.disconnects = self.disconnects.saturating_add(other.disconnects);
         self.roams = self.roams.saturating_add(other.roams);
+        self.off_channel = self.off_channel.saturating_add(other.off_channel);
     }
 }
 

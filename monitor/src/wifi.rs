@@ -19,6 +19,7 @@ const CHANGES: usize = 64;
 const REOPEN: Duration = Duration::from_secs(30);
 const SETTLE: Duration = Duration::from_millis(300);
 const SERVING_REFRESH: Duration = Duration::from_secs(60);
+const OFF_CHANNEL_HOLD_MS: u64 = 60_000;
 
 pub trait Source {
     fn interfaces(&mut self) -> Option<Vec<Interface>>;
@@ -119,6 +120,7 @@ pub struct Frames {
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Survey {
+    pub frequency: u32,
     pub active: u64,
     pub busy: u64,
     pub rx: u64,
@@ -131,7 +133,25 @@ pub struct Reading {
     pub link: WifiLink,
     pub frames: Option<Frames>,
     pub survey: Option<Survey>,
+    pub tuned: Option<Tuned>,
     pub bytes: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Tuned {
+    pub frequency: u32,
+    pub survey: Option<Survey>,
+}
+
+fn survey_of(channel: &Channel) -> Option<Survey> {
+    Some(Survey {
+        frequency: channel.frequency,
+        active: channel.active_ms?,
+        busy: channel.busy_ms?,
+        rx: channel.rx_ms.unwrap_or(0),
+        tx: channel.tx_ms.unwrap_or(0),
+        noise: channel.noise,
+    })
 }
 
 pub enum Observation {
@@ -284,25 +304,24 @@ impl<S: Source> Sampler<S> {
             }
             (serving.security.clone(), serving.ssid.clone())
         });
-        let channel = self.source.survey(item.index).and_then(|list| {
-            list.iter()
-                .find(|channel| Some(channel.frequency) == frequency)
-                .or_else(|| list.iter().find(|channel| channel.in_use))
-                .copied()
-        });
+        let channels = self.source.survey(item.index).unwrap_or_default();
+        let in_use = channels.iter().find(|channel| channel.in_use);
+        let channel = channels
+            .iter()
+            .find(|channel| Some(channel.frequency) == frequency)
+            .or(in_use)
+            .copied();
+        let tuned = in_use
+            .filter(|used| frequency.is_some_and(|serving| serving != used.frequency))
+            .map(|used| Tuned {
+                frequency: used.frequency,
+                survey: survey_of(used),
+            });
         let (family, hwmode) = generation(
             peer.tx.mode.as_deref().or(peer.rx.mode.as_deref()),
             frequency,
         );
-        let survey = channel.and_then(|channel| {
-            Some(Survey {
-                active: channel.active_ms?,
-                busy: channel.busy_ms?,
-                rx: channel.rx_ms.unwrap_or(0),
-                tx: channel.tx_ms.unwrap_or(0),
-                noise: channel.noise,
-            })
-        });
+        let survey = channel.as_ref().and_then(survey_of);
         let frames = peer
             .tx_packets
             .zip(peer.tx_retries)
@@ -340,6 +359,7 @@ impl<S: Source> Sampler<S> {
             connected_seconds: peer.connected_seconds,
             inactive_ms: peer.inactive_ms,
             busy_permille: None,
+            radio_frequency: None,
         };
         Reading {
             bytes: self.source.bytes(&item.name),
@@ -347,6 +367,7 @@ impl<S: Source> Sampler<S> {
             link,
             frames,
             survey,
+            tuned,
         }
     }
 }
@@ -355,7 +376,6 @@ impl<S: Source> Sampler<S> {
 struct Baseline {
     interface: String,
     bssid: String,
-    frequency: Option<u32>,
     connected_seconds: Option<u64>,
     frames: Option<Frames>,
     survey: Option<Survey>,
@@ -407,9 +427,10 @@ impl Delta {
         let survey = before
             .survey
             .zip(survey)
-            .filter(|_| same_interface && before.frequency == link.frequency)
+            .filter(|(before, after)| same_interface && before.frequency == after.frequency)
             .and_then(|(before, after)| {
                 Some(Survey {
+                    frequency: after.frequency,
                     active: grew(after.active, before.active)?,
                     busy: grew(after.busy, before.busy)?,
                     rx: grew(after.rx, before.rx)?,
@@ -510,6 +531,7 @@ pub struct Record {
     recent: VecDeque<WifiSample>,
     open: Option<WifiBucket>,
     closed: VecDeque<WifiBucket>,
+    off: Option<(u32, u64)>,
 }
 
 impl Default for Record {
@@ -537,7 +559,18 @@ impl Record {
             recent: VecDeque::new(),
             open: None,
             closed: VecDeque::new(),
+            off: None,
         }
+    }
+
+    fn tuned(&mut self, wall_ms: u64, frequency: Option<u32>) -> Option<u32> {
+        self.off = frequency.map(|frequency| match self.off {
+            Some((known, since)) if known == frequency => (frequency, since),
+            _ => (frequency, wall_ms),
+        });
+        self.off
+            .filter(|(_, since)| wall_ms.saturating_sub(*since) >= OFF_CHANNEL_HOLD_MS)
+            .map(|(frequency, _)| frequency)
     }
 
     fn credit(&mut self, wall_ms: u64, ap: u64) {
@@ -629,8 +662,12 @@ impl Record {
             }
             Observation::Connected(reading) => {
                 let Reading {
-                    interface, link, ..
+                    interface,
+                    mut link,
+                    tuned,
+                    ..
                 } = *reading;
+                link.radio_frequency = self.tuned(wall_ms, tuned.map(|tuned| tuned.frequency));
                 let identity = WifiIdentity::of(&link);
                 let restarted = self.previous.as_ref().is_some_and(|before| {
                     before.bssid == identity.bssid
@@ -664,6 +701,7 @@ impl Record {
     }
 
     fn lose(&mut self) {
+        self.off = None;
         if self.last.is_some() && !self.lost {
             self.pending_drops = self.pending_drops.saturating_add(1);
             self.lost = true;
@@ -736,6 +774,7 @@ impl Record {
                 self.state = WifiState::NoClientInterface;
                 self.interface = None;
                 self.link = None;
+                self.off = None;
                 if self.last.is_some() {
                     self.gap(wall_ms);
                 } else {
@@ -747,6 +786,7 @@ impl Record {
                 self.state = WifiState::Disconnected;
                 self.interface = Some(interface);
                 self.link = None;
+                self.off = None;
                 self.gap(wall_ms);
                 self.remember(WifiSample {
                     at_ms: wall_ms,
@@ -763,8 +803,18 @@ impl Record {
             mut link,
             frames,
             survey,
+            tuned,
             bytes,
         } = *reading;
+        let off_channel = self.tuned(wall_ms, tuned.map(|tuned| tuned.frequency));
+        let survey = if off_channel.is_some() {
+            let survey = tuned.and_then(|tuned| tuned.survey);
+            link.noise = survey.and_then(|survey| survey.noise).or(link.noise);
+            survey
+        } else {
+            survey
+        };
+        link.radio_frequency = off_channel;
         let delta = Delta::between(previous.as_ref(), &interface, &link, frames, survey, bytes);
         link.busy_permille = delta.survey.and_then(|survey| {
             u16::try_from(survey.busy.saturating_mul(1000) / survey.active).ok()
@@ -775,6 +825,9 @@ impl Record {
         self.credit(wall_ms, access_point_id(&identity.bssid));
         let bucket = self.bucket(wall_ms);
         delta.add(bucket, &link);
+        bucket.off_channel = bucket
+            .off_channel
+            .saturating_add(u32::from(off_channel.is_some()));
         bucket.roams = bucket.roams.saturating_add(u32::from(roamed));
         bucket.disconnects = bucket.disconnects.saturating_add(u32::from(dropped));
         self.settle(wall_ms);
@@ -797,7 +850,6 @@ impl Record {
         self.previous = Some(Baseline {
             interface: interface.clone(),
             bssid: link.bssid.clone(),
-            frequency: link.frequency,
             connected_seconds: link.connected_seconds,
             frames,
             survey,
@@ -944,7 +996,7 @@ fn run<S: Source>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Observation, Reading, Record, Sampler, Source};
+    use super::{Observation, Reading, Record, Sampler, Source, Survey, Tuned};
     use crate::nl80211::{
         self, Bss, Channel, Interface, Peer, parse_interface, parse_station, parse_survey,
     };
@@ -1270,8 +1322,105 @@ mod tests {
             },
             frames: None,
             survey: None,
+            tuned: None,
             bytes: None,
         }))
+    }
+
+    #[test]
+    fn the_sampler_notices_a_radio_on_another_channel() -> Result<(), &'static str> {
+        let mut source = fake();
+        source.surveys = BTreeMap::from([(
+            19,
+            [
+                nl80211::tests::survey(5_180, true, 4_000, 300),
+                nl80211::tests::survey(5_200, false, 1_000, 200),
+            ]
+            .iter()
+            .filter_map(|data| parse_survey(data))
+            .collect(),
+        )]);
+        let Observation::Connected(reading) = Sampler::new(source).observe(Instant::now()) else {
+            return Err("expected a connection");
+        };
+        assert_eq!(reading.link.channel, Some(40));
+        assert_eq!(reading.survey.map(|survey| survey.frequency), Some(5_200));
+        let tuned = reading.tuned.ok_or("expected the tuned channel")?;
+        assert_eq!(tuned.frequency, 5_180);
+        assert_eq!(tuned.survey.map(|survey| survey.busy), Some(300));
+        let Observation::Connected(normal) = Sampler::new(fake()).observe(Instant::now()) else {
+            return Err("expected a connection");
+        };
+        assert!(normal.tuned.is_none());
+        Ok(())
+    }
+
+    fn surveyed(frequency: u32, active: u64, busy: u64) -> Survey {
+        Survey {
+            frequency,
+            active,
+            busy,
+            rx: busy,
+            tx: 0,
+            noise: Some(-92),
+        }
+    }
+
+    fn tuned_to(step: u64, radio: Option<u32>) -> Observation {
+        let Observation::Connected(mut reading) = joined("apclii0", "A", "aa:00:00:00:00:01", 40)
+        else {
+            return Observation::QueryFailed;
+        };
+        reading.link.frequency = Some(5_200);
+        reading.survey = Some(surveyed(5_200, 1_000, 100));
+        reading.tuned = radio.map(|frequency| Tuned {
+            frequency,
+            survey: Some(surveyed(frequency, step * 5_000, step * 1_000)),
+        });
+        Observation::Connected(reading)
+    }
+
+    #[test]
+    fn a_radio_held_on_another_channel_is_flagged_and_keeps_its_airtime() {
+        let start = Instant::now();
+        let base = 1_800_000_000_000;
+        let mut record = Record::new();
+        let mut flagged = Vec::new();
+        let plan = [
+            (0, None),
+            (5, Some(5_660)),
+            (10, None),
+            (15, Some(5_180)),
+            (20, Some(5_180)),
+            (75, Some(5_180)),
+            (80, Some(5_180)),
+            (85, None),
+        ];
+        for (step, radio) in plan {
+            let offset = step * 1_000;
+            record.apply(
+                start + Duration::from_millis(offset),
+                base + offset,
+                tuned_to(step, radio),
+                &[],
+            );
+            flagged.push(record.link.as_ref().and_then(|link| link.radio_frequency));
+        }
+        assert_eq!(
+            flagged,
+            [None, None, None, None, None, Some(5_180), Some(5_180), None]
+        );
+        let status = record.status(start + Duration::from_secs(120), Some(0));
+        let mut buckets = status.buckets;
+        buckets.extend(record.open);
+        let sum = buckets
+            .iter()
+            .fold(WifiBucket::empty(0), |mut sum, bucket| {
+                sum.merge(bucket);
+                sum
+            });
+        assert_eq!(sum.off_channel, 2);
+        assert_eq!((sum.active_ms, sum.busy_ms), (25_000, 5_000));
     }
 
     #[test]

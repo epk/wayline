@@ -698,7 +698,7 @@ pub fn monitor<'a>(
         interval_ms: u64::from(settings.interval) * 1000,
         timeout_ms: 2000,
         tunnels,
-        wifi: settings.upstream_wifi.then_some(WifiConfig {
+        wifi: (settings.upstream_wifi && crate::wifi::radio_present()).then_some(WifiConfig {
             interval_ms: WIFI_INTERVAL_MS,
         }),
         telemetry: settings.telemetry.then(|| TelemetryConfig {

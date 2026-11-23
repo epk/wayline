@@ -26,6 +26,7 @@ const FLASH_CAP: u64 = 96 * 1024 * 1024;
 const CHUNK_LIMIT: usize = 16 * 1024 * 1024;
 const EXTENSION: &str = "parquet";
 const ZSTD_LEVEL: i32 = 3;
+const ROLLUP_EVERY: u64 = 3_600;
 const DAMAGED: &str = "A history chunk was damaged and was reset.";
 const BROKEN: &str = ".broken";
 const BROKEN_GRACE: Duration = Duration::from_hours(72);
@@ -501,7 +502,8 @@ fn rollup(
     window: &Window,
 ) -> Result<BTreeSet<u64>> {
     let ratio = parent.step / child.step;
-    let Some(closed) = (window.now / parent.step).checked_sub(1) else {
+    let gate = parent.step.max(ROLLUP_EVERY);
+    let Some(closed) = (window.now / gate * gate / parent.step).checked_sub(1) else {
         return Ok(BTreeSet::new());
     };
     let mut parents: BTreeSet<u64> = periods
@@ -853,7 +855,7 @@ pub fn report(root: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, Fold, Kind, fold, series, stamp, store, unstamp};
+    use super::{Entry, Fold, Kind, fold, rows_in, series, stamp, store, tier, unstamp};
     use crate::history::{HOUR, LEVELS};
     use crate::runtime;
     use anyhow::{Context, Result, ensure};
@@ -1037,6 +1039,37 @@ mod tests {
     }
 
     #[test]
+    fn coarser_tiers_wait_for_the_hour_and_reads_fill_the_open_hour() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let hour = runtime::now() / HOUR * HOUR;
+        let now = hour + 1_800;
+        let entries: Vec<Entry> = (hour - HOUR..now)
+            .step_by(15)
+            .map(|at| entry("a", at, 1))
+            .collect();
+        store(root, 30, &TEST, &entries, now)?;
+        let minutes = rows_in(root, &TEST, &tier(60), (0, u64::MAX))?;
+        let newest = minutes.keys().map(|(_, period)| *period).max();
+        ensure!(
+            newest == Some(hour / 60 - 1),
+            "The open hour was rolled up: {newest:?}"
+        );
+        let read = series(root, &TEST, 60, (hour / 60, now / 60 - 1), &[])?;
+        let open = read.get("a").map_or(0, std::collections::BTreeMap::len);
+        ensure!(open == 30, "The open hour was not filled: {open}");
+        let later = hour + HOUR + 60;
+        store(root, 30, &TEST, &[entry("a", later - 15, 1)], later)?;
+        let minutes = rows_in(root, &TEST, &tier(60), (hour / 60, now / 60 - 1))?;
+        ensure!(
+            minutes.len() == 30,
+            "The closed hour was not rolled up: {}",
+            minutes.len()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn older_and_newer_schemas_stay_readable() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let root = directory.path();
@@ -1179,14 +1212,21 @@ mod tests {
             )
         };
         ensure!(
-            stored(60, hour / 60 + 29)?,
-            "A closed minute was not rolled up."
+            !stored(60, hour / 60 + 29)?,
+            "A minute of the open hour was written."
         );
         ensure!(
-            stored(300, hour / 300 + 5)?,
-            "A closed five minutes were not rolled up."
+            !stored(300, hour / 300 + 5)?,
+            "Five minutes of the open hour were written."
         );
         ensure!(!stored(3_600, hour / HOUR)?, "The open hour was written.");
+        let minute = series(root, &TEST, 60, (hour / 60 + 29, hour / 60 + 29), &[])?;
+        ensure!(
+            minute
+                .get("a")
+                .is_some_and(|rows| rows.contains_key(&(hour / 60 + 29))),
+            "A minute of the open hour is missing from reads."
+        );
         let shown = series(root, &TEST, 3_600, (hour / HOUR, hour / HOUR), &[])?;
         let row = shown
             .get("a")
@@ -1194,10 +1234,6 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         ensure!(row[0] == Some(120), "The open hour shows {row:?}.");
-        let files = parent_inodes(root)?;
-        store(root, 30, &TEST, &entries, now)?;
-        let again = parent_inodes(root)?;
-        ensure!(files == again, "Unchanged parents were rewritten.");
         let later = hour + 2 * HOUR + 30;
         store(root, 30, &TEST, &[entry("a", hour + 2 * HOUR, 2)], later)?;
         ensure!(
@@ -1208,6 +1244,10 @@ mod tests {
             .remove(&("a".to_owned(), hour / HOUR))
             .unwrap_or_default();
         ensure!(row[0] == Some(120), "The caught-up hour holds {row:?}.");
+        let files = parent_inodes(root)?;
+        store(root, 30, &TEST, &[entry("a", hour + 2 * HOUR, 2)], later)?;
+        let again = parent_inodes(root)?;
+        ensure!(files == again, "Unchanged parents were rewritten.");
         Ok(())
     }
 }
