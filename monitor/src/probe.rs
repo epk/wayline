@@ -122,8 +122,8 @@ fn is_up(interface: &str) -> bool {
     sysfs_number(interface, "flags", 16).is_some_and(|flags| flags & 1 != 0)
 }
 
-pub struct Probe<'tunnel> {
-    tunnel: &'tunnel Tunnel,
+pub struct Probe {
+    tunnel: Tunnel,
     target: Ipv4Addr,
     interval: Duration,
     timeout: Duration,
@@ -143,9 +143,9 @@ pub struct Probe<'tunnel> {
     closed: VecDeque<Bucket>,
 }
 
-impl<'tunnel> Probe<'tunnel> {
+impl Probe {
     pub fn new(
-        tunnel: &'tunnel Tunnel,
+        tunnel: Tunnel,
         default_target: Ipv4Addr,
         next_due: Instant,
         interval: Duration,
@@ -153,8 +153,8 @@ impl<'tunnel> Probe<'tunnel> {
     ) -> Self {
         let per_bucket = BUCKET_SECONDS * 1000 / millis(interval).max(1) + 2;
         Self {
-            tunnel,
             target: tunnel.target.unwrap_or(default_target),
+            tunnel,
             interval,
             timeout,
             sample_hint: usize::try_from(per_bucket)
@@ -214,6 +214,23 @@ impl<'tunnel> Probe<'tunnel> {
                 .copied()
                 .collect(),
         }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.tunnel.id
+    }
+
+    pub fn retarget(&mut self, tunnel: Tunnel, default_target: Ipv4Addr) {
+        let target = tunnel.target.unwrap_or(default_target);
+        let moved = self.tunnel.interface != tunnel.interface
+            || self.tunnel.source != tunnel.source
+            || self.tunnel.mark != tunnel.mark
+            || self.target != target;
+        if moved {
+            self.reset_path(self.generation);
+            self.target = target;
+        }
+        self.tunnel = tunnel;
     }
 
     pub const fn saturated(&self) -> bool {
@@ -340,7 +357,8 @@ impl<'tunnel> Probe<'tunnel> {
     ) {
         self.advance_slot(now);
 
-        let interface = self.tunnel.interface.as_str();
+        let interface = self.tunnel.interface.clone();
+        let interface = interface.as_str();
         let Some(index) = ifindex(interface) else {
             self.reset_path(0);
             self.state = State::InterfaceUnavailable;
@@ -381,7 +399,7 @@ impl<'tunnel> Probe<'tunnel> {
             return;
         };
         if self.socket.is_none() {
-            let Ok(socket) = open_socket(self.tunnel, self.target, self.generation) else {
+            let Ok(socket) = open_socket(&self.tunnel, self.target, self.generation) else {
                 self.fail_slot(State::SocketSetupFailed);
                 return;
             };
@@ -579,9 +597,9 @@ mod tests {
         }
     }
 
-    fn probe(tunnel: &Tunnel) -> Probe<'_> {
+    fn probe(tunnel: &Tunnel) -> Probe {
         Probe::new(
-            tunnel,
+            tunnel.clone(),
             Ipv4Addr::new(1, 1, 1, 1),
             Instant::now(),
             Duration::from_secs(1),
@@ -637,5 +655,24 @@ mod tests {
         assert_eq!((sent, lost), (3, 3));
         assert!(series.history.iter().all(|sample| sample.us.is_none()));
         Ok(())
+    }
+
+    #[test]
+    fn retargeting_keeps_buckets_and_resets_only_a_moved_path() {
+        let mut probe = probe(&tunnel("apcli0"));
+        let bucket = probe.open_bucket(1_000);
+        bucket.sent = 3;
+        probe.close_buckets((1_000 + BUCKET_SECONDS) * 1000 + 1000);
+        probe.sent = 9;
+        let mut renamed = tunnel("apcli0");
+        renamed.name = "Renamed".into();
+        probe.retarget(renamed, Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(probe.sent, 9);
+        probe.retarget(tunnel("apclii0"), Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(probe.sent, 0);
+        let series = probe.series(Instant::now(), Some(0));
+        assert_eq!(series.interface, "apclii0");
+        assert_eq!(series.buckets.len(), 1);
+        assert_eq!(series.buckets[0].sent, 3);
     }
 }

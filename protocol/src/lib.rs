@@ -78,7 +78,7 @@ pub struct WifiConfig {
     pub interval_ms: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tunnel {
     pub id: String,
@@ -199,7 +199,7 @@ pub enum WifiState {
     Connected,
 }
 
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rate {
     pub kbps: Option<u32>,
     pub mode: Option<String>,
@@ -242,6 +242,45 @@ pub struct WifiSample {
     pub rx_kbps: Option<u32>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WifiIdentity {
+    pub ssid: String,
+    pub bssid: String,
+    pub channel: Option<u16>,
+    pub frequency: Option<u32>,
+    pub width: Option<u16>,
+}
+
+impl WifiIdentity {
+    #[must_use]
+    pub fn of(link: &WifiLink) -> Self {
+        Self {
+            ssid: link.ssid.clone(),
+            bssid: link.bssid.clone(),
+            channel: link.channel,
+            frequency: link.frequency,
+            width: link.width,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WifiChange {
+    pub at_ms: u64,
+    pub from: Option<WifiIdentity>,
+    pub to: WifiIdentity,
+}
+
+#[must_use]
+pub fn access_point_id(bssid: &str) -> u64 {
+    let hex: String = bssid.chars().filter(|c| *c != ':').collect();
+    if hex.len() == 12 {
+        u64::from_str_radix(&hex, 16).unwrap_or(0)
+    } else {
+        0
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct WifiStatus {
     pub state: WifiState,
@@ -251,6 +290,8 @@ pub struct WifiStatus {
     pub link: Option<WifiLink>,
     pub recent: Vec<WifiSample>,
     pub buckets: Vec<WifiBucket>,
+    #[serde(default)]
+    pub changes: Vec<WifiChange>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +325,8 @@ pub struct WifiBucket {
     pub roams: u32,
     #[serde(default)]
     pub uptime_ms: u64,
+    #[serde(default)]
+    pub ap: u64,
 }
 
 fn lower<T: Ord>(left: Option<T>, right: Option<T>) -> Option<T> {
@@ -332,6 +375,7 @@ impl WifiBucket {
             disconnects: 0,
             roams: 0,
             uptime_ms: 0,
+            ap: 0,
         }
     }
 

@@ -277,10 +277,24 @@ export type WifiKey =
   | 'disconnects'
   | 'roams';
 
+/** One access point's share of a range, from get_wifi_history. */
+export interface WifiNetwork {
+  /** `ap:<12 hex digits>`, or `upstream` for history from before access points were told apart. */
+  id: string;
+  bssid: string | null;
+  ssid: string | null;
+  channel: string | null;
+  connectedSeconds: number;
+  first: number;
+  last: number;
+  summary: Partial<Record<WifiKey, Num>>;
+}
+
 export interface WifiDoc extends Doc {
   summary: Partial<Record<WifiKey, Num>>;
   columns: Partial<Record<WifiKey, Column>>;
   events: ChangeEvent[];
+  networks: WifiNetwork[];
 }
 
 export interface TelemetryInterface {

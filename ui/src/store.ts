@@ -433,6 +433,7 @@ const wifiShape = docShape<WifiDoc>((doc) => {
   doc.summary = doc.summary || {};
   doc.columns = doc.columns || {};
   doc.events = list(doc.events);
+  doc.networks = list(doc.networks);
 });
 const telemetryShape = docShape<TelemetryDoc>((doc) => {
   doc.system = doc.system || ({} as TelemetryDoc['system']);

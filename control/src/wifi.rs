@@ -111,6 +111,7 @@ impl crate::encoding::Document for Response {
         meta.insert("count".into(), self.count.into());
         meta.insert("summary".into(), serde_json::to_value(&self.summary)?);
         meta.insert("events".into(), serde_json::to_value(&self.events)?);
+        meta.insert("networks".into(), serde_json::to_value(&self.networks)?);
         let c = &self.columns;
         let float =
             |name: &str, values: &[Option<f64>]| (name.to_owned(), Column::F64(values.to_vec()));
@@ -167,6 +168,19 @@ impl crate::encoding::Document for Response {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Network {
+    id: String,
+    bssid: Option<String>,
+    ssid: Option<String>,
+    channel: Option<String>,
+    connected_seconds: u64,
+    first: u64,
+    last: u64,
+    summary: Point,
+}
+
+#[derive(Serialize)]
 pub struct Response {
     start: u64,
     step: u64,
@@ -174,6 +188,7 @@ pub struct Response {
     summary: Point,
     columns: Columns,
     events: Vec<Event>,
+    networks: Vec<Network>,
 }
 
 #[derive(Serialize)]
@@ -266,11 +281,30 @@ fn bucket(at: u64, row: &[Option<i64>]) -> WifiBucket {
     }
 }
 
+pub fn series_key(ap: u64) -> String {
+    if ap == 0 {
+        UPSTREAM.into()
+    } else {
+        format!("ap:{ap:012x}")
+    }
+}
+
+pub fn bssid_of(key: &str) -> Option<String> {
+    let hex = key.strip_prefix("ap:")?;
+    (hex.len() == 12 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| {
+        hex.as_bytes()
+            .chunks(2)
+            .map(|pair| String::from_utf8_lossy(pair).into_owned())
+            .collect::<Vec<_>>()
+            .join(":")
+    })
+}
+
 pub fn entries(buckets: &[WifiBucket]) -> Vec<Entry> {
     buckets
         .iter()
         .map(|item| Entry {
-            link: UPSTREAM.into(),
+            link: series_key(item.ap),
             at: item.at,
             row: row(item),
         })
@@ -354,8 +388,8 @@ fn periods(
     first: u64,
     last: u64,
     live: &[WifiBucket],
-) -> Result<BTreeMap<u64, WifiBucket>> {
-    let mut found = columnar::series(
+) -> Result<BTreeMap<String, BTreeMap<u64, WifiBucket>>> {
+    let found = columnar::series(
         &history::root(config),
         &KIND,
         step,
@@ -363,11 +397,95 @@ fn periods(
         &entries(live),
     )?;
     Ok(found
-        .remove(UPSTREAM)
-        .unwrap_or_default()
         .into_iter()
-        .map(|(period, row)| (period, bucket(period, &row)))
+        .map(|(key, rows)| {
+            let buckets = rows
+                .into_iter()
+                .map(|(period, row)| (period, bucket(period, &row)))
+                .collect();
+            (key, buckets)
+        })
         .collect())
+}
+
+struct Label {
+    ssid: String,
+    channel: Option<String>,
+    bssid: String,
+    from: u64,
+}
+
+fn access_point_names(config: &Settings) -> BTreeMap<String, Label> {
+    let path = crate::dimensions::path(config);
+    let rows = if path.exists() {
+        crate::dimensions::read(&path).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut names: BTreeMap<String, Label> = BTreeMap::new();
+    for row in rows
+        .into_iter()
+        .filter(|row| row.table == KIND.name && row.kind == crate::dimensions::ACCESS_POINT)
+    {
+        if names
+            .get(&row.series)
+            .is_none_or(|label| row.valid_from >= label.from)
+        {
+            names.insert(
+                row.series,
+                Label {
+                    ssid: row.name,
+                    channel: row.target,
+                    bssid: row.subject,
+                    from: row.valid_from,
+                },
+            );
+        }
+    }
+    names
+}
+
+fn networks(
+    config: &Settings,
+    step: u64,
+    by_series: &BTreeMap<String, BTreeMap<u64, WifiBucket>>,
+) -> Vec<Network> {
+    let names = access_point_names(config);
+    let mut found: Vec<Network> = by_series
+        .iter()
+        .filter_map(|(key, buckets)| {
+            let used: Vec<(&u64, &WifiBucket)> = buckets
+                .iter()
+                .filter(|(_, item)| item.samples > 0)
+                .collect();
+            let (first, last) = (*used.first()?.0, *used.last()?.0);
+            let mut total = WifiBucket::empty(first);
+            for (_, item) in &used {
+                total.merge(item);
+            }
+            let seconds = u64::from(total.connected) * crate::router::WIFI_INTERVAL_MS / 1_000;
+            let label = names.get(key);
+            Some(Network {
+                id: key.clone(),
+                bssid: label
+                    .map(|label| label.bssid.clone())
+                    .or_else(|| bssid_of(key)),
+                ssid: label.map(|label| label.ssid.clone()),
+                channel: label.and_then(|label| label.channel.clone()),
+                connected_seconds: seconds,
+                first: first * step * 1_000,
+                last: last * step * 1_000,
+                summary: point(Some(&total), seconds.max(1)),
+            })
+        })
+        .collect();
+    found.sort_by(|left, right| {
+        right
+            .connected_seconds
+            .cmp(&left.connected_seconds)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    found
 }
 
 pub fn query(config: &Settings, query: &Query) -> Result<Response> {
@@ -384,7 +502,16 @@ fn query_inner(config: &Settings, query: &Query) -> Result<Response> {
     )?;
     let (first, last) = (query.start / 1_000 / step, query.end / 1_000 / step);
     let (_, live) = history::fresh()?;
-    let periods = periods(config, step, first, last, &live)?;
+    let by_series = periods(config, step, first, last, &live)?;
+    let mut periods: BTreeMap<u64, WifiBucket> = BTreeMap::new();
+    for buckets in by_series.values() {
+        for (period, item) in buckets {
+            periods
+                .entry(*period)
+                .or_insert_with(|| WifiBucket::empty(*period))
+                .merge(item);
+        }
+    }
     let mut total = WifiBucket::empty(first);
     for item in periods.values() {
         total.merge(item);
@@ -404,6 +531,7 @@ fn query_inner(config: &Settings, query: &Query) -> Result<Response> {
         summary: point(Some(&total), (last - first + 1) * step),
         columns,
         events,
+        networks: networks(config, step, &by_series),
     })
 }
 
@@ -422,6 +550,10 @@ const fn band(frequency: u32) -> &'static str {
 }
 
 pub fn channel(link: &WifiLink) -> String {
+    channel_of(&wayline_protocol::WifiIdentity::of(link))
+}
+
+pub fn channel_of(link: &wayline_protocol::WifiIdentity) -> String {
     let mut parts = Vec::new();
     if let Some(channel) = link.channel {
         parts.push(channel.to_string());
@@ -448,7 +580,7 @@ fn reason(enabled: bool, status: Option<&WifiStatus>) -> String {
     };
     match status.state {
         WifiState::Starting => "The monitor is starting.".into(),
-        WifiState::QueryFailed => "The router's Wi-Fi status service (iwinfo) did not answer.".into(),
+        WifiState::QueryFailed => "The kernel's Wi-Fi interface (nl80211) did not answer.".into(),
         WifiState::NoClientInterface => {
             "The router has no Wi-Fi client interface. Connect to a Wi-Fi network as a repeater in the router's Internet page.".into()
         }
@@ -511,6 +643,18 @@ pub const fn disabled() -> View {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn access_point_series_keys_round_trip() {
+        let ap = wayline_protocol::access_point_id("76:fa:ce:8a:c4:b3");
+        assert_eq!(super::series_key(ap), "ap:76face8ac4b3");
+        assert_eq!(
+            super::bssid_of(&super::series_key(ap)).as_deref(),
+            Some("76:fa:ce:8a:c4:b3")
+        );
+        assert_eq!(super::series_key(0), super::UPSTREAM);
+        assert_eq!(super::bssid_of(super::UPSTREAM), None);
+    }
+
     use super::{KIND, entries, point};
     use crate::columnar;
     use crate::history::{HOUR, LEVELS};

@@ -4,6 +4,7 @@
 compile_error!("waylined requires Linux. Cross-compile the ARM64 musl executable through devenv.");
 
 mod config;
+mod nl80211;
 mod probe;
 mod route;
 mod telemetry;
@@ -17,7 +18,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use wayline_protocol::{Config, MAX_STATUS, Status};
 
@@ -26,6 +27,7 @@ const MAX_REQUEST: usize = 64;
 const REQUEST_WINDOW: Duration = Duration::from_millis(200);
 const REPLY_WINDOW: Duration = Duration::from_secs(2);
 const IDLE_WAIT: Duration = Duration::from_secs(1);
+const CONFIG_CHECK: Duration = Duration::from_secs(1);
 
 struct Endpoint {
     listener: UnixListener,
@@ -106,9 +108,9 @@ struct Client {
     deadline: Instant,
 }
 
-struct Monitor<'config> {
-    config: &'config Config,
-    probes: Vec<Probe<'config>>,
+struct Monitor {
+    config: Config,
+    probes: Vec<Probe>,
     started: Instant,
     nonce: [u8; 16],
     run_id: String,
@@ -118,8 +120,8 @@ struct Monitor<'config> {
     telemetry: Option<telemetry::Telemetry>,
 }
 
-impl<'config> Monitor<'config> {
-    fn try_new(config: &'config Config) -> io::Result<Self> {
+impl Monitor {
+    fn try_new(config: Config) -> io::Result<Self> {
         let started = Instant::now();
         let interval = Duration::from_millis(config.interval_ms);
         let timeout = Duration::from_millis(config.timeout_ms);
@@ -130,7 +132,7 @@ impl<'config> Monitor<'config> {
             .zip(0_u32..)
             .map(|(tunnel, slot)| {
                 Probe::new(
-                    tunnel,
+                    tunnel.clone(),
                     config.target,
                     started + step * slot,
                     interval,
@@ -140,6 +142,12 @@ impl<'config> Monitor<'config> {
             .collect();
         let mut nonce = [0_u8; 16];
         File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+        let wifi = config.wifi.as_ref().map(wifi::Wifi::start).transpose()?;
+        let telemetry = config
+            .telemetry
+            .as_ref()
+            .map(telemetry::Telemetry::start)
+            .transpose()?;
         Ok(Self {
             config,
             probes,
@@ -155,13 +163,73 @@ impl<'config> Monitor<'config> {
                 .map(|id| id.trim().chars().filter(char::is_ascii_hexdigit).collect())
                 .unwrap_or_default(),
             reply_hint: 0,
-            wifi: config.wifi.as_ref().map(wifi::Wifi::start).transpose()?,
-            telemetry: config
-                .telemetry
-                .as_ref()
-                .map(telemetry::Telemetry::start)
-                .transpose()?,
+            wifi,
+            telemetry,
         })
+    }
+
+    fn reload(&mut self, config: Config) -> io::Result<()> {
+        let now = Instant::now();
+        let interval = Duration::from_millis(config.interval_ms);
+        let timeout = Duration::from_millis(config.timeout_ms);
+        let same_schedule = config.interval_ms == self.config.interval_ms
+            && config.timeout_ms == self.config.timeout_ms;
+        let step = interval / u32::try_from(config.tunnels.len()).unwrap_or(1).max(1);
+        let mut old = std::mem::take(&mut self.probes);
+        self.probes = config
+            .tunnels
+            .iter()
+            .zip(0_u32..)
+            .map(|(tunnel, slot)| {
+                let found = old
+                    .iter()
+                    .position(|probe| probe.id() == tunnel.id)
+                    .filter(|_| same_schedule);
+                if let Some(index) = found {
+                    let mut probe = old.swap_remove(index);
+                    probe.retarget(tunnel.clone(), config.target);
+                    probe
+                } else {
+                    Probe::new(
+                        tunnel.clone(),
+                        config.target,
+                        now + step * slot,
+                        interval,
+                        timeout,
+                    )
+                }
+            })
+            .collect();
+        let running = self.wifi.take();
+        self.wifi = match (&config.wifi, running) {
+            (Some(wanted), Some(running)) if running.interval_ms() == wanted.interval_ms => {
+                Some(running)
+            }
+            (wanted, running) => {
+                if let Some(running) = running {
+                    running.stop();
+                }
+                wanted.as_ref().map(wifi::Wifi::start).transpose()?
+            }
+        };
+        let running = self.telemetry.take();
+        self.telemetry = match (&config.telemetry, running) {
+            (Some(wanted), Some(running)) if running.interval_ms() == wanted.interval_ms => {
+                running.retrack(&wanted.interfaces);
+                Some(running)
+            }
+            (wanted, running) => {
+                if let Some(running) = running {
+                    running.stop();
+                }
+                wanted
+                    .as_ref()
+                    .map(telemetry::Telemetry::start)
+                    .transpose()?
+            }
+        };
+        self.config = config;
+        Ok(())
     }
 
     fn snapshot(&mut self, since: Option<u64>) -> io::Result<Vec<u8>> {
@@ -304,7 +372,7 @@ enum Ready {
 
 fn wait_ready(
     endpoint: &Endpoint,
-    probes: &[Probe<'_>],
+    probes: &[Probe],
     clients: &[Client],
     wait: Duration,
 ) -> io::Result<Vec<Ready>> {
@@ -369,9 +437,21 @@ fn accept_clients(endpoint: &Endpoint, clients: &mut Vec<Client>, now: Instant) 
     Ok(())
 }
 
-fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>) -> io::Result<()> {
+fn signature(path: &Path) -> Option<(u64, u64, i64, i64)> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec()))
+}
+
+fn serve(
+    config: Config,
+    config_path: &Path,
+    socket_path: PathBuf,
+    run_for: Option<Duration>,
+) -> io::Result<()> {
     let endpoint = Endpoint::bind(socket_path)?;
     let routes = route::RouteLookup::try_new()?;
+    let mut seen = signature(config_path);
+    let mut checked = Instant::now();
     let mut monitor = Monitor::try_new(config)?;
     let stop_at = run_for.map(|duration| monitor.started + duration);
     let mut clients: Vec<Client> = Vec::with_capacity(MAX_CLIENTS);
@@ -381,6 +461,17 @@ fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>) -> io
         let now = Instant::now();
         if stop_at.is_some_and(|at| now >= at) {
             return Ok(());
+        }
+        if now.saturating_duration_since(checked) >= CONFIG_CHECK {
+            checked = now;
+            let current = signature(config_path);
+            if current != seen {
+                seen = current;
+                match config::read(config_path) {
+                    Ok(config) => monitor.reload(config)?,
+                    Err(error) => eprintln!("waylined: keeping the running configuration: {error}"),
+                }
+            }
         }
         let wall_ms = probe::unix_millis();
         for probe in &mut monitor.probes {
@@ -411,6 +502,7 @@ fn serve(config: &Config, socket_path: PathBuf, run_for: Option<Duration>) -> io
             .map(Probe::deadline)
             .chain(clients.iter().map(|client| client.deadline))
             .chain(stop_at)
+            .chain([checked + CONFIG_CHECK])
             .min()
             .unwrap_or(now + IDLE_WAIT);
         let wait = deadline.saturating_duration_since(Instant::now());
@@ -474,8 +566,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     match command.as_str() {
         "monitor" => {
-            let config = config::read(&config_path.ok_or("--config is required")?)?;
-            serve(&config, socket_path, run_for)?;
+            let path = config_path.ok_or("--config is required")?;
+            let config = config::read(&path)?;
+            serve(config, &path, socket_path, run_for)?;
         }
         "status" if config_path.is_none() && run_for.is_none() => {
             let mut stream = UnixStream::connect(socket_path)?;

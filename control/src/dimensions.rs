@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const FILE: &str = "dimensions.parquet";
+pub const ACCESS_POINT: &str = "access_point";
 const LIMIT: usize = 4 * 1024 * 1024;
 const SCHEMA: &str = "message dimensions { required binary table (UTF8); required binary series (UTF8); required binary kind (UTF8); required binary subject (UTF8); required binary name (UTF8); optional binary target (UTF8); optional binary device (UTF8); required int64 valid_from (TIMESTAMP(MILLIS,true)); optional int64 valid_to (TIMESTAMP(MILLIS,true)); }";
 
@@ -139,6 +140,40 @@ pub fn current(config: &Settings, inventory: &Inventory) -> Vec<Dimension> {
             Some(&counter.device),
         ));
     }
+    let mut seen = BTreeSet::new();
+    found.retain(|item| seen.insert(item.key()));
+    found
+}
+
+pub fn access_points(status: Option<&wayline_protocol::WifiStatus>) -> Vec<Dimension> {
+    let Some(status) = status else {
+        return Vec::new();
+    };
+    let mut found: Vec<Dimension> = status
+        .changes
+        .iter()
+        .map(|change| change.to.clone())
+        .chain(status.link.iter().map(wayline_protocol::WifiIdentity::of))
+        .filter_map(|identity| {
+            let ap = wayline_protocol::access_point_id(&identity.bssid);
+            (ap != 0).then(|| {
+                let name = if identity.ssid.is_empty() {
+                    "a hidden network".to_owned()
+                } else {
+                    identity.ssid.clone()
+                };
+                row(
+                    crate::wifi::KIND.name,
+                    crate::wifi::series_key(ap),
+                    ACCESS_POINT,
+                    (&identity.bssid, &name),
+                    Some(crate::wifi::channel_of(&identity)),
+                    None,
+                )
+            })
+        })
+        .collect();
+    found.reverse();
     let mut seen = BTreeSet::new();
     found.retain(|item| seen.insert(item.key()));
     found
@@ -309,7 +344,7 @@ pub fn merge(previous: Vec<Dimension>, current: Vec<Dimension>, now: u64) -> Vec
         }
     }
     for row in &mut rows {
-        if row.valid_to.is_none() && !seen.contains(&row.key()) {
+        if row.valid_to.is_none() && !seen.contains(&row.key()) && row.kind != ACCESS_POINT {
             row.valid_to = Some(now);
         }
     }
@@ -335,11 +370,11 @@ pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
         } else {
             Vec::new()
         };
-        let rows = merge(
-            previous.clone(),
-            current(config, inventory),
-            runtime::now() * 1_000,
-        );
+        let mut labels = current(config, inventory);
+        if config.upstream_wifi {
+            labels.extend(access_points(runtime::current().wifi.as_ref()));
+        }
+        let rows = merge(previous.clone(), labels, runtime::now() * 1_000);
         if rows == previous {
             return Ok(());
         }
@@ -365,6 +400,55 @@ mod tests {
             valid_from: 0,
             valid_to: None,
         }
+    }
+
+    #[test]
+    fn access_points_stay_open_out_of_range_and_take_the_newest_label() -> Result<()> {
+        use wayline_protocol::{WifiChange, WifiIdentity, WifiState, WifiStatus};
+        let identity = |ssid: &str, bssid: &str, channel: u16| WifiIdentity {
+            ssid: ssid.into(),
+            bssid: bssid.into(),
+            channel: Some(channel),
+            frequency: Some(5_200),
+            width: Some(80),
+        };
+        let status = WifiStatus {
+            state: WifiState::Connected,
+            interface: None,
+            candidates: Vec::new(),
+            sample_age_ms: None,
+            link: None,
+            recent: Vec::new(),
+            buckets: Vec::new(),
+            changes: vec![
+                WifiChange {
+                    at_ms: 1,
+                    from: None,
+                    to: identity("A", "aa:00:00:00:00:01", 36),
+                },
+                WifiChange {
+                    at_ms: 2,
+                    from: None,
+                    to: identity("B", "bb:00:00:00:00:01", 40),
+                },
+                WifiChange {
+                    at_ms: 3,
+                    from: None,
+                    to: identity("A", "aa:00:00:00:00:01", 44),
+                },
+            ],
+        };
+        let found = super::access_points(Some(&status));
+        ensure!(found.len() == 2, "Expected two access points: {found:?}");
+        let a = found
+            .iter()
+            .find(|row| row.series == "ap:aa0000000001")
+            .ok_or_else(|| anyhow::anyhow!("missing A"))?;
+        ensure!(a.name == "A" && a.target.as_deref() == Some("44 · 5 GHz · 80 MHz"));
+        let first = merge(Vec::new(), found, 1_000);
+        let later = merge(first.clone(), Vec::new(), 2_000);
+        ensure!(later == first, "Out-of-range access points were closed.");
+        Ok(())
     }
 
     #[test]

@@ -3,6 +3,7 @@ use crate::wifi::valid_device;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -186,6 +187,13 @@ impl<H: Host> Sampler<H> {
         }
     }
 
+    pub fn set_counters(&mut self, counters: Vec<Counter>) {
+        self.counters = counters
+            .into_iter()
+            .filter(|counter| valid_device(&counter.device))
+            .collect();
+    }
+
     pub fn observe(&mut self) -> Observation {
         let host = &mut self.host;
         let temperature = host
@@ -288,7 +296,47 @@ fn spread_load(sum: u64, readings: u32, samples: u32) -> u64 {
         .unwrap_or(0)
 }
 
+fn track(counter: &Counter) -> Track {
+    Track {
+        counter: counter.clone(),
+        previous: None,
+        live: Link {
+            id: counter.id.clone(),
+            name: counter.name.clone(),
+            device: counter.device.clone(),
+            kind: counter.kind.clone(),
+            ..Link::default()
+        },
+        handshake: Handshake::default(),
+        open: None,
+        closed: VecDeque::new(),
+    }
+}
+
 impl Record {
+    pub fn retrack(&mut self, counters: &[Counter]) {
+        let mut old = std::mem::take(&mut self.tracks);
+        self.tracks = counters
+            .iter()
+            .filter(|counter| valid_device(&counter.device))
+            .map(|counter| {
+                let Some(index) = old.iter().position(|item| item.counter.id == counter.id) else {
+                    return track(counter);
+                };
+                let mut kept = old.swap_remove(index);
+                if kept.counter.device != counter.device {
+                    kept.previous = None;
+                    kept.handshake = Handshake::default();
+                }
+                kept.live.name.clone_from(&counter.name);
+                kept.live.device.clone_from(&counter.device);
+                kept.live.kind.clone_from(&counter.kind);
+                kept.counter = counter.clone();
+                kept
+            })
+            .collect();
+    }
+
     pub fn new(counters: &[Counter]) -> Self {
         Self {
             sampled: None,
@@ -301,20 +349,7 @@ impl Record {
             tracks: counters
                 .iter()
                 .filter(|counter| valid_device(&counter.device))
-                .map(|counter| Track {
-                    counter: counter.clone(),
-                    previous: None,
-                    live: Link {
-                        id: counter.id.clone(),
-                        name: counter.name.clone(),
-                        device: counter.device.clone(),
-                        kind: counter.kind.clone(),
-                        ..Link::default()
-                    },
-                    handshake: Handshake::default(),
-                    open: None,
-                    closed: VecDeque::new(),
-                })
+                .map(track)
                 .collect(),
         }
     }
@@ -504,18 +539,40 @@ impl Record {
 
 pub struct Telemetry {
     record: Arc<Mutex<Record>>,
+    pending: Arc<Mutex<Option<Vec<Counter>>>>,
+    stop: Arc<AtomicBool>,
+    interval_ms: u64,
 }
 
 impl Telemetry {
     pub fn start(config: &TelemetryConfig) -> io::Result<Self> {
         let record = Arc::new(Mutex::new(Record::new(&config.interfaces)));
-        let shared = Arc::clone(&record);
+        let pending = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let shared = (Arc::clone(&record), Arc::clone(&pending), Arc::clone(&stop));
         let interval = Duration::from_millis(config.interval_ms);
         let sampler = Sampler::new(Proc, config.interfaces.clone());
         thread::Builder::new()
             .name("telemetry".into())
-            .spawn(move || run(&shared, sampler, interval))?;
-        Ok(Self { record })
+            .spawn(move || run(&shared.0, &shared.1, &shared.2, sampler, interval))?;
+        Ok(Self {
+            record,
+            pending,
+            stop,
+            interval_ms: config.interval_ms,
+        })
+    }
+
+    pub const fn interval_ms(&self) -> u64 {
+        self.interval_ms
+    }
+
+    pub fn retrack(&self, counters: &[Counter]) {
+        *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(counters.to_vec());
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 
     pub fn status(&self, now: Instant, since: Option<u64>) -> TelemetryStatus {
@@ -526,9 +583,26 @@ impl Telemetry {
     }
 }
 
-fn run<H: Host>(record: &Mutex<Record>, mut sampler: Sampler<H>, interval: Duration) {
+fn run<H: Host>(
+    record: &Mutex<Record>,
+    pending: &Mutex<Option<Vec<Counter>>>,
+    stop: &AtomicBool,
+    mut sampler: Sampler<H>,
+    interval: Duration,
+) {
     let mut next = Instant::now();
-    loop {
+    while !stop.load(Ordering::Relaxed) {
+        let update = pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(counters) = update {
+            sampler.set_counters(counters.clone());
+            record
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retrack(&counters);
+        }
         let observation = sampler.observe();
         record.lock().unwrap_or_else(PoisonError::into_inner).apply(
             Instant::now(),

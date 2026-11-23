@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "wayline-control"
-version = "0.1.0-alpha.26"
+version = "0.1.0-alpha.27"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "waylined"
-version = "0.1.0-alpha.26"
+version = "0.1.0-alpha.27"
 dependencies = [
  "netlink-packet-core",
  "pnet_packet",

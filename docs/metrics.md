@@ -9,7 +9,7 @@ shows the inputs next to each score.
 | Source | Interval | Bucket | Kept (history setting 7 days) |
 | --- | --- | --- | --- |
 | ICMP probes per path and destination | 1–60 s (setting) | 15 s | 15 s for 6 h, 1 min for 3 days, 5 min for 7 days |
-| Upstream Wi-Fi (`iwinfo`) | 5 s | 15 s | same tiers |
+| Upstream Wi-Fi (nl80211) | 5 s, and at each connect or disconnect | 15 s | same tiers |
 | Router and interface telemetry | 5 s | 15 s | same tiers |
 
 With 30 days, 5-minute and 1-hour tiers keep 30 days. With 1 day, 1-minute
@@ -237,8 +237,16 @@ Bands: 4.3 and above excellent, 4.0–4.3 good, 3.6–4.0 fair, below 3.6 poor.
 
 ## Upstream Wi-Fi
 
-Read from `ubus call iwinfo info|assoclist|survey` for the client-mode
-interface, plus `/sys/class/net/<if>/statistics`.
+Read straight from the kernel over generic netlink (nl80211), without ubus or
+`iwinfo`: `GET_INTERFACE` for every station-mode interface (SSID, frequency,
+width, transmit power), `GET_STATION` for the access point it is associated
+with (signal, rates, frame counters, connected time), `GET_SURVEY` for the
+serving channel (noise, busy, receive and transmit time) and `GET_SCAN` for the
+associated BSS (its security, from the RSN or WPA element). Interface byte
+counters come from `/sys/class/net/<if>/statistics` and the driver name from
+`/sys/class/net/<if>/device/driver`. The monitor also listens to nl80211
+connect, roam and disconnect events and to rtnetlink link changes, and samples
+at once when one arrives.
 
 - **Signal, noise**: dBm. Values outside −110..−1 (signal) or −120..−50 (noise)
   are driver placeholders and are dropped. **SNR** = signal − noise.
@@ -250,9 +258,31 @@ interface, plus `/sys/class/net/<if>/statistics`.
 - **Channel busy** = Δbusy time / Δactive time from the channel survey of the
   serving frequency. **Own airtime** = Δ(rx + tx time) / Δactive.
   **Others** = busy − own.
-- **Drop**: connected → disconnected, a silent reassociation (connected time
-  went backwards), or a change of network. **Roam**: new access point, same
-  network.
+- **Access point**: the station the client interface is associated with, from
+  `GET_STATION`. An interface counts as connected only while it has one, so an
+  idle radio that keeps an old SSID or channel is not mistaken for a link.
+- **Drop**: the connection is lost (counted once per gap), the same access
+  point reassociates (connected time went backwards), or the repeater moves to
+  another network without a visible gap. **Roam**: another access point of the
+  same network, with or without a gap. The last network is remembered across a
+  gap, so a reconnect is told apart from a roam or a change of network.
+- **Per access point**: each 15-second bucket is filed under the access point
+  that had most of its connected samples (ties keep the first). A bucket with
+  no connection is filed under the access point that was lost. Coarser tiers
+  keep the access points apart, so per-network summaries stay exact to 15
+  seconds. History saved before 0.1.0-alpha.27 has no access point.
+- **Changes**: the monitor logs every change of network, access point or
+  channel when it happens (at the event, or at the next 5-second sample), and
+  the collector turns them into change events at those times, so stays shorter
+  than a minute are not lost. Counts from event samples are added to the next
+  5-second sample's bucket, so every bucket still holds evenly spaced samples.
+- **Reload**: when the uplink changes, the router's hotplug makes the
+  controller rewrite the monitor configuration. The monitor checks the file
+  every second and applies it in place, keeping every bucket and its Wi-Fi
+  state; a probe whose interface or source address changed starts a new path
+  and its pending probes count as lost.
+- **Throughput** (`upload`, `download`) is bytes over the whole bucket. A speed
+  test shorter than the bucket reads lower than its own result.
 
 Default colour bands (heuristics, as used by common Wi-Fi survey guidance):
 

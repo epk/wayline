@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::iter;
 use std::path::Path;
+use wayline_protocol::WifiIdentity;
 
 pub const RECENT: usize = 50;
 
@@ -235,6 +236,26 @@ pub fn diff(at: u64, stored: &mut BTreeMap<String, String>, facts: &[Fact]) -> (
     (events, changed)
 }
 
+const WIFI_CURSOR: &str = "wifi:cursor";
+
+fn wifi_fact(link: &WifiIdentity) -> Fact<'static> {
+    let network = if link.ssid.is_empty() {
+        "a hidden network".to_owned()
+    } else {
+        link.ssid.clone()
+    };
+    fact(
+        "wifi:upstream".into(),
+        wifi::SUBJECT,
+        "Upstream Wi-Fi",
+        [
+            ("network", network),
+            ("access_point", link.bssid.clone()),
+            ("channel", wifi::channel_of(link)),
+        ],
+    )
+}
+
 pub fn record(config: &Settings, inventory: &Inventory) -> Result<()> {
     runtime::writing("history", || record_inner(config, inventory))
 }
@@ -269,27 +290,40 @@ fn record_inner(config: &Settings, inventory: &Inventory) -> Result<()> {
             [("egress", ip.clone())],
         ))
     }));
+    let mut added = Vec::new();
+    let mut changed = false;
     if config.upstream_wifi
-        && let Some(status) = parts.wifi
-        && let Some(link) = status.link
+        && let Some(status) = parts.wifi.as_ref()
     {
-        let network = if link.ssid.is_empty() {
-            "a hidden network".to_owned()
-        } else {
-            link.ssid.clone()
-        };
-        current.push(fact(
-            "wifi:upstream".into(),
-            wifi::SUBJECT,
-            "Upstream Wi-Fi",
-            [
-                ("network", network),
-                ("access_point", link.bssid.clone()),
-                ("channel", wifi::channel(&link)),
-            ],
-        ));
+        if !stored.contains_key(WIFI_CURSOR) {
+            stored.remove("wifi:upstream");
+        }
+        let cursor: u64 = stored
+            .get(WIFI_CURSOR)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let mut newest = cursor;
+        for change in status
+            .changes
+            .iter()
+            .filter(|change| change.at_ms > cursor && change.at_ms >= history::MIN_CLOCK * 1_000)
+        {
+            let (found, moved) = diff(change.at_ms, &mut stored, &[wifi_fact(&change.to)]);
+            added.extend(found);
+            changed |= moved;
+            newest = newest.max(change.at_ms);
+        }
+        if newest != cursor {
+            stored.insert(WIFI_CURSOR.into(), newest.to_string());
+            changed = true;
+        }
+        if let Some(link) = &status.link {
+            current.push(wifi_fact(&WifiIdentity::of(link)));
+        }
     }
-    let (added, changed) = diff(runtime::now() * 1000, &mut stored, &current);
+    let (found, moved) = diff(runtime::now() * 1000, &mut stored, &current);
+    added.extend(found);
+    changed |= moved;
     if changed {
         runtime::store(&facts_path, &stored)?;
     }
@@ -380,6 +414,46 @@ mod tests {
         ensure!(events.len() == 1 && events[0].kind == "egress");
         ensure!(
             events[0].text == "Tunnel A public exit IP changed from 203.0.113.1 to 203.0.113.2."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn logged_wifi_changes_become_events_at_their_own_times() -> Result<()> {
+        use wayline_protocol::WifiIdentity;
+        let at = |ssid: &str, bssid: &str, channel: u16, frequency: u32| WifiIdentity {
+            ssid: ssid.into(),
+            bssid: bssid.into(),
+            channel: Some(channel),
+            frequency: Some(frequency),
+            width: Some(80),
+        };
+        let log = [
+            (1_000, at("candelaria200", "76:fa:ce:8a:c4:b3", 40, 5_200)),
+            (13_000, at("candelaria200", "76:fa:ce:8a:f2:83", 40, 5_200)),
+            (21_000, at("candelaria300", "42:aa:30:7d:3d:ef", 36, 5_180)),
+            (29_000, at("candelaria300", "42:aa:30:7d:3d:ef", 4, 2_427)),
+        ];
+        let mut stored = BTreeMap::new();
+        let mut events = Vec::new();
+        for (time, identity) in &log {
+            events.extend(diff(*time, &mut stored, &[super::wifi_fact(identity)]).0);
+        }
+        let seen: Vec<(u64, &str)> = events
+            .iter()
+            .map(|event| (event.at, event.kind.as_str()))
+            .collect();
+        ensure!(
+            seen == [
+                (13_000, "access_point"),
+                (21_000, "network"),
+                (29_000, "channel")
+            ],
+            "Unexpected events: {seen:?}"
+        );
+        ensure!(
+            events[0].text
+                == "Upstream Wi-Fi access point changed from 76:fa:ce:8a:c4:b3 to 76:fa:ce:8a:f2:83."
         );
         Ok(())
     }
