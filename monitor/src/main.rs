@@ -7,6 +7,7 @@ mod config;
 mod nl80211;
 mod probe;
 mod route;
+mod sqm;
 mod telemetry;
 mod wifi;
 
@@ -118,6 +119,7 @@ struct Monitor {
     reply_hint: usize,
     wifi: Option<wifi::Wifi>,
     telemetry: Option<telemetry::Telemetry>,
+    sqm: Option<sqm::Controller<sqm::LinuxShaper>>,
 }
 
 impl Monitor {
@@ -148,6 +150,10 @@ impl Monitor {
             .as_ref()
             .map(telemetry::Telemetry::start)
             .transpose()?;
+        let sqm = config
+            .sqm
+            .clone()
+            .map(|sqm| sqm::Controller::new(sqm, sqm::LinuxShaper));
         Ok(Self {
             config,
             probes,
@@ -165,6 +171,7 @@ impl Monitor {
             reply_hint: 0,
             wifi,
             telemetry,
+            sqm,
         })
     }
 
@@ -228,6 +235,12 @@ impl Monitor {
                     .transpose()?
             }
         };
+        self.sqm = match (&config.sqm, self.sqm.take()) {
+            (Some(wanted), Some(running)) if running.config() == wanted => Some(running),
+            (wanted, _) => wanted
+                .clone()
+                .map(|sqm| sqm::Controller::new(sqm, sqm::LinuxShaper)),
+        };
         self.config = config;
         Ok(())
     }
@@ -253,6 +266,10 @@ impl Monitor {
                 .telemetry
                 .as_ref()
                 .map(|telemetry| telemetry.status(now, since)),
+            sqm: self
+                .sqm
+                .as_ref()
+                .map(|controller| controller.status(now, since)),
         };
         let data = fit(&mut status, self.reply_hint)?;
         self.reply_hint = data.len();
@@ -291,6 +308,11 @@ fn fit(status: &mut Status, hint: usize) -> io::Result<Vec<u8>> {
                             .flat_map(|link| link.buckets.iter().map(|bucket| bucket.at)),
                     )
             }))
+            .chain(status.sqm.iter().flat_map(|sqm| {
+                sqm.buckets
+                    .iter()
+                    .flat_map(|link| link.buckets.iter().map(|bucket| bucket.at))
+            }))
             .collect();
         times.sort_unstable();
         let excess = data.len() - MAX_STATUS;
@@ -311,6 +333,11 @@ fn fit(status: &mut Status, hint: usize) -> io::Result<Vec<u8>> {
         if let Some(telemetry) = &mut status.telemetry {
             telemetry.system_buckets.retain(|bucket| bucket.at > cut);
             for link in &mut telemetry.link_buckets {
+                link.buckets.retain(|bucket| bucket.at > cut);
+            }
+        }
+        if let Some(sqm) = &mut status.sqm {
+            for link in &mut sqm.buckets {
                 link.buckets.retain(|bucket| bucket.at > cut);
             }
         }
@@ -471,6 +498,14 @@ fn serve(
                     Ok(config) => monitor.reload(config)?,
                     Err(error) => eprintln!("waylined: keeping the running configuration: {error}"),
                 }
+            }
+            if let Some(sqm) = &mut monitor.sqm {
+                let rtts: Vec<(String, u32)> = monitor
+                    .probes
+                    .iter()
+                    .filter_map(|probe| Some((probe.interface().to_owned(), probe.latest_us()?)))
+                    .collect();
+                sqm.step(now, &rtts);
             }
         }
         let wall_ms = probe::unix_millis();

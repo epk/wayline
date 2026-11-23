@@ -111,6 +111,12 @@ const state = {
     endpointDiagnostics: true,
     upstreamWifi: wifiMode !== 'off',
     telemetry: telemetryOn,
+    sqmAutorate: false,
+    sqmDelayMs: 20,
+    sqmMinDlMbps: 5,
+    sqmMaxDlMbps: 500,
+    sqmMinUlMbps: 5,
+    sqmMaxUlMbps: 500,
   },
   egress: {
     checkedAt: nowSeconds() - 90,

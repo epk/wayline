@@ -4,7 +4,7 @@ use crate::runtime;
 use crate::runtime::SETTINGS;
 use crate::service;
 use crate::settings::{self, Settings, Target};
-use crate::{auto, changes, clock, egress, history, native, telemetry, update, wifi};
+use crate::{auto, changes, clock, egress, history, native, sqm, telemetry, update, wifi};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::thread;
 use std::time::Duration;
-use wayline_protocol::{Series, State as Measurement, TelemetryStatus, WifiStatus};
+use wayline_protocol::{Series, SqmStatus, State as Measurement, TelemetryStatus, WifiStatus};
+
+use crate::sqm::SqmView;
 
 const RECENT: usize = 8;
 const MAX_RECENT_LOSS: usize = 2;
@@ -43,6 +45,7 @@ pub struct State {
     update: update::Status,
     wifi: wifi::View,
     telemetry: telemetry::View,
+    sqm: SqmView,
     probe: Probe,
     incidents: Vec<history::Incident>,
     clock: ClockView,
@@ -182,6 +185,7 @@ struct Discovery {
     snapshot: Vec<Series>,
     wifi: Option<WifiStatus>,
     telemetry: Option<TelemetryStatus>,
+    sqm: Option<SqmStatus>,
     clock: Option<clock::Clock>,
     native: Result<native::List>,
     compat: native::Compat,
@@ -202,6 +206,7 @@ impl Discovery {
             series: snapshot,
             wifi,
             telemetry,
+            sqm,
             boot_id,
             boot_ms,
             wall_ms,
@@ -231,6 +236,7 @@ impl Discovery {
             snapshot,
             wifi,
             telemetry,
+            sqm,
             clock,
             native,
             compat,
@@ -606,6 +612,7 @@ fn unsupported(compat: native::Compat) -> State {
         update: update::view(),
         wifi: wifi::disabled(),
         telemetry: telemetry::disabled(),
+        sqm: sqm::disabled(),
         probe: Probe {
             interval: 0,
             timeout: 0,
@@ -635,6 +642,7 @@ pub fn state() -> Result<State> {
         snapshot,
         wifi,
         telemetry,
+        sqm,
         clock,
         compat,
         ..
@@ -689,6 +697,7 @@ pub fn state() -> Result<State> {
         incidents: incidents(&config, &inventory, &snapshot, wifi.as_ref()),
         wifi: wifi::view(&config, Some(&inventory), wifi),
         telemetry: telemetry::view(&config, telemetry),
+        sqm: sqm::view(&config, sqm),
         clock: ClockView {
             synced: clock.as_ref().is_none_or(|clock| clock.synced),
             source: clock.as_ref().and_then(|clock| clock.source),

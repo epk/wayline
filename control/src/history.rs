@@ -6,14 +6,16 @@ use crate::router::Inventory;
 use crate::runtime;
 use crate::runtime::RUNTIME;
 use crate::settings::{Settings, Target};
-use crate::{clock, encoding, telemetry, wifi};
+use crate::{clock, encoding, sqm, telemetry, wifi};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use wayline_protocol::schema::{RTT_BINS, RTT_EDGES_US, RTT_FIRST};
-use wayline_protocol::{BUCKET_SECONDS, MAX_SERIES, Series, TelemetryStatus, WifiBucket};
+use wayline_protocol::{
+    BUCKET_SECONDS, MAX_SERIES, Series, SqmStatus, TelemetryStatus, WifiBucket,
+};
 
 pub const HOUR: u64 = 3_600;
 const DAY: u64 = 86_400;
@@ -387,12 +389,15 @@ struct Staged {
     series: Vec<Series>,
     wifi: Vec<WifiBucket>,
     telemetry: Option<TelemetryStatus>,
+    #[serde(default)]
+    sqm: Option<SqmStatus>,
 }
 
 struct Snapshot {
     series: Vec<Series>,
     wifi: Vec<WifiBucket>,
     telemetry: Option<TelemetryStatus>,
+    sqm: Option<SqmStatus>,
     clock: Option<clock::Clock>,
 }
 
@@ -417,6 +422,7 @@ fn snapshot() -> Result<Snapshot> {
         series: parts.series,
         wifi: parts.wifi.map(|wifi| wifi.buckets).unwrap_or_default(),
         telemetry: parts.telemetry,
+        sqm: parts.sqm,
     };
     if let Some(clock) = clock.as_ref().filter(|clock| clock.synced) {
         restamp_all(&mut staged, clock.offset_ms);
@@ -429,10 +435,16 @@ fn snapshot() -> Result<Snapshot> {
             link.buckets.retain(|bucket| bucket.at > cutoff);
         }
     }
+    if let Some(sqm) = &mut staged.sqm {
+        for history in &mut sqm.buckets {
+            history.buckets.retain(|bucket| bucket.at > cutoff);
+        }
+    }
     Ok(Snapshot {
         series: staged.series,
         wifi: staged.wifi,
         telemetry: staged.telemetry,
+        sqm: staged.sqm,
         clock,
     })
 }
@@ -467,18 +479,9 @@ pub fn pending(config: &Settings) -> bool {
     !staged_files(&root(config)).is_empty()
 }
 
-fn stage(root: &Path, boot: &str, snapshot: &Snapshot) -> Result<()> {
-    use std::io::Write as _;
-    let cursor_path = pending_dir(root).join("cursor.json");
-    let cursor: Cursor = runtime::load(&cursor_path);
-    let after = if cursor.boot == boot {
-        cursor.uptime_ms
-    } else {
-        0
-    };
+fn staged_snapshot(snapshot: &Snapshot, after: u64) -> Staged {
     let newer = |uptime: u64| uptime > after;
-    fs::create_dir_all(pending_dir(root))?;
-    let staged = Staged {
+    Staged {
         series: snapshot
             .series
             .iter()
@@ -525,7 +528,25 @@ fn stage(root: &Path, boot: &str, snapshot: &Snapshot) -> Result<()> {
                     .collect(),
                 ..TelemetryStatus::default()
             }),
+        sqm: snapshot.sqm.as_ref().map(|sqm| SqmStatus {
+            active: sqm.active,
+            links: Vec::new(),
+            buckets: sqm.buckets.clone(),
+        }),
+    }
+}
+
+fn stage(root: &Path, boot: &str, snapshot: &Snapshot) -> Result<()> {
+    use std::io::Write as _;
+    let cursor_path = pending_dir(root).join("cursor.json");
+    let cursor: Cursor = runtime::load(&cursor_path);
+    let after = if cursor.boot == boot {
+        cursor.uptime_ms
+    } else {
+        0
     };
+    fs::create_dir_all(pending_dir(root))?;
+    let staged = staged_snapshot(snapshot, after);
     let latest = staged
         .series
         .iter()
@@ -635,6 +656,23 @@ fn flush_file(
                 }
             }
         }
+        if let Some(sqm) = part.sqm {
+            let target = staged.sqm.get_or_insert_with(|| SqmStatus {
+                active: sqm.active,
+                links: Vec::new(),
+                buckets: Vec::new(),
+            });
+            for history in sqm.buckets {
+                match target
+                    .buckets
+                    .iter_mut()
+                    .find(|known| known.id == history.id)
+                {
+                    Some(known) => known.buckets.extend(history.buckets),
+                    None => target.buckets.push(history),
+                }
+            }
+        }
     }
     let event = |kind: &str, text: String| Event {
         at: now * 1_000,
@@ -666,6 +704,7 @@ fn flush_file(
         &series,
         &staged.wifi,
         staged.telemetry.as_ref(),
+        staged.sqm.as_ref(),
     )?;
     changes::append(root, notes)?;
     fs::remove_file(path)?;
@@ -972,6 +1011,7 @@ fn collect_inner(config: &Settings) -> Result<()> {
         &snapshot.series,
         &snapshot.wifi,
         snapshot.telemetry.as_ref(),
+        snapshot.sqm.as_ref(),
     )?;
     publish(&known_cache(), &prefixes)?;
     flushed.and(migrated)
@@ -1018,6 +1058,7 @@ fn persist(
     ring: &[Series],
     buckets: &[WifiBucket],
     status: Option<&TelemetryStatus>,
+    sqm: Option<&SqmStatus>,
 ) -> Result<BTreeSet<String>> {
     let wifi = columnar::store(root, days, &wifi::KIND, &wifi::entries(buckets), now);
     let system = status.map_or(Ok(()), |status| {
@@ -1038,12 +1079,19 @@ fn persist(
             now,
         )
     });
+    let sqm = sqm.map_or(Ok(()), |status| {
+        columnar::store(root, days, &sqm::KIND, &sqm::entries(status), now)
+    });
     let logged = record_incidents(root, ring, buckets, now * 1_000);
     let prefixes = store(root, days, now, ring)?;
     let kept = longest(days);
     let expired = journal::expire::<Event>(root, kept, now)
         .and_then(|()| journal::expire::<Logged>(root, kept, now));
-    wifi.and(system).and(links).and(logged).and(expired)?;
+    wifi.and(system)
+        .and(links)
+        .and(sqm)
+        .and(logged)
+        .and(expired)?;
     columnar::tidy(root)?;
     Ok(prefixes)
 }
@@ -1898,6 +1946,7 @@ mod tests {
             )],
             wifi: Vec::new(),
             telemetry: None,
+            sqm: None,
             clock: None,
         };
         super::stage(root, "boot1", &snapshot)?;
@@ -2102,6 +2151,7 @@ mod tests {
             series: vec![series(&identity(1), buckets)],
             wifi: Vec::new(),
             telemetry: None,
+            sqm: None,
             clock: None,
         };
         super::stage(root, "boot1", &snapshot(staged_buckets(0)))?;

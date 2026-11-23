@@ -44,9 +44,28 @@ const settingNames: Record<keyof Settings, string> = {
   telemetry: 'router telemetry',
   autoExit: 'automatic exit switching',
   autoTunnels: 'automatic switching pool',
+  sqmAutorate: 'adaptive SQM',
+  sqmDelayMs: 'SQM delay threshold',
+  sqmMinDlMbps: 'SQM download min',
+  sqmMaxDlMbps: 'SQM download max',
+  sqmMinUlMbps: 'SQM upload min',
+  sqmMaxUlMbps: 'SQM upload max',
   historyDays: 'history retention',
   autoUpdates: 'automatic updates',
 };
+
+const sqmFields: {
+  key: 'sqmDelayMs' | 'sqmMinDlMbps' | 'sqmMaxDlMbps' | 'sqmMinUlMbps' | 'sqmMaxUlMbps';
+  label: string;
+  min: number;
+  max: number;
+}[] = [
+  { key: 'sqmDelayMs', label: 'Delay threshold (ms)', min: 5, max: 200 },
+  { key: 'sqmMinDlMbps', label: 'Download min (Mbps)', min: 1, max: 2000 },
+  { key: 'sqmMaxDlMbps', label: 'Download max (Mbps)', min: 1, max: 2000 },
+  { key: 'sqmMinUlMbps', label: 'Upload min (Mbps)', min: 1, max: 2000 },
+  { key: 'sqmMaxUlMbps', label: 'Upload max (Mbps)', min: 1, max: 2000 },
+];
 
 const shown = (value: unknown): string =>
   Array.isArray(value)
@@ -203,6 +222,7 @@ export function SettingsDrawer() {
   const open = settingsOpen.value;
   const d = draft.value;
   const s = state.value;
+  const sqmId = useId();
   return (
     <Modal
       open={open}
@@ -233,7 +253,9 @@ export function SettingsDrawer() {
             <Check
               label="Measure latency"
               checked={d.enabled}
-              onChange={(enabled) => updateDraft({ enabled })}
+              onChange={(enabled) =>
+                updateDraft(enabled ? { enabled } : { enabled, sqmAutorate: false })
+              }
             />
             <Pick
               label="Measure every"
@@ -347,6 +369,39 @@ export function SettingsDrawer() {
                   not move.
                 </p>
               </>
+            )}
+          </section>
+          <section className="wl-set" aria-labelledby="wl-set-sqm">
+            <h3 id="wl-set-sqm">Adaptive SQM (CAKE)</h3>
+            <Check
+              label="Adjust CAKE bandwidth automatically"
+              checked={d.sqmAutorate}
+              disabled={!d.enabled}
+              onChange={(sqmAutorate) => updateDraft({ sqmAutorate })}
+            />
+            {!d.enabled && (
+              <p className="wl-muted">Latency measurement must be on to use adaptive SQM.</p>
+            )}
+            {d.sqmAutorate && (
+              <div className="wl-dest">
+                {sqmFields.map((f) => (
+                  <div key={f.key} className="wl-dest-field">
+                    <label htmlFor={sqmId + f.key}>{f.label}</label>
+                    <Input
+                      id={sqmId + f.key}
+                      type="number"
+                      min={f.min}
+                      max={f.max}
+                      step={1}
+                      value={Number.isFinite(d[f.key]) ? String(d[f.key]) : ''}
+                      onChange={(e) => {
+                        const raw = e.currentTarget.value;
+                        updateDraft({ [f.key]: raw === '' ? Number.NaN : Number(raw) });
+                      }}
+                    />
+                  </div>
+                ))}
+              </div>
             )}
           </section>
           <section className="wl-set" aria-labelledby="wl-set-history">

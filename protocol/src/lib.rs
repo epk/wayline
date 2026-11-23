@@ -51,6 +51,37 @@ pub struct Config {
     pub wifi: Option<WifiConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetryConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqm: Option<SqmConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqmConfig {
+    pub interfaces: Vec<SqmInterface>,
+    #[serde(default = "default_sqm_delay_ms")]
+    pub delay_threshold_ms: u32,
+    #[serde(default = "default_sqm_min_kbps")]
+    pub min_dl_kbps: u32,
+    #[serde(default = "default_sqm_base_kbps")]
+    pub base_dl_kbps: u32,
+    #[serde(default = "default_sqm_max_kbps")]
+    pub max_dl_kbps: u32,
+    #[serde(default = "default_sqm_min_kbps")]
+    pub min_ul_kbps: u32,
+    #[serde(default = "default_sqm_base_kbps")]
+    pub base_ul_kbps: u32,
+    #[serde(default = "default_sqm_max_kbps")]
+    pub max_ul_kbps: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqmInterface {
+    pub id: String,
+    pub name: String,
+    pub egress_device: String,
+    pub ingress_device: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -105,6 +136,22 @@ const fn default_wifi_interval() -> u64 {
     5_000
 }
 
+const fn default_sqm_delay_ms() -> u32 {
+    20
+}
+
+const fn default_sqm_min_kbps() -> u32 {
+    5_000
+}
+
+const fn default_sqm_base_kbps() -> u32 {
+    40_000
+}
+
+const fn default_sqm_max_kbps() -> u32 {
+    500_000
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Status {
     pub schema: u8,
@@ -123,6 +170,8 @@ pub struct Status {
     pub wifi: Option<WifiStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetryStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqm: Option<SqmStatus>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -495,4 +544,64 @@ pub struct TelemetryStatus {
     pub links: Vec<Link>,
     pub system_buckets: Vec<SystemBucket>,
     pub link_buckets: Vec<LinkHistory>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqmAction {
+    Idle,
+    Hold,
+    Increase,
+    Decrease,
+    MissingQdisc,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqmLinkStatus {
+    pub id: String,
+    pub name: String,
+    pub egress_device: String,
+    pub ingress_device: String,
+    pub dl_kbps: u32,
+    pub ul_kbps: u32,
+    pub rx_kbps: u32,
+    pub tx_kbps: u32,
+    pub baseline_us: Option<u32>,
+    pub delta_us: Option<i64>,
+    pub dl_action: SqmAction,
+    pub ul_action: SqmAction,
+    pub adjustments: u64,
+    pub updated_age_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqmBucket {
+    pub at: u64,
+    pub samples: u16,
+    pub dl_kbps_sum: u64,
+    pub dl_kbps_min: Option<u32>,
+    pub dl_kbps_max: Option<u32>,
+    pub ul_kbps_sum: u64,
+    pub ul_kbps_min: Option<u32>,
+    pub ul_kbps_max: Option<u32>,
+    pub baseline_us_n: u16,
+    pub baseline_us_sum: u64,
+    pub delta_us_max: Option<i64>,
+    pub increases: u16,
+    pub decreases: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqmHistory {
+    pub id: String,
+    pub buckets: Vec<SqmBucket>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqmStatus {
+    pub active: bool,
+    pub links: Vec<SqmLinkStatus>,
+    #[serde(default)]
+    pub buckets: Vec<SqmHistory>,
 }

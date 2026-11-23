@@ -37,6 +37,12 @@ pub struct Settings {
     pub endpoint_diagnostics: bool,
     pub upstream_wifi: bool,
     pub telemetry: bool,
+    pub sqm_autorate: bool,
+    pub sqm_delay_ms: u32,
+    pub sqm_min_dl_mbps: u32,
+    pub sqm_max_dl_mbps: u32,
+    pub sqm_min_ul_mbps: u32,
+    pub sqm_max_ul_mbps: u32,
 }
 
 fn tunnel_list<'de, D: serde::Deserializer<'de>>(
@@ -68,6 +74,12 @@ impl Default for Settings {
             endpoint_diagnostics: false,
             upstream_wifi: false,
             telemetry: false,
+            sqm_autorate: false,
+            sqm_delay_ms: 20,
+            sqm_min_dl_mbps: 5,
+            sqm_max_dl_mbps: 500,
+            sqm_min_ul_mbps: 5,
+            sqm_max_ul_mbps: 500,
         }
     }
 }
@@ -199,6 +211,26 @@ impl Settings {
             "Automatic switching only permits monitored tunnels."
         );
         ensure!(unique(&self.auto_tunnels), "Duplicate automatic tunnel.");
+        ensure!(
+            (5..=200).contains(&self.sqm_delay_ms),
+            "SQM delay threshold must be 5..200 ms."
+        );
+        ensure!(
+            self.sqm_min_dl_mbps >= 1
+                && self.sqm_min_dl_mbps <= self.sqm_max_dl_mbps
+                && self.sqm_max_dl_mbps <= 2000,
+            "Invalid SQM download bounds."
+        );
+        ensure!(
+            self.sqm_min_ul_mbps >= 1
+                && self.sqm_min_ul_mbps <= self.sqm_max_ul_mbps
+                && self.sqm_max_ul_mbps <= 2000,
+            "Invalid SQM upload bounds."
+        );
+        ensure!(
+            !self.sqm_autorate || self.enabled,
+            "Adaptive SQM requires latency measurement."
+        );
         Ok(())
     }
 }
@@ -327,6 +359,68 @@ mod tests {
             .validate()
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sqm_autorate_settings_validate_and_round_trip() -> Result<()> {
+        let valid = Settings {
+            enabled: true,
+            tunnels: vec!["vpn:1".into()],
+            sqm_autorate: true,
+            sqm_delay_ms: 25,
+            sqm_min_dl_mbps: 10,
+            sqm_max_dl_mbps: 300,
+            sqm_min_ul_mbps: 5,
+            sqm_max_ul_mbps: 100,
+            ..Settings::default()
+        };
+        valid.validate()?;
+        let json = serde_json::to_string(&valid)?;
+        ensure!(json.contains("\"sqmAutorate\":true"));
+        ensure!(json.contains("\"sqmDelayMs\":25"));
+        let decoded: Settings = serde_json::from_str(&json)?;
+        ensure!(decoded == valid);
+
+        ensure!(
+            Settings {
+                sqm_autorate: true,
+                enabled: false,
+                ..Settings::default()
+            }
+            .validate()
+            .is_err()
+        );
+        for delay in [4, 201] {
+            ensure!(
+                Settings {
+                    sqm_delay_ms: delay,
+                    ..Settings::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for (min, max) in [(0, 100), (100, 50), (10, 2001)] {
+            ensure!(
+                Settings {
+                    sqm_min_dl_mbps: min,
+                    sqm_max_dl_mbps: max,
+                    ..Settings::default()
+                }
+                .validate()
+                .is_err()
+            );
+            ensure!(
+                Settings {
+                    sqm_min_ul_mbps: min,
+                    sqm_max_ul_mbps: max,
+                    ..Settings::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
         Ok(())
     }
 }
