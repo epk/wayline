@@ -156,7 +156,7 @@ consumer can tell which events it has already seen. `sent` and `lost` are probe 
 
 Request: `start`, `end`, `step`, `format`.
 
-Arrow metadata: `summary`, `events`. Columns use the JSON `columns` names.
+Arrow metadata: `summary`, `events`, `networks`. Columns use the JSON `columns` names.
 Float64 nullable: `uptime`, `signal`, `noise`, `snr`, `txRate`, `txRateMin`,
 `rxRate`, `expected`, `retries`, `failures`, `busy`, `rxAir`, `txAir`,
 `upload`, `download`. Int32 nullable: `signalMin`, `signalMax`. UInt32:
@@ -177,9 +177,21 @@ JSON document:
     "rxRate": [], "expected": [], "retries": [], "failures": [], "busy": [],
     "rxAir": [], "txAir": [], "upload": [], "download": [], "txBytes": [],
     "rxBytes": [], "disconnects": [], "roams": [] },
-  "events": []
+  "events": [],
+  "networks": [
+    { "id": "ap:76face8ac4b3", "bssid": "76:fa:ce:8a:c4:b3", "ssid": "Hotel",
+      "channel": "40 · 5 GHz · 80 MHz", "connectedSeconds": 0,
+      "first": 0, "last": 0, "summary": {} }
+  ]
 }
 ```
+
+`columns` and `summary` cover every access point together. `networks` lists
+each access point seen in the range, longest connected first, with a `summary`
+(the same fields) over its own buckets only. `id` is `upstream` for history
+saved before access points were recorded; its `bssid`, `ssid` and `channel`
+are `null`. `connectedSeconds` counts connected 5-second samples. `first` and
+`last` are the first and last buckets with samples.
 
 Units: dBm, dB, Mbit/s for rates and `upload`/`download`, percent for
 `uptime`, `retries`, `failures`, `busy`, `rxAir`, `txAir`, bytes for byte counts.

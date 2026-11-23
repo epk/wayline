@@ -1,6 +1,6 @@
 [package]
 name = "waylined"
-version = "0.1.0-alpha.26"
+version = "0.1.0-alpha.27"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
@@ -16,7 +16,7 @@ bench = false
 [dependencies]
 wayline-protocol.workspace = true
 wayline-support.workspace = true
-rustix = { workspace = true, features = ["process", "event"] }
+rustix = { workspace = true, features = ["process", "event", "net"] }
 serde_json.workspace = true
 socket2.workspace = true
 netlink-packet-core.workspace = true

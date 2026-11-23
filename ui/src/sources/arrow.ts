@@ -8,6 +8,7 @@ import type {
   TelemetryInterface,
   WifiDoc,
   WifiKey,
+  WifiNetwork,
 } from '../types.ts';
 
 type Decompress = (bytes: Uint8Array, out: Uint8Array) => Uint8Array;
@@ -110,6 +111,7 @@ export const wifiDoc = (f: Frame): WifiDoc => ({
   summary: (f.meta.summary || {}) as WifiDoc['summary'],
   columns: Object.fromEntries(wifiKeys.map((k) => [k, f.column(k)])),
   events: list<ChangeEvent>(f.meta.events),
+  networks: list<WifiNetwork>(f.meta.networks),
 });
 
 const ifaceKeys = [

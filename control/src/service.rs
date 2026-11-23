@@ -89,19 +89,16 @@ fn apply(config: &Settings, inventory: Option<&Inventory>) -> Result<()> {
     let encoded = serde_json::to_vec(&desired)?;
     let changed = fs::read(path).ok().as_deref() != Some(&encoded);
     let running = monitor_running().unwrap_or(false);
-    if changed || !running {
-        if changed {
-            if running {
-                flush();
-            }
-            wayline_support::atomic(path, &encoded)?;
-        }
+    if changed {
+        wayline_support::atomic(path, &encoded)?;
+    }
+    if !running {
         native::bus::<Value>(
             "service",
             "set",
             &json!({"name":"wayline","instances":{"monitor":{
             "command":[DAEMON,"monitor","--config",path,"--socket",STATUS_SOCKET],
-            "respawn":["3600","5","3"],"limits":{"core":"0","nofile":"256 256"},"stderr":true,"file":[path]}}}),
+            "respawn":["3600","5","3"],"limits":{"core":"0","nofile":"256 256"},"stderr":true}}}),
         )?;
     }
     Ok(())

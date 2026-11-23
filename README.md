@@ -2,7 +2,7 @@
 
 Wayline compares VPN tunnels on GL.iNet routers. The **VPN → Wayline** page shows latency, loss, history, and exit addresses. It provides native tunnel Start and Stop controls and manual exit selection. It also records the quality of the upstream Wi-Fi link when the router joins a network as a repeater.
 
-Wayline is experimental. This README describes **0.1.0-alpha.26**, which records outages when an interface or route disappears, keeps old history files instead of deleting them on upgrade, writes far less to flash, and lets a stuck update be cleared from the page. alpha.25 moved change events and incidents into Parquet, added the Health tab and reworked the page for phone, tablet and desktop. alpha.24 fixed automatic updates, and alpha.22 and alpha.23 added support for firmware 4.11 and its APK package manager. Install signed packages from [GitHub Releases](https://github.com/epk/wayline/releases).
+Wayline is experimental. This README describes **0.1.0-alpha.27**, which reads upstream Wi-Fi straight from the kernel over nl80211, reacts to connects and disconnects as they happen, tells access points apart with per-network history, and keeps the monitor running through uplink changes. alpha.26 recorded outages when an interface or route disappears and wrote far less to flash. alpha.25 moved change events and incidents into Parquet, added the Health tab and reworked the page for phone, tablet and desktop. alpha.24 fixed automatic updates, and alpha.22 and alpha.23 added support for firmware 4.11 and its APK package manager. Install signed packages from [GitHub Releases](https://github.com/epk/wayline/releases).
 
 The screenshots use synthetic data. They contain no live router addresses, endpoints, locations, or tunnel names.
 
@@ -47,7 +47,7 @@ The installer downloads the newest published release, including prereleases. Bef
 To install a specific version, set `WAYLINE_VERSION`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/epk/wayline/main/install.sh | WAYLINE_VERSION=0.1.0-alpha.26 sh
+curl -fsSL https://raw.githubusercontent.com/epk/wayline/main/install.sh | WAYLINE_VERSION=0.1.0-alpha.27 sh
 ```
 
 This pins the package but still runs the installer from `main`. Releases newer than 0.1.0-alpha.25 also attach the `install.sh` they were built with. To pin the installer as well, download it from the release instead of `main`, for example `https://github.com/epk/wayline/releases/download/v<version>/install.sh`, and run it with the same `WAYLINE_VERSION`.
@@ -90,10 +90,11 @@ History uses the same 15-second, 1-minute, 5-minute and 1-hour tiers and retenti
 - Channel busy, receive and transmit airtime, as a share of time on the channel.
 - Bytes sent and received through the repeater interface.
 - Connected share, drops, and roams between access points of the same network.
+- Each network and access point used in the range, with its own time, signal, throughput, drops and roams.
 
-Changes of network, access point, and channel appear in **Recent changes**. Purge history also deletes Wi-Fi history.
+Changes of network, access point, and channel appear in **Recent changes** at the time they happened, even for stays shorter than a minute. Purge history also deletes Wi-Fi history.
 
-Wayline finds the repeater interface by its client mode, so it works with names such as `apclix0`, `sta1`, and `wlan-sta0`. It reads the router's `iwinfo` service and does not scan or change Wi-Fi settings. Drivers report different fields: a missing value shows as a dash. The closed MediaTek driver on some models reports approximate signal levels.
+Wayline finds the repeater interface by its client mode, so it works with names such as `apclix0`, `sta1`, and `wlan-sta0`. It reads the kernel's nl80211 interface directly, reacts to connect and disconnect events as they happen, and does not scan or change Wi-Fi settings. Drivers report different fields: a missing value shows as a dash. The closed MediaTek driver on some models reports approximate signal levels.
 
 ## Update and remove
 

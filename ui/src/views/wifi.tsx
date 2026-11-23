@@ -17,7 +17,7 @@ import {
 } from '../format.ts';
 import { column, mapColumn, some, times } from '../series.ts';
 import { busy, can, enableSetting, range, state, wifiData } from '../store.ts';
-import type { Column, Rate, WifiKey } from '../types.ts';
+import type { Column, Rate, WifiKey, WifiNetwork } from '../types.ts';
 import { Badge, Explain, Panel, scaleNote, Tip, type Tone } from '../ui.tsx';
 
 const generation: Record<string, string> = {
@@ -84,6 +84,76 @@ function Group(props: { title: string; rows: [string, string, ReactNode?][] }) {
         ))}
       </dl>
     </section>
+  );
+}
+
+const THROUGHPUT_NOTE =
+  'Average over each interval from the interface byte counters. A short speed test fills only part of an interval, so it reads lower here than in the test itself.';
+
+function NetworkCard(props: { network: WifiNetwork; current: boolean }) {
+  const n = props.network;
+  const sum = n.summary;
+  const known = n.id !== 'upstream';
+  const metric = (label: string, value: ReactNode, sub?: string, tip?: string) => (
+    <div>
+      <dt>{tip ? <Tip text={tip}>{label}</Tip> : label}</dt>
+      <dd>
+        <span className="wl-metric-value">{value}</span>
+        {sub && <small>{sub}</small>}
+      </dd>
+    </div>
+  );
+  return (
+    <li className={'wl-pathcard' + (props.current ? ' wl-active' : '')}>
+      <div className="wl-pathcard-head">
+        <div className="wl-pathcard-title">
+          <div className="wl-name-line">
+            <span className="wl-name">
+              {known ? n.ssid || 'Hidden network' : 'Before access points were recorded'}
+            </span>
+            {props.current && <Badge tone="good">Connected now</Badge>}
+          </div>
+          <div className="wl-muted wl-status">
+            {known
+              ? [n.bssid ? 'Access point ' + n.bssid : '', n.channel ? 'channel ' + n.channel : '']
+                  .filter(Boolean)
+                  .join(' · ')
+              : 'History saved before this version, for every network together'}
+          </div>
+        </div>
+      </div>
+      <dl className="wl-metrics">
+        {metric(
+          'Time on it',
+          <span className="wl-num">{span(n.connectedSeconds)}</span>,
+          n.first === n.last
+            ? stamp(n.first, true)
+            : stamp(n.first, true) + ' to ' + stamp(n.last, true),
+        )}
+        {metric(
+          'Signal',
+          <>
+            <span className="wl-num">{dbm(sum.signal)}</span> {level('signal', sum.signal)}
+          </>,
+          finite(sum.signalMin) ? 'weakest ' + dbm(sum.signalMin) : undefined,
+        )}
+        {metric(
+          'Throughput',
+          <span className="wl-num">
+            {finite(sum.download) ? sum.download.toFixed(1) : dash}
+            {' / '}
+            {finite(sum.upload) ? sum.upload.toFixed(1) : dash}
+          </span>,
+          'Mbit/s down / up, average',
+          THROUGHPUT_NOTE,
+        )}
+        {metric(
+          'Drops and roams',
+          <span className="wl-num">{(sum.disconnects ?? 0) + ' / ' + (sum.roams ?? 0)}</span>,
+          'retries ' + percent(sum.retries),
+        )}
+      </dl>
+    </li>
   );
 }
 
@@ -348,10 +418,10 @@ export function WifiView() {
         {!data.loaded && <p className="wl-muted">Loading Wi-Fi history…</p>}
         <Explain>
           <p>
-            Read from <code>ubus call iwinfo info|assoclist|survey</code> for the client-mode
-            interface and from <code>/sys/class/net/&lt;if&gt;/statistics</code>. Signal and noise
-            outside −110..−1 and −120..−50 dBm are driver placeholders and are dropped. SNR = signal
-            − noise.
+            Read straight from the kernel over nl80211 (interface, station, survey and associated
+            BSS) and from <code>/sys/class/net/&lt;if&gt;/statistics</code>, and sampled again at
+            every connect or disconnect. Signal and noise outside −110..−1 and −120..−50 dBm are
+            driver placeholders and are dropped. SNR = signal − noise.
           </p>
           <p>
             Retries = retried / (sent + retried) frames. Failures = failed / sent frames. Counters
@@ -359,8 +429,13 @@ export function WifiView() {
             Own airtime = Δ(receive + send time) / Δactive. Others = busy − own.
           </p>
           <p>
-            A drop is connected → disconnected, a silent reassociation, or a change of network. A
-            roam is a new access point on the same network.
+            A drop is losing the connection, a silent reassociation with the same access point, or
+            moving to another network without a gap. A roam is moving to another access point of the
+            same network. The access point is the station the client interface is associated with.
+          </p>
+          <p>
+            Each 15-second interval belongs to the access point with most of its samples. Network,
+            access point and channel changes are logged at the sample they happen.
           </p>
           <p>
             Bands (heuristics): signal good ≥ −67 dBm, fair −68 to −75, poor &lt; −75. SNR good ≥ 25
@@ -463,7 +538,10 @@ export function WifiView() {
           />
           <Chart
             title="Throughput over the link (Mbit/s)"
-            detail={scaleNote('means') + ' · from interface byte counters'}
+            detail={
+              scaleNote('means') +
+              ' of interface byte counters · bursts read lower than a speed test'
+            }
             label="Download and upload throughput over the upstream Wi-Fi link"
             x={built.x}
             ys={built.traffic}
@@ -477,6 +555,28 @@ export function WifiView() {
             height={150}
           />
         </div>
+      )}
+      {doc && doc.networks.length > 0 && (
+        <Panel
+          id="wl-wifi-networks"
+          title="Networks in range"
+          sub={
+            doc.networks.length === 1
+              ? 'One access point in this range.'
+              : doc.networks.length +
+                ' access points in this range, longest first. Each shows its metrics for its own time only.'
+          }
+        >
+          <ul className="wl-pathlist">
+            {doc.networks.map((n) => (
+              <NetworkCard
+                key={n.id}
+                network={n}
+                current={!!l && !!n.bssid && n.bssid === l.bssid}
+              />
+            ))}
+          </ul>
+        </Panel>
       )}
       {doc && doc.events.length > 0 && (
         <Panel id="wl-wifi-events" title="Wi-Fi events in range">
