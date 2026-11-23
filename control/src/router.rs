@@ -651,6 +651,16 @@ pub fn check_capacity(settings: &Settings, inventory: &Inventory) -> Result<()> 
     Ok(())
 }
 
+fn ifb_for(device: &str) -> String {
+    let mut name = format!("ifb4{device}");
+    let mut end = name.len().min(15);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name.truncate(end);
+    name
+}
+
 pub fn monitor<'a>(
     settings: &'a Settings,
     inventory: &'a Inventory,
@@ -697,33 +707,25 @@ pub fn monitor<'a>(
         .unwrap_or(Ipv4Addr::new(1, 1, 1, 1));
     let sqm = (settings.sqm_autorate && settings.enabled)
         .then(|| {
+            let wan = inventory.wan.iter().filter(|_| settings.direct_wan);
             let interfaces: Vec<SqmInterface> = monitored(settings, inventory)
-                .filter_map(|path| {
-                    let ingress_device = format!("ifb4{}", path.interface);
-                    (ingress_device.len() <= 15).then(|| SqmInterface {
-                        id: path.id.clone(),
-                        name: path.name.clone(),
-                        egress_device: path.interface.clone(),
-                        ingress_device,
-                    })
+                .map(|path| (path, false))
+                .chain(wan.map(|path| (path, true)))
+                .map(|(path, fallback)| SqmInterface {
+                    id: path.id.clone(),
+                    name: path.name.clone(),
+                    egress_device: path.interface.clone(),
+                    ingress_device: ifb_for(&path.interface),
+                    fallback,
                 })
                 .collect();
-            let bounds = |min: u32, max: u32| {
-                let low = min * 1_000;
-                let high = max * 1_000;
-                (low, 40_000.clamp(low, high), high)
-            };
-            let download = bounds(settings.sqm_min_dl_mbps, settings.sqm_max_dl_mbps);
-            let upload = bounds(settings.sqm_min_ul_mbps, settings.sqm_max_ul_mbps);
             (!interfaces.is_empty()).then_some(SqmConfig {
                 interfaces,
                 delay_threshold_ms: settings.sqm_delay_ms,
-                min_dl_kbps: download.0,
-                base_dl_kbps: download.1,
-                max_dl_kbps: download.2,
-                min_ul_kbps: upload.0,
-                base_ul_kbps: upload.1,
-                max_ul_kbps: upload.2,
+                min_dl_kbps: settings.sqm_min_dl_mbps * 1_000,
+                max_dl_kbps: settings.sqm_max_dl_mbps * 1_000,
+                min_ul_kbps: settings.sqm_min_ul_mbps * 1_000,
+                max_ul_kbps: settings.sqm_max_ul_mbps * 1_000,
             })
         })
         .flatten();
@@ -1027,6 +1029,7 @@ mod tests {
         inv.paths.push(path("long", "very_long_ifname", None));
         let mut settings = Settings {
             enabled: true,
+            direct_wan: true,
             sqm_autorate: true,
             sqm_delay_ms: 30,
             sqm_min_dl_mbps: 60,
@@ -1041,17 +1044,43 @@ mod tests {
             .sqm
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing sqm"))?;
-        assert_eq!(sqm.interfaces.len(), 1);
-        assert_eq!(sqm.interfaces[0].id, "a");
-        assert_eq!(sqm.interfaces[0].egress_device, "wg1");
-        assert_eq!(sqm.interfaces[0].ingress_device, "ifb4wg1");
+        let devices: Vec<_> = sqm
+            .interfaces
+            .iter()
+            .map(|iface| {
+                (
+                    iface.id.as_str(),
+                    iface.egress_device.as_str(),
+                    iface.ingress_device.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            devices,
+            [
+                ("a", "wg1", "ifb4wg1"),
+                ("long", "very_long_ifname", "ifb4very_long_i"),
+                ("wan", "eth1", "ifb4eth1"),
+            ]
+        );
+        assert_eq!(
+            sqm.interfaces
+                .iter()
+                .map(|iface| iface.fallback)
+                .collect::<Vec<_>>(),
+            [false, false, true]
+        );
         assert_eq!(sqm.delay_threshold_ms, 30);
         assert_eq!(sqm.min_dl_kbps, 60_000);
-        assert_eq!(sqm.base_dl_kbps, 60_000);
         assert_eq!(sqm.max_dl_kbps, 200_000);
         assert_eq!(sqm.min_ul_kbps, 10_000);
-        assert_eq!(sqm.base_ul_kbps, 30_000);
         assert_eq!(sqm.max_ul_kbps, 30_000);
+
+        settings.direct_wan = false;
+        let tunnels = monitor(&settings, &inv, &resolved()?)
+            .sqm
+            .map(|sqm| sqm.interfaces.len());
+        assert_eq!(tunnels, Some(2));
 
         settings.sqm_autorate = false;
         assert!(monitor(&settings, &inv, &resolved()?).sqm.is_none());

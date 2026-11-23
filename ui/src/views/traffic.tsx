@@ -64,6 +64,7 @@ const sqmAction: Record<string, { tone: Tone; label: string }> = {
   hold: { tone: 'ok', label: 'Hold' },
   idle: { tone: 'off', label: 'Idle' },
   missing_qdisc: { tone: 'degraded', label: 'No CAKE' },
+  standby: { tone: 'off', label: 'Standby' },
   error: { tone: 'down', label: 'Error' },
 };
 

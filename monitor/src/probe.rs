@@ -139,6 +139,7 @@ pub struct Probe {
     received: u64,
     unmatched: u16,
     history: VecDeque<Sample>,
+    fresh: bool,
     open: Vec<OpenBucket>,
     closed: VecDeque<Bucket>,
 }
@@ -170,6 +171,7 @@ impl Probe {
             received: 0,
             unmatched: 0,
             history: VecDeque::new(),
+            fresh: false,
             open: Vec::new(),
             closed: VecDeque::new(),
         }
@@ -224,8 +226,10 @@ impl Probe {
         &self.tunnel.interface
     }
 
-    pub fn latest_us(&self) -> Option<u32> {
-        self.history.back().and_then(|sample| sample.us)
+    pub fn take_fresh_us(&mut self) -> Option<u32> {
+        std::mem::take(&mut self.fresh)
+            .then(|| self.history.back().and_then(|sample| sample.us))
+            .flatten()
     }
 
     pub fn retarget(&mut self, tunnel: Tunnel, default_target: Ipv4Addr) {
@@ -287,6 +291,7 @@ impl Probe {
         }
         self.generation = generation;
         self.history.clear();
+        self.fresh = false;
         self.unmatched = 0;
         self.last_success = None;
         self.previous_rtt = None;
@@ -340,6 +345,7 @@ impl Probe {
             at_ms: unix_millis(),
             us: micros,
         });
+        self.fresh = true;
     }
 
     pub fn skip_slot(&mut self, now: Instant) {
