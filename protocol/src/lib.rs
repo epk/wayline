@@ -78,6 +78,8 @@ pub struct SqmInterface {
     pub name: String,
     pub egress_device: String,
     pub ingress_device: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -546,6 +548,7 @@ pub enum SqmAction {
     Increase,
     Decrease,
     MissingQdisc,
+    Standby,
     Error,
 }
 

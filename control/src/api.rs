@@ -771,10 +771,6 @@ pub fn set_config(request: SetConfig) -> Result<Value> {
             router::normalize(&mut config, &inventory);
             config.upstream_wifi &= wifi::radio_present();
             config.validate()?;
-            ensure!(
-                !config.sqm_autorate || config.direct_wan,
-                "Adaptive SQM measures the WAN with direct internet probes. Turn on Direct internet without VPN."
-            );
             router::check_capacity(&config, &inventory)?;
             ensure!(
                 config

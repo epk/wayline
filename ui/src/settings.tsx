@@ -240,16 +240,22 @@ function Limits(props: {
   );
 }
 
-const sqmTrouble = (links: SqmLink[]): string[] => {
-  const shaping = links.some(
-    (link) => link.dlAction !== 'missing_qdisc' || link.ulAction !== 'missing_qdisc',
+const sqmNotes = (links: SqmLink[]): string[] => {
+  const shaping = links.some((link) =>
+    [link.dlAction, link.ulAction].some((a) => a !== 'missing_qdisc' && a !== 'standby'),
   );
-  const refused = links
+  const notes = links
     .filter((link) => link.dlAction === 'error' || link.ulAction === 'error')
     .map((link) => link.name + ': the router refused the last bandwidth change.');
-  return links.length && !shaping
-    ? ['No CAKE shaper found on the WAN or the monitored tunnels. Set up SQM with CAKE first.']
-    : refused;
+  if (links.length && !shaping)
+    notes.push(
+      'No CAKE shaper found on the monitored tunnels or the WAN. Set up SQM with CAKE first.',
+    );
+  if (links.some((link) => link.dlAction === 'standby' || link.ulAction === 'standby'))
+    notes.push(
+      'The WAN also runs CAKE. Wayline leaves it at its own rate; keep that above the tunnel’s, or the WAN queue sees only the encrypted tunnel and cannot keep flows apart.',
+    );
+  return notes;
 };
 
 function AdaptiveSqm() {
@@ -258,7 +264,7 @@ function AdaptiveSqm() {
   const problems = d.sqmAutorate ? sqmProblems(d) : {};
   const shaped = s.tunnels.filter((t) => d.tunnels.includes(t.monitorId)).map((t) => t.name);
   const saved = s.config.sqmAutorate && s.config.enabled;
-  const trouble = saved ? sqmTrouble(s.sqm?.links || []) : [];
+  const trouble = saved ? sqmNotes(s.sqm?.links || []) : [];
   return (
     <section className="wl-set" aria-labelledby="wl-set-sqm">
       <h3 id="wl-set-sqm">Adaptive SQM (CAKE)</h3>
@@ -266,9 +272,7 @@ function AdaptiveSqm() {
         label="Adjust CAKE bandwidth automatically"
         checked={d.sqmAutorate && d.enabled}
         disabled={!d.enabled}
-        onChange={(sqmAutorate) =>
-          updateDraft(sqmAutorate ? { sqmAutorate, directWan: true } : { sqmAutorate })
-        }
+        onChange={(sqmAutorate) => updateDraft({ sqmAutorate })}
       />
       <p className="wl-muted">
         {d.enabled
@@ -278,9 +282,15 @@ function AdaptiveSqm() {
       {d.sqmAutorate && d.enabled && (
         <>
           <p className="wl-muted">
-            {'Applies to the WAN' +
-              (shaped.length ? ' and the monitored tunnels (' + shaped.join(', ') + ')' : '') +
-              ': upload on each interface, download on its ifb4 device. It uses the direct internet probes, which stay on while this is on.'}
+            {(shaped.length
+              ? 'Shapes CAKE on the monitored tunnels (' +
+                shaped.join(', ') +
+                '), where it sees each flow inside the tunnel. '
+              : '') +
+              (d.directWan
+                ? 'If no monitored tunnel has CAKE, it shapes the WAN instead.'
+                : 'To shape the WAN when no tunnel has CAKE, turn on Direct internet without VPN.') +
+              ' Upload is shaped on each interface, download on its ifb4 device.'}
           </p>
           {trouble.map((line) => (
             <p key={line} className="wl-warning" role="note">
@@ -446,9 +456,7 @@ export function SettingsDrawer() {
             <Check
               label="Direct internet without VPN (every uplink)"
               checked={d.directWan}
-              onChange={(directWan) =>
-                updateDraft(directWan ? { directWan } : { directWan, sqmAutorate: false })
-              }
+              onChange={(directWan) => updateDraft({ directWan })}
             />
             <p className="wl-muted">
               Probes bypass the VPN. Where a probe cannot, the monitor says so.

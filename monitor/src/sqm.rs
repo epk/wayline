@@ -547,13 +547,43 @@ impl<S: Shaper> Controller<S> {
             max: self.config.max_ul_kbps,
         };
         let mut synced = false;
-        for link in &mut self.links {
+        let mut tunnel_cake = None;
+        let order: Vec<usize> = (0..self.links.len())
+            .filter(|&index| !self.links[index].iface.fallback)
+            .chain((0..self.links.len()).filter(|&index| self.links[index].iface.fallback))
+            .collect();
+        for index in order {
+            let link = &mut self.links[index];
             let (rx_kbps, tx_kbps) = measure_throughput(&mut self.shaper, link, now);
             link.rx_kbps = rx_kbps;
             link.tx_kbps = tx_kbps;
             let Some(rtt_us) = match_rtt(&link.iface, rtts) else {
                 continue;
             };
+            if link.iface.fallback {
+                let tunnels = *tunnel_cake.get_or_insert_with(|| {
+                    let devices: Vec<String> = self
+                        .links
+                        .iter()
+                        .filter(|other| !other.iface.fallback)
+                        .flat_map(|other| {
+                            [
+                                other.iface.egress_device.clone(),
+                                other.iface.ingress_device.clone(),
+                            ]
+                        })
+                        .collect();
+                    devices
+                        .iter()
+                        .any(|device| self.shaper.cake(device).is_some())
+                });
+                if tunnels {
+                    let link = &mut self.links[index];
+                    synced |= stand_by(&mut self.shaper, link);
+                    continue;
+                }
+            }
+            let link = &mut self.links[index];
             link.last_updated = Some(now);
             let base = update_baseline(link, rtt_us, rx_kbps, tx_kbps);
             let delta_us = i64::from(rtt_us) - i64::from(base);
@@ -609,22 +639,7 @@ impl<S: Shaper> Controller<S> {
                 (&link.iface.ingress_device, &mut link.dl),
                 (&link.iface.egress_device, &mut link.ul),
             ] {
-                let (Some(original), Some(applied)) = (dir.original, dir.applied) else {
-                    continue;
-                };
-                if applied.handle != original.handle || applied.kbps == original.kbps {
-                    continue;
-                }
-                let live = self.shaper.cake(device);
-                if live.is_some_and(|live| live.handle == original.handle)
-                    && self
-                        .shaper
-                        .set_cake_bandwidth(device, original.handle, original.kbps)
-                        .is_ok()
-                {
-                    dir.applied = Some(original);
-                    dir.rate_kbps = original.kbps;
-                }
+                restore_direction(&mut self.shaper, device, dir);
             }
         }
         self.recalled.clear();
@@ -670,6 +685,45 @@ impl<S: Shaper> Controller<S> {
             buckets,
         }
     }
+}
+
+fn restore_direction<S: Shaper>(shaper: &mut S, device: &str, dir: &mut DirectionState) {
+    let (Some(original), Some(applied)) = (dir.original, dir.applied) else {
+        return;
+    };
+    if applied.handle != original.handle || applied.kbps == original.kbps {
+        return;
+    }
+    let live = shaper.cake(device);
+    if live.is_some_and(|live| live.handle == original.handle)
+        && shaper
+            .set_cake_bandwidth(device, original.handle, original.kbps)
+            .is_ok()
+    {
+        dir.applied = Some(original);
+        dir.rate_kbps = original.kbps;
+    }
+}
+
+fn stand_by<S: Shaper>(shaper: &mut S, link: &mut LinkState) -> bool {
+    let mut released = false;
+    for (device, dir) in [
+        (&link.iface.ingress_device, &mut link.dl),
+        (&link.iface.egress_device, &mut link.ul),
+    ] {
+        restore_direction(shaper, device, dir);
+        released |= dir.original.is_some();
+        let found = shaper.cake(device);
+        *dir = DirectionState::new();
+        dir.rate_kbps = found.map_or(0, |cake| cake.kbps);
+        dir.action = if found.is_some() {
+            SqmAction::Standby
+        } else {
+            SqmAction::MissingQdisc
+        };
+    }
+    link.delta_us = None;
+    released
 }
 
 impl<S: Shaper> Drop for Controller<S> {
@@ -897,6 +951,7 @@ mod tests {
                 name: "Primary WAN".into(),
                 egress_device: "eth1".into(),
                 ingress_device: "ifb4eth1".into(),
+                fallback: false,
             }],
             delay_threshold_ms: 20,
             min_dl_kbps: 5_000,
@@ -1308,6 +1363,58 @@ mod tests {
         );
         drop(controller);
         assert_eq!(*applied.borrow(), [("ifb4eth1".to_owned(), 25_500)]);
+    }
+
+    #[test]
+    fn the_wan_is_shaped_only_while_no_tunnel_has_cake() {
+        let mut config = test_config();
+        config.interfaces[0].fallback = true;
+        config.interfaces.insert(
+            0,
+            SqmInterface {
+                id: "tunnel".into(),
+                name: "Tunnel".into(),
+                egress_device: "wg0".into(),
+                ingress_device: "ifb4wg0".into(),
+                fallback: false,
+            },
+        );
+        let shaper = ready_shaper();
+        let applied = Rc::clone(&shaper.applied);
+        let mut controller = Controller::new(config, shaper);
+        let t0 = Instant::now();
+        let both = |rtt: u32| [("eth1".to_owned(), rtt), ("wg0".to_owned(), rtt)];
+        controller.step_at(t0, 1_000, &both(15_000));
+        controller
+            .shaper
+            .bytes
+            .insert("eth1".into(), (3_750_000, 10_000));
+        controller.step_at(t0 + Duration::from_secs(1), 2_000, &both(50_000));
+        let status = controller.status(t0, None);
+        assert_eq!(status.links[0].dl_action, SqmAction::MissingQdisc);
+        assert_eq!(status.links[1].dl_action, SqmAction::Decrease);
+        assert_eq!(*applied.borrow(), [("ifb4eth1".to_owned(), 25_500)]);
+
+        controller.shaper.cakes.insert(
+            "wg0".into(),
+            Cake {
+                handle: 0x8003_0000,
+                kbps: 30_000,
+            },
+        );
+        controller.step_at(t0 + Duration::from_secs(2), 3_000, &both(15_000));
+        let status = controller.status(t0, None);
+        assert!(status.active);
+        assert_eq!(status.links[1].dl_action, SqmAction::Standby);
+        assert_eq!(status.links[0].ul_action, SqmAction::Idle);
+        assert_eq!(
+            applied.borrow().last(),
+            Some(&("ifb4eth1".to_owned(), 40_000))
+        );
+        assert_eq!(
+            controller.shaper.store.borrow().keys().collect::<Vec<_>>(),
+            ["wg0"]
+        );
     }
 
     #[test]

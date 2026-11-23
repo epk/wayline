@@ -664,10 +664,6 @@ export async function saveSettings(): Promise<void> {
       error.value = 'Turn on latency measurement before enabling adaptive SQM.';
       return;
     }
-    if (!draft.value.directWan) {
-      error.value = 'Adaptive SQM needs Direct internet without VPN to measure the WAN.';
-      return;
-    }
     if (Object.keys(sqmProblems(draft.value)).length) {
       error.value = 'Fix the adaptive SQM limits.';
       return;

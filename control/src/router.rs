@@ -707,16 +707,16 @@ pub fn monitor<'a>(
         .unwrap_or(Ipv4Addr::new(1, 1, 1, 1));
     let sqm = (settings.sqm_autorate && settings.enabled)
         .then(|| {
-            let interfaces: Vec<SqmInterface> = inventory
-                .wan
-                .iter()
-                .filter(|_| settings.direct_wan)
-                .chain(monitored(settings, inventory))
-                .map(|path| SqmInterface {
+            let wan = inventory.wan.iter().filter(|_| settings.direct_wan);
+            let interfaces: Vec<SqmInterface> = monitored(settings, inventory)
+                .map(|path| (path, false))
+                .chain(wan.map(|path| (path, true)))
+                .map(|(path, fallback)| SqmInterface {
                     id: path.id.clone(),
                     name: path.name.clone(),
                     egress_device: path.interface.clone(),
                     ingress_device: ifb_for(&path.interface),
+                    fallback,
                 })
                 .collect();
             (!interfaces.is_empty()).then_some(SqmConfig {
@@ -1058,16 +1058,29 @@ mod tests {
         assert_eq!(
             devices,
             [
-                ("wan", "eth1", "ifb4eth1"),
                 ("a", "wg1", "ifb4wg1"),
                 ("long", "very_long_ifname", "ifb4very_long_i"),
+                ("wan", "eth1", "ifb4eth1"),
             ]
+        );
+        assert_eq!(
+            sqm.interfaces
+                .iter()
+                .map(|iface| iface.fallback)
+                .collect::<Vec<_>>(),
+            [false, false, true]
         );
         assert_eq!(sqm.delay_threshold_ms, 30);
         assert_eq!(sqm.min_dl_kbps, 60_000);
         assert_eq!(sqm.max_dl_kbps, 200_000);
         assert_eq!(sqm.min_ul_kbps, 10_000);
         assert_eq!(sqm.max_ul_kbps, 30_000);
+
+        settings.direct_wan = false;
+        let tunnels = monitor(&settings, &inv, &resolved()?)
+            .sqm
+            .map(|sqm| sqm.interfaces.len());
+        assert_eq!(tunnels, Some(2));
 
         settings.sqm_autorate = false;
         assert!(monitor(&settings, &inv, &resolved()?).sqm.is_none());
