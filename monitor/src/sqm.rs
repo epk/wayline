@@ -27,7 +27,7 @@ const NLM_F_DUMP: u16 = 0x300;
 const TC_H_ROOT: u32 = 0xffff_ffff;
 const TCA_KIND: u16 = 1;
 const TCA_OPTIONS: u16 = 2;
-const TCA_CAKE_BASE_RATE64: u16 = 1;
+const TCA_CAKE_BASE_RATE64: u16 = 2;
 const NLA_F_NESTED: u16 = 0x8000;
 const MAX_DUMP_READS: usize = 128;
 
