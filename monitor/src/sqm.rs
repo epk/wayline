@@ -136,6 +136,9 @@ fn write_nla(buf: &mut [u8], kind: u16, value: &[u8]) -> io::Result<usize> {
     let mut attr = NlaBuffer::new(slot);
     attr.set_length(u16::try_from(total).map_err(io::Error::other)?);
     attr.set_kind(kind);
+    if (kind & NLA_F_NESTED) != 0 {
+        attr.set_nested_flag();
+    }
     attr.value_mut().copy_from_slice(value);
     Ok(aligned)
 }
