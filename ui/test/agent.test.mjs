@@ -223,14 +223,22 @@ test('an agent edits a setting in the settings dialog', async () => {
   ]);
   assert.equal(result.ok, true, result.error?.message);
   await until(
-    () => entries().some((entry) => entry.label === 'Delay threshold (ms)'),
+    () => entries().some((entry) => entry.label === 'Latency rise above the idle baseline (ms)'),
     'SQM fields',
   );
-  result = await run([{ ref: 'Delay threshold (ms)', action: 'setValue', args: ['30'] }]);
+  result = await run([
+    { ref: 'Latency rise above the idle baseline (ms)', action: 'setValue', args: ['30'] },
+    { ref: 'Download maximum (Mbps)', action: 'setValue', args: ['300'] },
+  ]);
   assert.equal(result.ok, true, result.error?.message);
   const saveSqm = entries().find((entry) => entry.label === 'Save settings');
   assert.match(saveSqm.confirm, /adaptive SQM off → on/);
-  assert.match(saveSqm.confirm, /SQM delay threshold 20 → 30/);
+  const direct = [...document.querySelectorAll('.wl-check')].find((el) =>
+    el.textContent.includes('Direct internet without VPN'),
+  );
+  assert.equal(direct.querySelector('[data-slot="checkbox"]').getAttribute('aria-checked'), 'true');
+  assert.match(saveSqm.confirm, /SQM latency rise \(ms\) 20 → 30/);
+  assert.match(saveSqm.confirm, /SQM download maximum \(Mbps\) 500 → 300/);
 });
 
 test('purging history waits for a person', async () => {

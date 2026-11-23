@@ -63,14 +63,10 @@ pub struct SqmConfig {
     pub delay_threshold_ms: u32,
     #[serde(default = "default_sqm_min_kbps")]
     pub min_dl_kbps: u32,
-    #[serde(default = "default_sqm_base_kbps")]
-    pub base_dl_kbps: u32,
     #[serde(default = "default_sqm_max_kbps")]
     pub max_dl_kbps: u32,
     #[serde(default = "default_sqm_min_kbps")]
     pub min_ul_kbps: u32,
-    #[serde(default = "default_sqm_base_kbps")]
-    pub base_ul_kbps: u32,
     #[serde(default = "default_sqm_max_kbps")]
     pub max_ul_kbps: u32,
 }
@@ -142,10 +138,6 @@ const fn default_sqm_delay_ms() -> u32 {
 
 const fn default_sqm_min_kbps() -> u32 {
     5_000
-}
-
-const fn default_sqm_base_kbps() -> u32 {
-    40_000
 }
 
 const fn default_sqm_max_kbps() -> u32 {

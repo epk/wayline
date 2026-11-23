@@ -14,10 +14,13 @@ import {
   purgeHistory,
   saveSettings,
   settingsOpen,
+  sqmProblems,
+  sqmRange,
   state,
   updateDraft,
+  type SqmKey,
 } from './store.ts';
-import type { Settings } from './types.ts';
+import type { Settings, SqmLink } from './types.ts';
 import { UpdatePanel } from './update-panel.tsx';
 
 const intervals = [1, 5, 15, 30, 60].map((n) => ({ value: String(n), label: n + ' s' }));
@@ -45,27 +48,14 @@ const settingNames: Record<keyof Settings, string> = {
   autoExit: 'automatic exit switching',
   autoTunnels: 'automatic switching pool',
   sqmAutorate: 'adaptive SQM',
-  sqmDelayMs: 'SQM delay threshold',
-  sqmMinDlMbps: 'SQM download min',
-  sqmMaxDlMbps: 'SQM download max',
-  sqmMinUlMbps: 'SQM upload min',
-  sqmMaxUlMbps: 'SQM upload max',
+  sqmDelayMs: 'SQM latency rise (ms)',
+  sqmMinDlMbps: 'SQM download minimum (Mbps)',
+  sqmMaxDlMbps: 'SQM download maximum (Mbps)',
+  sqmMinUlMbps: 'SQM upload minimum (Mbps)',
+  sqmMaxUlMbps: 'SQM upload maximum (Mbps)',
   historyDays: 'history retention',
   autoUpdates: 'automatic updates',
 };
-
-const sqmFields: {
-  key: 'sqmDelayMs' | 'sqmMinDlMbps' | 'sqmMaxDlMbps' | 'sqmMinUlMbps' | 'sqmMaxUlMbps';
-  label: string;
-  min: number;
-  max: number;
-}[] = [
-  { key: 'sqmDelayMs', label: 'Delay threshold (ms)', min: 5, max: 200 },
-  { key: 'sqmMinDlMbps', label: 'Download min (Mbps)', min: 1, max: 2000 },
-  { key: 'sqmMaxDlMbps', label: 'Download max (Mbps)', min: 1, max: 2000 },
-  { key: 'sqmMinUlMbps', label: 'Upload min (Mbps)', min: 1, max: 2000 },
-  { key: 'sqmMaxUlMbps', label: 'Upload max (Mbps)', min: 1, max: 2000 },
-];
 
 const shown = (value: unknown): string =>
   Array.isArray(value)
@@ -178,6 +168,168 @@ function Destinations() {
   );
 }
 
+function Limit(props: {
+  field: SqmKey;
+  label: string;
+  name: string;
+  unit: string;
+  problems: Partial<Record<SqmKey, string>>;
+  errorId: string;
+}) {
+  const id = useId();
+  const value = draft.value[props.field];
+  const [low, high] = sqmRange[props.field];
+  const bad = !!props.problems[props.field];
+  return (
+    <div className="wl-limit">
+      <label htmlFor={id}>{props.label}</label>
+      <span className="wl-unit">
+        <Input
+          id={id}
+          aria-label={props.name}
+          type="number"
+          inputMode="numeric"
+          min={low}
+          max={high}
+          step={1}
+          required
+          value={Number.isFinite(value) ? String(value) : ''}
+          aria-invalid={bad || undefined}
+          aria-describedby={bad ? props.errorId : undefined}
+          onChange={(e) => {
+            const raw = e.currentTarget.value;
+            updateDraft({ [props.field]: raw === '' ? Number.NaN : Number(raw) });
+          }}
+        />
+        <span aria-hidden="true">{props.unit}</span>
+      </span>
+    </div>
+  );
+}
+
+function Limits(props: {
+  legend: string;
+  unit: string;
+  fields: [SqmKey, string, string][];
+  problems: Partial<Record<SqmKey, string>>;
+}) {
+  const errorId = useId();
+  const problem = props.fields.map(([field]) => props.problems[field]).find(Boolean);
+  return (
+    <fieldset className="wl-range">
+      <legend>{props.legend}</legend>
+      <div className="wl-range-fields">
+        {props.fields.map(([field, label, name]) => (
+          <Limit
+            key={field}
+            field={field}
+            label={label}
+            name={name}
+            unit={props.unit}
+            problems={props.problems}
+            errorId={errorId}
+          />
+        ))}
+      </div>
+      {problem && (
+        <p id={errorId} className="wl-field-error">
+          {problem}
+        </p>
+      )}
+    </fieldset>
+  );
+}
+
+const sqmTrouble = (links: SqmLink[]): string[] => {
+  const shaping = links.some(
+    (link) => link.dlAction !== 'missing_qdisc' || link.ulAction !== 'missing_qdisc',
+  );
+  const refused = links
+    .filter((link) => link.dlAction === 'error' || link.ulAction === 'error')
+    .map((link) => link.name + ': the router refused the last bandwidth change.');
+  return links.length && !shaping
+    ? ['No CAKE shaper found on the WAN or the monitored tunnels. Set up SQM with CAKE first.']
+    : refused;
+};
+
+function AdaptiveSqm() {
+  const d = draft.value;
+  const s = state.value;
+  const problems = d.sqmAutorate ? sqmProblems(d) : {};
+  const shaped = s.tunnels.filter((t) => d.tunnels.includes(t.monitorId)).map((t) => t.name);
+  const saved = s.config.sqmAutorate && s.config.enabled;
+  const trouble = saved ? sqmTrouble(s.sqm?.links || []) : [];
+  return (
+    <section className="wl-set" aria-labelledby="wl-set-sqm">
+      <h3 id="wl-set-sqm">Adaptive SQM (CAKE)</h3>
+      <Check
+        label="Adjust CAKE bandwidth automatically"
+        checked={d.sqmAutorate && d.enabled}
+        disabled={!d.enabled}
+        onChange={(sqmAutorate) =>
+          updateDraft(sqmAutorate ? { sqmAutorate, directWan: true } : { sqmAutorate })
+        }
+      />
+      <p className="wl-muted">
+        {d.enabled
+          ? 'Keeps latency low as the line’s speed changes. Wayline lowers the bandwidth of the CAKE shapers SQM runs when latency climbs under load, and raises it again while latency stays low. It starts from the rate SQM set, changes only shapers that already exist, and puts the original rate back when it stops.'
+          : 'Turn on Measure latency to use adaptive SQM.'}
+      </p>
+      {d.sqmAutorate && d.enabled && (
+        <>
+          <p className="wl-muted">
+            {'Applies to the WAN' +
+              (shaped.length ? ' and the monitored tunnels (' + shaped.join(', ') + ')' : '') +
+              ': upload on each interface, download on its ifb4 device. It uses the direct internet probes, which stay on while this is on.'}
+          </p>
+          {trouble.map((line) => (
+            <p key={line} className="wl-warning" role="note">
+              {line}
+            </p>
+          ))}
+          <Limits
+            legend="Download bandwidth"
+            unit="Mbps"
+            problems={problems}
+            fields={[
+              ['sqmMinDlMbps', 'Minimum', 'Download minimum (Mbps)'],
+              ['sqmMaxDlMbps', 'Maximum', 'Download maximum (Mbps)'],
+            ]}
+          />
+          <Limits
+            legend="Upload bandwidth"
+            unit="Mbps"
+            problems={problems}
+            fields={[
+              ['sqmMinUlMbps', 'Minimum', 'Upload minimum (Mbps)'],
+              ['sqmMaxUlMbps', 'Maximum', 'Upload maximum (Mbps)'],
+            ]}
+          />
+          <p className="wl-muted">
+            Set the maximum near the line’s real speed and the minimum to the slowest speed you
+            accept when the link is congested.
+          </p>
+          <Limits
+            legend="Latency rise that lowers bandwidth"
+            unit="ms"
+            problems={problems}
+            fields={[
+              [
+                'sqmDelayMs',
+                'Above the idle baseline',
+                'Latency rise above the idle baseline (ms)',
+              ],
+            ]}
+          />
+          <p className="wl-muted">
+            A smaller rise keeps latency tighter and gives up more bandwidth.
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
 function Purge() {
   const [open, setOpen] = useState(false);
   return (
@@ -194,7 +346,7 @@ function Purge() {
       >
         <h2>Delete all stored history?</h2>
         <p>
-          This permanently deletes all stored latency, Wi-Fi and telemetry history and change
+          This permanently deletes all stored latency, Wi-Fi, telemetry and SQM history and change
           events, including recovery copies. Live measurements continue.
         </p>
         <div className="wl-actions">
@@ -222,7 +374,6 @@ export function SettingsDrawer() {
   const open = settingsOpen.value;
   const d = draft.value;
   const s = state.value;
-  const sqmId = useId();
   return (
     <Modal
       open={open}
@@ -295,7 +446,9 @@ export function SettingsDrawer() {
             <Check
               label="Direct internet without VPN (every uplink)"
               checked={d.directWan}
-              onChange={(directWan) => updateDraft({ directWan })}
+              onChange={(directWan) =>
+                updateDraft(directWan ? { directWan } : { directWan, sqmAutorate: false })
+              }
             />
             <p className="wl-muted">
               Probes bypass the VPN. Where a probe cannot, the monitor says so.
@@ -371,39 +524,7 @@ export function SettingsDrawer() {
               </>
             )}
           </section>
-          <section className="wl-set" aria-labelledby="wl-set-sqm">
-            <h3 id="wl-set-sqm">Adaptive SQM (CAKE)</h3>
-            <Check
-              label="Adjust CAKE bandwidth automatically"
-              checked={d.sqmAutorate}
-              disabled={!d.enabled}
-              onChange={(sqmAutorate) => updateDraft({ sqmAutorate })}
-            />
-            {!d.enabled && (
-              <p className="wl-muted">Latency measurement must be on to use adaptive SQM.</p>
-            )}
-            {d.sqmAutorate && (
-              <div className="wl-dest">
-                {sqmFields.map((f) => (
-                  <div key={f.key} className="wl-dest-field">
-                    <label htmlFor={sqmId + f.key}>{f.label}</label>
-                    <Input
-                      id={sqmId + f.key}
-                      type="number"
-                      min={f.min}
-                      max={f.max}
-                      step={1}
-                      value={Number.isFinite(d[f.key]) ? String(d[f.key]) : ''}
-                      onChange={(e) => {
-                        const raw = e.currentTarget.value;
-                        updateDraft({ [f.key]: raw === '' ? Number.NaN : Number(raw) });
-                      }}
-                    />
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
+          <AdaptiveSqm />
           <section className="wl-set" aria-labelledby="wl-set-history">
             <h3 id="wl-set-history">History</h3>
             <Pick
@@ -417,8 +538,8 @@ export function SettingsDrawer() {
               batches to limit flash writes.
             </p>
             <p className="wl-muted">
-              Purge stored latency, Wi-Fi and telemetry history and change events from memory and
-              flash. Live measurements continue. Settings and VPN tunnels stay unchanged.
+              Purge stored latency, Wi-Fi, telemetry and SQM history and change events from memory
+              and flash. Live measurements continue. Settings and VPN tunnels stay unchanged.
             </p>
             <Purge />
           </section>

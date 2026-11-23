@@ -506,7 +506,19 @@
 }
 .wl-view {
   min-width: 0;
-  view-transition-name: wl-view;
+}
+/* A plain fade, not a view transition: after a view transition iOS Safari
+   sends taps to the wrong place while the admin page's scroll box is
+   scrolled (WebKit bug 275335). */
+@media (prefers-reduced-motion: no-preference) {
+  .wl-view {
+    animation: wl-view-in 0.2s ease-out;
+  }
+}
+@keyframes wl-view-in {
+  from {
+    opacity: 0;
+  }
 }
 .wl-view:focus-visible {
   outline-offset: 4px;
@@ -1287,6 +1299,49 @@ th[aria-sort='descending'] .wl-sort::after {
 }
 .wl-dest-field input {
   width: 100%;
+}
+.wl-range {
+  min-width: 0;
+  margin: 10px 0 4px;
+  padding: 0;
+  border: 0;
+}
+.wl-range legend {
+  padding: 0;
+  margin-bottom: 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.wl-range-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 12px;
+}
+.wl-limit {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.wl-limit label {
+  font-size: 12px;
+  color: var(--wl-muted);
+}
+.wl-unit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.wl-unit input {
+  width: 100%;
+  min-width: 0;
+}
+.wl-unit span {
+  font-size: 12px;
+  color: var(--wl-muted);
+}
+.wl-set .wl-field-error {
+  margin: 4px 0 0;
+  color: var(--wl-danger-text);
 }
 .wl-dest-actions {
   display: flex;

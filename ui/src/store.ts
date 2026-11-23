@@ -43,6 +43,42 @@ export const settingsFrom = (source: Partial<Settings>): Settings => {
   return settings as unknown as Settings;
 };
 
+export const sqmKeys = [
+  'sqmDelayMs',
+  'sqmMinDlMbps',
+  'sqmMaxDlMbps',
+  'sqmMinUlMbps',
+  'sqmMaxUlMbps',
+] as const;
+export type SqmKey = (typeof sqmKeys)[number];
+
+// The router accepts whole numbers in these ranges, with each minimum at or
+// below its maximum.
+export const sqmRange: Record<SqmKey, [number, number]> = {
+  sqmDelayMs: [5, 200],
+  sqmMinDlMbps: [1, 2000],
+  sqmMaxDlMbps: [1, 2000],
+  sqmMinUlMbps: [1, 2000],
+  sqmMaxUlMbps: [1, 2000],
+};
+
+export function sqmProblems(d: Settings): Partial<Record<SqmKey, string>> {
+  const out: Partial<Record<SqmKey, string>> = {};
+  for (const key of sqmKeys) {
+    const [low, high] = sqmRange[key];
+    const value = d[key];
+    if (!finite(value) || !Number.isInteger(value) || value < low || value > high)
+      out[key] = 'Enter a whole number from ' + low + ' to ' + high + '.';
+  }
+  for (const [min, max] of [
+    ['sqmMinDlMbps', 'sqmMaxDlMbps'],
+    ['sqmMinUlMbps', 'sqmMaxUlMbps'],
+  ] as const)
+    if (!out[min] && !out[max] && d[min] > d[max])
+      out[min] = out[max] = 'The minimum is above the maximum.';
+  return out;
+}
+
 export const validTarget = (value: unknown): boolean =>
   typeof value === 'string' &&
   value.length > 0 &&
@@ -624,26 +660,25 @@ export async function saveSettings(): Promise<void> {
     return;
   }
   if (draft.value.sqmAutorate) {
-    const d = draft.value;
-    if (!d.enabled) {
+    if (!draft.value.enabled) {
       error.value = 'Turn on latency measurement before enabling adaptive SQM.';
       return;
     }
-    const inRange = (v: number, lo: number, hi: number) => finite(v) && v >= lo && v <= hi;
-    if (
-      !inRange(d.sqmDelayMs, 5, 200) ||
-      !inRange(d.sqmMinDlMbps, 1, 2000) ||
-      !inRange(d.sqmMaxDlMbps, 1, 2000) ||
-      !inRange(d.sqmMinUlMbps, 1, 2000) ||
-      !inRange(d.sqmMaxUlMbps, 1, 2000)
-    ) {
-      error.value = 'Use valid SQM delay (5–200 ms) and bandwidth (1–2000 Mbps) limits.';
+    if (!draft.value.directWan) {
+      error.value = 'Adaptive SQM needs Direct internet without VPN to measure the WAN.';
       return;
     }
-    if (d.sqmMinDlMbps > d.sqmMaxDlMbps || d.sqmMinUlMbps > d.sqmMaxUlMbps) {
-      error.value = 'SQM minimum bandwidth cannot exceed maximum bandwidth.';
+    if (Object.keys(sqmProblems(draft.value)).length) {
+      error.value = 'Fix the adaptive SQM limits.';
       return;
     }
+  } else {
+    // Hidden limits the router would reject fall back to the saved ones.
+    const saved = state.value.config;
+    const problems = sqmProblems(draft.value);
+    const keep: Partial<Settings> = {};
+    for (const key of sqmKeys) if (problems[key]) keep[key] = saved[key];
+    updateDraft(keep);
   }
   busy.value = true;
   busyAction.value = 'save';

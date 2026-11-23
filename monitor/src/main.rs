@@ -120,10 +120,11 @@ struct Monitor {
     wifi: Option<wifi::Wifi>,
     telemetry: Option<telemetry::Telemetry>,
     sqm: Option<sqm::Controller<sqm::LinuxShaper>>,
+    sqm_state: PathBuf,
 }
 
 impl Monitor {
-    fn try_new(config: Config) -> io::Result<Self> {
+    fn try_new(config: Config, sqm_state: PathBuf) -> io::Result<Self> {
         let started = Instant::now();
         let interval = Duration::from_millis(config.interval_ms);
         let timeout = Duration::from_millis(config.timeout_ms);
@@ -153,7 +154,7 @@ impl Monitor {
         let sqm = config
             .sqm
             .clone()
-            .map(|sqm| sqm::Controller::new(sqm, sqm::LinuxShaper));
+            .map(|sqm| sqm::Controller::new(sqm, sqm::LinuxShaper::new(sqm_state.clone())));
         Ok(Self {
             config,
             probes,
@@ -172,6 +173,7 @@ impl Monitor {
             wifi,
             telemetry,
             sqm,
+            sqm_state,
         })
     }
 
@@ -235,12 +237,16 @@ impl Monitor {
                     .transpose()?
             }
         };
-        self.sqm = match (&config.sqm, self.sqm.take()) {
-            (Some(wanted), Some(running)) if running.config() == wanted => Some(running),
-            (wanted, _) => wanted
+        let kept = self
+            .sqm
+            .take()
+            .filter(|running| config.sqm.as_ref() == Some(running.config()));
+        self.sqm = kept.or_else(|| {
+            config
+                .sqm
                 .clone()
-                .map(|sqm| sqm::Controller::new(sqm, sqm::LinuxShaper)),
-        };
+                .map(|sqm| sqm::Controller::new(sqm, sqm::LinuxShaper::new(self.sqm_state.clone())))
+        });
         self.config = config;
         Ok(())
     }
@@ -479,7 +485,8 @@ fn serve(
     let routes = route::RouteLookup::try_new()?;
     let mut seen = signature(config_path);
     let mut checked = Instant::now();
-    let mut monitor = Monitor::try_new(config)?;
+    let sqm_state = endpoint.path.with_file_name(sqm::ORIGINALS);
+    let mut monitor = Monitor::try_new(config, sqm_state)?;
     let stop_at = run_for.map(|duration| monitor.started + duration);
     let mut clients: Vec<Client> = Vec::with_capacity(MAX_CLIENTS);
     let mut sequence = 0_u64;
@@ -502,8 +509,11 @@ fn serve(
             if let Some(sqm) = &mut monitor.sqm {
                 let rtts: Vec<(String, u32)> = monitor
                     .probes
-                    .iter()
-                    .filter_map(|probe| Some((probe.interface().to_owned(), probe.latest_us()?)))
+                    .iter_mut()
+                    .filter_map(|probe| {
+                        let us = probe.take_fresh_us()?;
+                        Some((probe.interface().to_owned(), us))
+                    })
                     .collect();
                 sqm.step(now, &rtts);
             }

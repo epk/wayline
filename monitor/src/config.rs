@@ -80,16 +80,13 @@ pub fn read(path: &Path) -> Result<Config, Box<dyn Error>> {
     }
     if let Some(sqm) = &config.sqm {
         let mut seen = std::collections::HashSet::new();
-        let valid_rates = |min_kbps: u32, base_kbps: u32, max_kbps: u32| {
-            min_kbps >= 1_000
-                && min_kbps <= base_kbps
-                && base_kbps <= max_kbps
-                && max_kbps <= 2_000_000
+        let valid_rates = |min_kbps: u32, max_kbps: u32| {
+            min_kbps >= 1_000 && min_kbps <= max_kbps && max_kbps <= 2_000_000
         };
         if sqm.interfaces.len() > 16
             || !(5..=500).contains(&sqm.delay_threshold_ms)
-            || !valid_rates(sqm.min_dl_kbps, sqm.base_dl_kbps, sqm.max_dl_kbps)
-            || !valid_rates(sqm.min_ul_kbps, sqm.base_ul_kbps, sqm.max_ul_kbps)
+            || !valid_rates(sqm.min_dl_kbps, sqm.max_dl_kbps)
+            || !valid_rates(sqm.min_ul_kbps, sqm.max_ul_kbps)
             || !sqm.interfaces.iter().all(|iface| {
                 valid_path_id(&iface.id)
                     && !iface.name.is_empty()
@@ -189,10 +186,8 @@ mod tests {
         let sqm = config.sqm.ok_or("missing sqm config")?;
         assert_eq!(sqm.delay_threshold_ms, 20);
         assert_eq!(sqm.min_dl_kbps, 5_000);
-        assert_eq!(sqm.base_dl_kbps, 40_000);
         assert_eq!(sqm.max_dl_kbps, 500_000);
         assert_eq!(sqm.min_ul_kbps, 5_000);
-        assert_eq!(sqm.base_ul_kbps, 40_000);
         assert_eq!(sqm.max_ul_kbps, 500_000);
         Ok(())
     }
@@ -202,7 +197,7 @@ mod tests {
         let bad_threshold = r#"{"target":"1.1.1.1","tunnels":[],"sqm":{"delay_threshold_ms":4,"interfaces":[{"id":"wan","name":"WAN","egress_device":"eth1","ingress_device":"ifb4eth1"}]}}"#;
         assert!(load_text(bad_threshold).is_err());
 
-        let bad_rates = r#"{"target":"1.1.1.1","tunnels":[],"sqm":{"min_dl_kbps":50000,"base_dl_kbps":40000,"interfaces":[{"id":"wan","name":"WAN","egress_device":"eth1","ingress_device":"ifb4eth1"}]}}"#;
+        let bad_rates = r#"{"target":"1.1.1.1","tunnels":[],"sqm":{"min_dl_kbps":50000,"max_dl_kbps":40000,"interfaces":[{"id":"wan","name":"WAN","egress_device":"eth1","ingress_device":"ifb4eth1"}]}}"#;
         assert!(load_text(bad_rates).is_err());
 
         let bad_ul_rates = r#"{"target":"1.1.1.1","tunnels":[],"sqm":{"min_ul_kbps":999,"interfaces":[{"id":"wan","name":"WAN","egress_device":"eth1","ingress_device":"ifb4eth1"}]}}"#;

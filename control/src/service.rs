@@ -11,6 +11,8 @@ use std::io::Write;
 use std::os::unix::fs as unix_fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 fn flush() {
     if let Ok(config) = Settings::read()
@@ -20,12 +22,39 @@ fn flush() {
     }
 }
 
+fn release_sqm() {
+    let path = Path::new(MONITOR_CONFIG);
+    let Some(mut config) = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<wayline_protocol::Config>(&bytes).ok())
+    else {
+        return;
+    };
+    if config.sqm.take().is_none() {
+        return;
+    }
+    let Ok(encoded) = serde_json::to_vec(&config) else {
+        return;
+    };
+    if wayline_support::atomic(path, &encoded).is_err() {
+        return;
+    }
+    for _ in 0..30 {
+        if runtime::current().sqm.is_none() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn delete() -> Result<Value> {
     flush();
+    release_sqm();
     native::bus("service", "delete", &json!({"name":"wayline"}))
 }
 
 fn halt() {
+    release_sqm();
     let _ = fs::remove_file(MONITOR_CONFIG);
     let registered = native::bus::<Value>("service", "list", &json!({"name":"wayline"}))
         .map_or(true, |list| !list["wayline"].is_null());
